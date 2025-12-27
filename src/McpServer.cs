@@ -548,18 +548,18 @@ USE CASE: Understand solution architecture, find circular dependencies, plan ref
                 description = @"Get all members (methods, properties, fields, events) of a type BY NAME.
 
 USAGE PATTERNS:
-- Basic: get_type_members(""Node2D"") - list all members
-- With inheritance: get_type_members(""Player"", includeInherited=true)
-- Filter by kind: get_type_members(""Node2D"", memberKind=""Method"")
+- Basic: get_type_members(""MyClass"") - list all members
+- With inheritance: get_type_members(""MyService"", includeInherited=true)
+- Filter by kind: get_type_members(""MyClass"", memberKind=""Method"")
 - Verbosity control: verbosity=""summary"" (names only), ""compact"" (default, + signatures), ""full"" (+ docs, attrs)
 
-WORKS WITH: Fully-qualified (""Godot.CharacterBody2D""), simple (""Node2D""), or partial names.",
+WORKS WITH: Fully-qualified (""MyNamespace.MyClass""), simple (""MyClass""), or partial names.",
                 inputSchema = new
                 {
                     type = "object",
                     properties = new
                     {
-                        typeName = new { type = "string", description = "Type name (e.g., 'Node2D', 'Godot.CharacterBody2D', 'Player')" },
+                        typeName = new { type = "string", description = "Type name (e.g., 'MyClass', 'MyNamespace.MyService')" },
                         includeInherited = new { type = "boolean", description = "Include members from base classes (default: false)" },
                         memberKind = new { type = "string", description = "Filter: 'Method', 'Property', 'Field', 'Event'" },
                         verbosity = new { type = "string", description = "'summary' (names only), 'compact' (default), 'full' (+ docs, attrs)" },
@@ -573,7 +573,7 @@ WORKS WITH: Fully-qualified (""Godot.CharacterBody2D""), simple (""Node2D""), or
                 name = "roslyn:get_method_signature",
                 description = @"Get detailed method signature BY NAME including parameters, return type, nullability, and modifiers.
 
-USAGE: get_method_signature(""Node2D"", ""GetNode"") or with overload selection: get_method_signature(""Node"", ""GetNode"", overloadIndex=1)",
+USAGE: get_method_signature(""MyClass"", ""ProcessData"") or with overload selection: get_method_signature(""MyClass"", ""ProcessData"", overloadIndex=1)",
                 inputSchema = new
                 {
                     type = "object",
@@ -589,23 +589,20 @@ USAGE: get_method_signature(""Node2D"", ""GetNode"") or with overload selection:
             (object)new
             {
                 name = "roslyn:get_attributes",
-                description = @"Find all symbols with specific attributes. GODOT-ENHANCED: parses [Export] PropertyHint values.
+                description = @"Find all symbols with specific attributes.
 
 USAGE:
-- Find exports: get_attributes(""Export"")
-- Find signals: get_attributes(""Signal"")
-- Scope to project: get_attributes(""Export"", scope=""project:MyGame"")
-- Scope to file: get_attributes(""Tool"", scope=""file:Player.cs"")
-
-Godot attributes supported: [Export], [Signal], [Tool], [GlobalClass], [GodotClassName]",
+- Find obsolete: get_attributes(""Obsolete"")
+- Find serializable: get_attributes(""Serializable"")
+- Scope to project: get_attributes(""Obsolete"", scope=""project:MyProject"")
+- Scope to file: get_attributes(""Obsolete"", scope=""file:MyClass.cs"")",
                 inputSchema = new
                 {
                     type = "object",
                     properties = new
                     {
-                        attributeName = new { type = "string", description = "Attribute name (e.g., 'Export', 'Signal', 'Tool')" },
+                        attributeName = new { type = "string", description = "Attribute name (e.g., 'Obsolete', 'Serializable', 'JsonProperty')" },
                         scope = new { type = "string", description = "'solution' (default), 'project:Name', or 'file:path'" },
-                        parseGodotHints = new { type = "boolean", description = "Parse Godot [Export] PropertyHint values (default: true)" },
                         maxResults = new { type = "integer", description = "Maximum results (default: 100)" }
                     },
                     required = new[] { "attributeName" }
@@ -617,8 +614,8 @@ Godot attributes supported: [Export], [Signal], [Tool], [GlobalClass], [GodotCla
                 description = @"Find all types inheriting from a base type BY NAME.
 
 USAGE:
-- Find all Node2D subclasses: get_derived_types(""Node2D"")
-- Direct children only: get_derived_types(""Node"", includeTransitive=false)",
+- Find all subclasses: get_derived_types(""BaseService"")
+- Direct children only: get_derived_types(""BaseClass"", includeTransitive=false)",
                 inputSchema = new
                 {
                     type = "object",
@@ -636,7 +633,7 @@ USAGE:
                 name = "roslyn:get_base_types",
                 description = @"Get full inheritance chain BY NAME.
 
-USAGE: get_base_types(""Player"") returns: Player → CharacterBody2D → PhysicsBody2D → ... → Node → GodotObject",
+USAGE: get_base_types(""MyService"") returns: MyService → BaseService → ... → Object",
                 inputSchema = new
                 {
                     type = "object",
@@ -693,9 +690,9 @@ USAGE: analyze_control_flow(""path/to/file.cs"", startLine=10, endLine=25)",
             (object)new
             {
                 name = "roslyn:get_type_overview",
-                description = @"Get comprehensive type overview in ONE CALL: type info + base types (first 3) + member counts + Godot attributes.
+                description = @"Get comprehensive type overview in ONE CALL: type info + base types (first 3) + member counts.
 
-USAGE: get_type_overview(""Player"") - returns everything you need to understand a type quickly.",
+USAGE: get_type_overview(""MyService"") - returns everything you need to understand a type quickly.",
                 inputSchema = new
                 {
                     type = "object",
@@ -711,7 +708,7 @@ USAGE: get_type_overview(""Player"") - returns everything you need to understand
                 name = "roslyn:analyze_method",
                 description = @"Get comprehensive method analysis in ONE CALL: signature + callers + location.
 
-USAGE: analyze_method(""Player"", ""_Process"") or analyze_method(""Node2D"", ""GetNode"", includeCallers=true)",
+USAGE: analyze_method(""MyService"", ""ProcessData"") or analyze_method(""MyClass"", ""Calculate"", includeCallers=true)",
                 inputSchema = new
                 {
                     type = "object",
@@ -730,7 +727,7 @@ USAGE: analyze_method(""Player"", ""_Process"") or analyze_method(""Node2D"", ""
                 name = "roslyn:get_file_overview",
                 description = @"Get comprehensive file overview in ONE CALL: diagnostics summary + type declarations + namespace + line count.
 
-USAGE: get_file_overview(""path/to/Player.cs"")",
+USAGE: get_file_overview(""path/to/MyClass.cs"")",
                 inputSchema = new
                 {
                     type = "object",
@@ -804,15 +801,15 @@ OUTPUT: compiles (bool), errors list with line numbers. Essential before inserti
                 name = "roslyn:check_type_compatibility",
                 description = @"Check if one type can be assigned to another. Use before generating assignments or casts.
 
-USAGE: check_type_compatibility(sourceType=""Player"", targetType=""Node2D"")
+USAGE: check_type_compatibility(sourceType=""MyDerivedClass"", targetType=""MyBaseClass"")
 OUTPUT: compatible (bool), requiresCast (bool), conversionKind, and explanation of why/why not.",
                 inputSchema = new
                 {
                     type = "object",
                     properties = new
                     {
-                        sourceType = new { type = "string", description = "The source type name (e.g., 'CharacterBody2D')" },
-                        targetType = new { type = "string", description = "The target type name (e.g., 'Node2D')" }
+                        sourceType = new { type = "string", description = "The source type name (e.g., 'MyDerivedClass')" },
+                        targetType = new { type = "string", description = "The target type name (e.g., 'MyBaseClass')" }
                     },
                     required = new[] { "sourceType", "targetType" }
                 }
@@ -861,15 +858,15 @@ IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
                 name = "roslyn:get_method_source",
                 description = @"Get the actual source code of a method by type and method name. Eliminates need for file Read.
 
-USAGE: get_method_source(typeName=""Player"", methodName=""TakeDamage"")
+USAGE: get_method_source(typeName=""MyService"", methodName=""ProcessData"")
 OUTPUT: Full method source including signature, body, location (file + line numbers), and line count.",
                 inputSchema = new
                 {
                     type = "object",
                     properties = new
                     {
-                        typeName = new { type = "string", description = "The containing type name (e.g., 'Player', 'Fleet')" },
-                        methodName = new { type = "string", description = "The method name (e.g., 'OnFleetFuelDepleted')" },
+                        typeName = new { type = "string", description = "The containing type name (e.g., 'MyService', 'MyController')" },
+                        methodName = new { type = "string", description = "The method name (e.g., 'ProcessData')" },
                         overloadIndex = new { type = "integer", description = "Which overload to get (0-based, default: 0)" }
                     },
                     required = new[] { "typeName", "methodName" }
@@ -960,6 +957,229 @@ IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
                         preview = new { type = "boolean", description = "Preview mode (default: true). Set to false to apply." }
                     },
                     required = new[] { "filePath", "startLine", "endLine", "methodName" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:get_code_actions_at_position",
+                description = @"Get ALL available code actions (fixes + refactorings) at a position. This is the master tool that exposes 100+ Roslyn refactorings.
+
+USAGE: get_code_actions_at_position(filePath, line, column) or with selection: add endLine, endColumn
+OUTPUT: List of actions with title, kind (fix/refactoring), equivalenceKey
+WORKFLOW: (1) Call this to see available actions, (2) Use apply_code_action_by_title to apply one
+IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        filePath = new { type = "string", description = "Absolute path to source file" },
+                        line = new { type = "integer", description = "Zero-based line number" },
+                        column = new { type = "integer", description = "Zero-based column number" },
+                        endLine = new { type = "integer", description = "Optional: end line for selection" },
+                        endColumn = new { type = "integer", description = "Optional: end column for selection" },
+                        includeCodeFixes = new { type = "boolean", description = "Include fixes for diagnostics (default: true)" },
+                        includeRefactorings = new { type = "boolean", description = "Include refactorings (default: true)" }
+                    },
+                    required = new[] { "filePath", "line", "column" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:apply_code_action_by_title",
+                description = @"Apply a code action by its title. Supports exact and partial matching.
+
+USAGE: apply_code_action_by_title(filePath, line, column, title)
+OUTPUT: Changed files with preview or applied changes
+WORKFLOW: (1) Call get_code_actions_at_position first, (2) Apply with preview=true, (3) Apply with preview=false
+IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        filePath = new { type = "string", description = "Absolute path to source file" },
+                        line = new { type = "integer", description = "Zero-based line number" },
+                        column = new { type = "integer", description = "Zero-based column number" },
+                        title = new { type = "string", description = "Action title (exact or partial match)" },
+                        endLine = new { type = "integer", description = "Optional: end line for selection" },
+                        endColumn = new { type = "integer", description = "Optional: end column for selection" },
+                        preview = new { type = "boolean", description = "Preview mode (default: true). Set to false to apply." }
+                    },
+                    required = new[] { "filePath", "line", "column", "title" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:implement_missing_members",
+                description = @"Generate stub implementations for interface/abstract members.
+
+USAGE: Position cursor on class declaration that implements interface or extends abstract class.
+OUTPUT: Generated stub code for all missing members.
+IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        filePath = new { type = "string", description = "Absolute path to source file" },
+                        line = new { type = "integer", description = "Zero-based line number on the class declaration" },
+                        column = new { type = "integer", description = "Zero-based column number" },
+                        preview = new { type = "boolean", description = "Preview mode (default: true)" }
+                    },
+                    required = new[] { "filePath", "line", "column" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:encapsulate_field",
+                description = @"Convert a field to a property with getter/setter.
+
+USAGE: Position cursor on a field declaration.
+OUTPUT: Generated property wrapping the field.
+IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        filePath = new { type = "string", description = "Absolute path to source file" },
+                        line = new { type = "integer", description = "Zero-based line number on the field" },
+                        column = new { type = "integer", description = "Zero-based column number" },
+                        preview = new { type = "boolean", description = "Preview mode (default: true)" }
+                    },
+                    required = new[] { "filePath", "line", "column" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:inline_variable",
+                description = @"Inline a variable, replacing all usages with its value.
+
+USAGE: Position cursor on a variable declaration or usage.
+OUTPUT: Variable removed and all usages replaced with the expression.
+IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        filePath = new { type = "string", description = "Absolute path to source file" },
+                        line = new { type = "integer", description = "Zero-based line number" },
+                        column = new { type = "integer", description = "Zero-based column number" },
+                        preview = new { type = "boolean", description = "Preview mode (default: true)" }
+                    },
+                    required = new[] { "filePath", "line", "column" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:extract_variable",
+                description = @"Extract an expression to a local variable.
+
+USAGE: Position cursor on or select an expression.
+OUTPUT: Expression extracted to a new local variable.
+IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        filePath = new { type = "string", description = "Absolute path to source file" },
+                        line = new { type = "integer", description = "Zero-based line number" },
+                        column = new { type = "integer", description = "Zero-based column number" },
+                        endLine = new { type = "integer", description = "Optional: end line for selection" },
+                        endColumn = new { type = "integer", description = "Optional: end column for selection" },
+                        preview = new { type = "boolean", description = "Preview mode (default: true)" }
+                    },
+                    required = new[] { "filePath", "line", "column" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:get_complexity_metrics",
+                description = @"Get complexity metrics for a method or entire file.
+
+METRICS: cyclomatic (decision points), nesting (max depth), loc (lines), parameters (count), cognitive (Sonar-style)
+USAGE: get_complexity_metrics(filePath) for file, or add line/column for specific method
+OUTPUT: Per-method breakdown with all requested metrics
+IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        filePath = new { type = "string", description = "Absolute path to source file" },
+                        line = new { type = "integer", description = "Optional: zero-based line for specific method" },
+                        column = new { type = "integer", description = "Optional: zero-based column" },
+                        metrics = new { type = "array", items = new { type = "string" }, description = "Optional: specific metrics [cyclomatic, nesting, loc, parameters, cognitive]" }
+                    },
+                    required = new[] { "filePath" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:add_null_checks",
+                description = @"Add ArgumentNullException.ThrowIfNull guard clauses for nullable parameters.
+
+USAGE: Position cursor on a method with reference type parameters.
+OUTPUT: Generated guard clauses inserted at method start.
+IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        filePath = new { type = "string", description = "Absolute path to source file" },
+                        line = new { type = "integer", description = "Zero-based line number on the method" },
+                        column = new { type = "integer", description = "Zero-based column number" },
+                        preview = new { type = "boolean", description = "Preview mode (default: true)" }
+                    },
+                    required = new[] { "filePath", "line", "column" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:generate_equality_members",
+                description = @"Generate Equals, GetHashCode, and == / != operators for a type.
+
+USAGE: Position cursor on a class or struct declaration.
+OUTPUT: Generated equality members comparing all instance fields and properties.
+IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        filePath = new { type = "string", description = "Absolute path to source file" },
+                        line = new { type = "integer", description = "Zero-based line number on the type" },
+                        column = new { type = "integer", description = "Zero-based column number" },
+                        includeOperators = new { type = "boolean", description = "Include == and != operators (default: true)" },
+                        preview = new { type = "boolean", description = "Preview mode (default: true)" }
+                    },
+                    required = new[] { "filePath", "line", "column" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:get_type_members_batch",
+                description = @"Get members for multiple types in a single call (batch optimization).
+
+USAGE: get_type_members_batch(typeNames: ['ServiceA', 'ServiceB', 'ControllerC'])
+OUTPUT: Results for each type with members, or error if type not found
+BENEFIT: One call instead of multiple - reduces context usage for AI agents",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        typeNames = new { type = "array", items = new { type = "string" }, description = "Array of type names to look up" },
+                        includeInherited = new { type = "boolean", description = "Include inherited members (default: false)" },
+                        memberKind = new { type = "string", description = "Filter: 'Method', 'Property', 'Field', 'Event'" },
+                        verbosity = new { type = "string", description = "'summary', 'compact' (default), or 'full'" },
+                        maxResultsPerType = new { type = "integer", description = "Max members per type (default: 50)" }
+                    },
+                    required = new[] { "typeNames" }
                 }
             }
         };
@@ -1225,6 +1445,76 @@ IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
                     arguments?["methodName"]?.GetValue<string>() ?? throw new Exception("methodName required"),
                     arguments?["accessibility"]?.GetValue<string>() ?? "private",
                     arguments?["preview"]?.GetValue<bool>() ?? true),
+
+                "roslyn:get_code_actions_at_position" => await _roslynService.GetCodeActionsAtPositionAsync(
+                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
+                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
+                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
+                    arguments?["endLine"]?.GetValue<int?>(),
+                    arguments?["endColumn"]?.GetValue<int?>(),
+                    arguments?["includeCodeFixes"]?.GetValue<bool>() ?? true,
+                    arguments?["includeRefactorings"]?.GetValue<bool>() ?? true),
+
+                "roslyn:apply_code_action_by_title" => await _roslynService.ApplyCodeActionByTitleAsync(
+                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
+                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
+                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
+                    arguments?["title"]?.GetValue<string>() ?? throw new Exception("title required"),
+                    arguments?["endLine"]?.GetValue<int?>(),
+                    arguments?["endColumn"]?.GetValue<int?>(),
+                    arguments?["preview"]?.GetValue<bool>() ?? true),
+
+                "roslyn:implement_missing_members" => await _roslynService.ImplementMissingMembersAsync(
+                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
+                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
+                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
+                    arguments?["preview"]?.GetValue<bool>() ?? true),
+
+                "roslyn:encapsulate_field" => await _roslynService.EncapsulateFieldAsync(
+                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
+                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
+                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
+                    arguments?["preview"]?.GetValue<bool>() ?? true),
+
+                "roslyn:inline_variable" => await _roslynService.InlineVariableAsync(
+                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
+                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
+                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
+                    arguments?["preview"]?.GetValue<bool>() ?? true),
+
+                "roslyn:extract_variable" => await _roslynService.ExtractVariableAsync(
+                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
+                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
+                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
+                    arguments?["endLine"]?.GetValue<int?>(),
+                    arguments?["endColumn"]?.GetValue<int?>(),
+                    arguments?["preview"]?.GetValue<bool>() ?? true),
+
+                "roslyn:get_complexity_metrics" => await _roslynService.GetComplexityMetricsAsync(
+                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
+                    arguments?["line"]?.GetValue<int?>(),
+                    arguments?["column"]?.GetValue<int?>(),
+                    arguments?["metrics"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList()),
+
+                "roslyn:add_null_checks" => await _roslynService.AddNullChecksAsync(
+                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
+                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
+                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
+                    arguments?["preview"]?.GetValue<bool>() ?? true),
+
+                "roslyn:generate_equality_members" => await _roslynService.GenerateEqualityMembersAsync(
+                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
+                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
+                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
+                    arguments?["includeOperators"]?.GetValue<bool>() ?? true,
+                    arguments?["preview"]?.GetValue<bool>() ?? true),
+
+                "roslyn:get_type_members_batch" => await _roslynService.GetTypeMembersBatchAsync(
+                    arguments?["typeNames"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList() ?? throw new Exception("typeNames required"),
+                    arguments?["includeInherited"]?.GetValue<bool>() ?? false,
+                    arguments?["memberKind"]?.GetValue<string>(),
+                    arguments?["verbosity"]?.GetValue<string>() ?? "compact",
+                    arguments?["maxResultsPerType"]?.GetValue<int>() ?? 50),
 
                 _ => throw new Exception($"Unknown tool: {name}")
             };

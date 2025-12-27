@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CodeActions;
 using Microsoft.CodeAnalysis.CodeFixes;
+using Microsoft.CodeAnalysis.CodeRefactorings;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FindSymbols;
@@ -1615,6 +1616,162 @@ public class RoslynService
             .ToList();
 
         return providers;
+    }
+
+    private List<CodeRefactoringProvider> GetBuiltInCodeRefactoringProviders()
+    {
+        // Get built-in C# code refactoring providers from Roslyn
+        var codeRefactoringProviderType = typeof(CodeRefactoringProvider);
+
+        // Check multiple assemblies for refactoring providers
+        var assemblies = new[]
+        {
+            typeof(Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree).Assembly,
+            typeof(Microsoft.CodeAnalysis.CSharp.CSharpSyntaxNode).Assembly
+        };
+
+        var providers = new List<CodeRefactoringProvider>();
+
+        foreach (var assembly in assemblies)
+        {
+            var assemblyProviders = assembly.GetTypes()
+                .Where(t => !t.IsAbstract && codeRefactoringProviderType.IsAssignableFrom(t))
+                .Where(t => t.GetConstructors().Any(c => c.GetParameters().Length == 0))
+                .Select(t =>
+                {
+                    try
+                    {
+                        return Activator.CreateInstance(t) as CodeRefactoringProvider;
+                    }
+                    catch
+                    {
+                        return null;
+                    }
+                })
+                .Where(p => p != null)
+                .Cast<CodeRefactoringProvider>();
+
+            providers.AddRange(assemblyProviders);
+        }
+
+        // Also try to load from Features assembly if available
+        try
+        {
+            var featuresAssembly = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.GetName().Name == "Microsoft.CodeAnalysis.CSharp.Features");
+
+            if (featuresAssembly != null)
+            {
+                var featuresProviders = featuresAssembly.GetTypes()
+                    .Where(t => !t.IsAbstract && codeRefactoringProviderType.IsAssignableFrom(t))
+                    .Where(t => t.GetConstructors().Any(c => c.GetParameters().Length == 0))
+                    .Select(t =>
+                    {
+                        try
+                        {
+                            return Activator.CreateInstance(t) as CodeRefactoringProvider;
+                        }
+                        catch
+                        {
+                            return null;
+                        }
+                    })
+                    .Where(p => p != null)
+                    .Cast<CodeRefactoringProvider>();
+
+                providers.AddRange(featuresProviders);
+            }
+        }
+        catch
+        {
+            // Features assembly not available, continue with what we have
+        }
+
+        return providers.Distinct().ToList();
+    }
+
+    private async Task<List<(CodeAction action, string kind)>> GetAllCodeActionsAtPositionAsync(
+        Document document,
+        int position,
+        int? endPosition = null,
+        bool includeCodeFixes = true,
+        bool includeRefactorings = true)
+    {
+        var allActions = new List<(CodeAction action, string kind)>();
+        var span = endPosition.HasValue
+            ? TextSpan.FromBounds(position, endPosition.Value)
+            : new TextSpan(position, 0);
+
+        // Get code fixes for diagnostics at this position
+        if (includeCodeFixes)
+        {
+            var semanticModel = await document.GetSemanticModelAsync();
+            var syntaxTree = await document.GetSyntaxTreeAsync();
+
+            if (semanticModel != null && syntaxTree != null)
+            {
+                // Get all diagnostics and filter to those overlapping our span
+                var allDiagnostics = semanticModel.GetDiagnostics().ToList();
+                allDiagnostics.AddRange(syntaxTree.GetDiagnostics());
+
+                var diagnostics = allDiagnostics
+                    .Where(d => d.Location.SourceSpan.IntersectsWith(span) ||
+                                d.Location.SourceSpan.Contains(position))
+                    .ToList();
+
+                var codeFixProviders = GetBuiltInCodeFixProviders();
+
+                foreach (var diagnostic in diagnostics.Distinct())
+                {
+                    foreach (var provider in codeFixProviders)
+                    {
+                        if (!provider.FixableDiagnosticIds.Contains(diagnostic.Id))
+                            continue;
+
+                        var context = new CodeFixContext(
+                            document,
+                            diagnostic,
+                            (action, _) => allActions.Add((action, "fix")),
+                            CancellationToken.None);
+
+                        try
+                        {
+                            await provider.RegisterCodeFixesAsync(context);
+                        }
+                        catch
+                        {
+                            // Skip providers that throw
+                        }
+                    }
+                }
+            }
+        }
+
+        // Get code refactorings at this position
+        if (includeRefactorings)
+        {
+            var refactoringProviders = GetBuiltInCodeRefactoringProviders();
+
+            foreach (var provider in refactoringProviders)
+            {
+                var context = new CodeRefactoringContext(
+                    document,
+                    span,
+                    action => allActions.Add((action, "refactoring")),
+                    CancellationToken.None);
+
+                try
+                {
+                    await provider.ComputeRefactoringsAsync(context);
+                }
+                catch
+                {
+                    // Skip providers that throw
+                }
+            }
+        }
+
+        return allActions;
     }
 
     public Task<object> GetProjectStructureAsync(
@@ -5349,7 +5506,7 @@ public class ValidationClass {{
             return CreateErrorResponse(
                 ErrorCodes.InvalidParameter,
                 "typeName is required",
-                hint: "Provide a type name like 'Node2D', 'Godot.CharacterBody2D', or 'Player'",
+                hint: "Provide a type name like 'MyClass' or 'MyNamespace.MyService'",
                 context: new { parameter = "typeName" }
             );
         }
@@ -5360,7 +5517,7 @@ public class ValidationClass {{
             return CreateErrorResponse(
                 ErrorCodes.TypeNotFound,
                 $"Type '{typeName}' not found",
-                hint: "Try using fully-qualified name (e.g., 'Godot.Node2D') or check spelling. Use search_symbols to find available types.",
+                hint: "Try using fully-qualified name (e.g., 'MyNamespace.MyClass') or check spelling. Use search_symbols to find available types.",
                 context: new { typeName }
             );
         }
@@ -5434,6 +5591,76 @@ public class ValidationClass {{
             totalCount: totalCount,
             returnedCount: uniqueMembers.Count,
             verbosity: verbosity
+        );
+    }
+
+    /// <summary>
+    /// Gets members for multiple types in a single call (batch optimization).
+    /// </summary>
+    public async Task<object> GetTypeMembersBatchAsync(
+        List<string> typeNames,
+        bool includeInherited = false,
+        string? memberKind = null,
+        string verbosity = "compact",
+        int maxResultsPerType = 50)
+    {
+        EnsureSolutionLoaded();
+
+        if (typeNames == null || typeNames.Count == 0)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                "typeNames array is required and must not be empty",
+                hint: "Provide an array of type names like ['ServiceA', 'ServiceB', 'ControllerC']",
+                context: new { parameter = "typeNames" }
+            );
+        }
+
+        var results = new List<object>();
+        var errors = new List<object>();
+
+        foreach (var typeName in typeNames.Distinct())
+        {
+            var result = await GetTypeMembersAsync(typeName, includeInherited, memberKind, verbosity, maxResultsPerType);
+
+            // Check if result was successful
+            var resultDict = result as dynamic;
+            if (resultDict?.success == true)
+            {
+                results.Add(new
+                {
+                    typeName,
+                    success = true,
+                    data = resultDict.data
+                });
+            }
+            else
+            {
+                errors.Add(new
+                {
+                    typeName,
+                    success = false,
+                    error = resultDict?.error
+                });
+            }
+        }
+
+        return CreateSuccessResponse(
+            data: new
+            {
+                totalRequested = typeNames.Count,
+                successCount = results.Count,
+                errorCount = errors.Count,
+                results,
+                errors = errors.Count > 0 ? errors : null
+            },
+            suggestedNextTools: new[]
+            {
+                results.Count > 0 ? "get_method_signature for detailed method info" : null,
+                errors.Count > 0 ? "Check type names - some were not found" : null
+            }.Where(s => s != null).ToArray()!,
+            totalCount: typeNames.Count,
+            returnedCount: results.Count
         );
     }
 
@@ -5530,7 +5757,7 @@ public class ValidationClass {{
             return CreateErrorResponse(
                 ErrorCodes.InvalidParameter,
                 "typeName is required",
-                hint: "Provide a type name like 'Node2D' or 'Godot.CharacterBody2D'"
+                hint: "Provide a type name like 'MyClass' or 'MyNamespace.MyService'"
             );
         }
 
@@ -5539,7 +5766,7 @@ public class ValidationClass {{
             return CreateErrorResponse(
                 ErrorCodes.InvalidParameter,
                 "methodName is required",
-                hint: "Provide a method name like 'MoveAndSlide' or 'GetNode'"
+                hint: "Provide a method name like 'ProcessData' or 'Calculate'"
             );
         }
 
@@ -5776,7 +6003,7 @@ public class ValidationClass {{
             return CreateErrorResponse(
                 ErrorCodes.InvalidParameter,
                 "baseTypeName is required",
-                hint: "Provide a base type name like 'Node2D' or 'Godot.Node'"
+                hint: "Provide a base type name like 'BaseClass' or 'MyNamespace.BaseService'"
             );
         }
 
@@ -5840,7 +6067,7 @@ public class ValidationClass {{
             return CreateErrorResponse(
                 ErrorCodes.InvalidParameter,
                 "typeName is required",
-                hint: "Provide a type name like 'Player' or 'CharacterBody2D'"
+                hint: "Provide a type name like 'MyClass' or 'MyBaseService'"
             );
         }
 
@@ -6424,6 +6651,1166 @@ public class ValidationClass {{
                 diagnostics.ContainsKey("Error") ? "get_diagnostics for detailed error info" : null,
                 typeDeclarations.Count > 0 ? $"get_type_members for {typeDeclarations[0].name} to see members" : null
             }.Where(s => s != null).ToArray()!
+        );
+    }
+
+    #endregion
+
+    #region Phase 3: Code Actions
+
+    /// <summary>
+    /// Get all available code actions (fixes + refactorings) at a position.
+    /// </summary>
+    public async Task<object> GetCodeActionsAtPositionAsync(
+        string filePath,
+        int line,
+        int column,
+        int? endLine = null,
+        int? endColumn = null,
+        bool includeCodeFixes = true,
+        bool includeRefactorings = true)
+    {
+        EnsureSolutionLoaded();
+
+        Document document;
+        try
+        {
+            document = await GetDocumentAsync(filePath);
+        }
+        catch (FileNotFoundException)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.FileNotInSolution,
+                $"File not found in solution: {filePath}",
+                hint: "Check the file path or reload the solution",
+                context: new { filePath }
+            );
+        }
+
+        var syntaxTree = await document.GetSyntaxTreeAsync();
+        if (syntaxTree == null)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AnalysisFailed,
+                "Could not get syntax tree",
+                context: new { filePath, line, column }
+            );
+        }
+
+        var startPosition = GetPosition(syntaxTree, line, column);
+        int? endPosition = null;
+        if (endLine.HasValue && endColumn.HasValue)
+        {
+            endPosition = GetPosition(syntaxTree, endLine.Value, endColumn.Value);
+        }
+
+        var allActions = await GetAllCodeActionsAtPositionAsync(
+            document,
+            startPosition,
+            endPosition,
+            includeCodeFixes,
+            includeRefactorings);
+
+        if (allActions.Count == 0)
+        {
+            return CreateSuccessResponse(
+                data: new
+                {
+                    position = new { line, column, endLine, endColumn },
+                    actions = Array.Empty<object>(),
+                    message = "No code actions available at this position"
+                },
+                suggestedNextTools: new[]
+                {
+                    "Try a different position or selection",
+                    "get_diagnostics to check for issues"
+                },
+                totalCount: 0,
+                returnedCount: 0
+            );
+        }
+
+        // Group by kind and deduplicate by title
+        var actions = allActions
+            .GroupBy(a => a.action.Title)
+            .Select((g, index) => new
+            {
+                index,
+                title = g.Key,
+                kind = g.First().kind,
+                equivalenceKey = g.First().action.EquivalenceKey,
+                count = g.Count()
+            })
+            .OrderBy(a => a.kind)
+            .ThenBy(a => a.title)
+            .ToList();
+
+        return CreateSuccessResponse(
+            data: new
+            {
+                position = new { line, column, endLine, endColumn },
+                actions,
+                fixCount = actions.Count(a => a.kind == "fix"),
+                refactoringCount = actions.Count(a => a.kind == "refactoring")
+            },
+            suggestedNextTools: new[]
+            {
+                actions.Count > 0 ? $"apply_code_action_by_title with title=\"{actions[0].title}\" to apply" : null
+            }.Where(s => s != null).ToArray()!,
+            totalCount: actions.Count,
+            returnedCount: actions.Count
+        );
+    }
+
+    /// <summary>
+    /// Apply a code action by its title.
+    /// </summary>
+    public async Task<object> ApplyCodeActionByTitleAsync(
+        string filePath,
+        int line,
+        int column,
+        string title,
+        int? endLine = null,
+        int? endColumn = null,
+        bool preview = true)
+    {
+        EnsureSolutionLoaded();
+
+        Document document;
+        try
+        {
+            document = await GetDocumentAsync(filePath);
+        }
+        catch (FileNotFoundException)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.FileNotInSolution,
+                $"File not found in solution: {filePath}",
+                hint: "Check the file path or reload the solution",
+                context: new { filePath }
+            );
+        }
+
+        var syntaxTree = await document.GetSyntaxTreeAsync();
+        if (syntaxTree == null)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AnalysisFailed,
+                "Could not get syntax tree",
+                context: new { filePath, line, column }
+            );
+        }
+
+        var startPosition = GetPosition(syntaxTree, line, column);
+        int? endPosition = null;
+        if (endLine.HasValue && endColumn.HasValue)
+        {
+            endPosition = GetPosition(syntaxTree, endLine.Value, endColumn.Value);
+        }
+
+        var allActions = await GetAllCodeActionsAtPositionAsync(
+            document,
+            startPosition,
+            endPosition,
+            includeCodeFixes: true,
+            includeRefactorings: true);
+
+        // Find action by title (case-insensitive)
+        var matchingAction = allActions.FirstOrDefault(a =>
+            a.action.Title.Equals(title, StringComparison.OrdinalIgnoreCase));
+
+        if (matchingAction.action == null)
+        {
+            // Try partial match
+            matchingAction = allActions.FirstOrDefault(a =>
+                a.action.Title.Contains(title, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (matchingAction.action == null)
+        {
+            var availableTitles = allActions
+                .Select(a => a.action.Title)
+                .Distinct()
+                .Take(10)
+                .ToList();
+
+            return CreateErrorResponse(
+                ErrorCodes.SymbolNotFound,
+                $"No code action found with title matching '{title}'",
+                hint: availableTitles.Count > 0
+                    ? $"Available actions: {string.Join(", ", availableTitles)}"
+                    : "No actions available at this position. Try get_code_actions_at_position first.",
+                context: new { title, availableCount = allActions.Count }
+            );
+        }
+
+        var selectedAction = matchingAction.action;
+
+        // Apply the code action
+        var operations = await selectedAction.GetOperationsAsync(CancellationToken.None);
+        var changedSolution = _solution;
+
+        foreach (var operation in operations)
+        {
+            if (operation is ApplyChangesOperation applyChangesOp)
+            {
+                changedSolution = applyChangesOp.ChangedSolution;
+                break;
+            }
+        }
+
+        if (changedSolution == _solution)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AnalysisFailed,
+                "Code action did not produce any changes",
+                hint: "The selected action may not be applicable in this context.",
+                context: new { actionTitle = selectedAction.Title }
+            );
+        }
+
+        // Collect all changed documents (reuse pattern from ApplyCodeFixAsync)
+        var changedDocuments = new List<object>();
+        var solutionChanges = changedSolution.GetChanges(_solution!);
+
+        foreach (var projectChanges in solutionChanges.GetProjectChanges())
+        {
+            // Added documents
+            foreach (var addedDocId in projectChanges.GetAddedDocuments())
+            {
+                var addedDoc = changedSolution.GetDocument(addedDocId);
+                if (addedDoc == null) continue;
+
+                var text = await addedDoc.GetTextAsync();
+                changedDocuments.Add(new
+                {
+                    filePath = addedDoc.FilePath ?? $"NewFile_{addedDoc.Name}",
+                    fileName = addedDoc.Name,
+                    isNewFile = true,
+                    newText = preview ? text.ToString() : null,
+                    changeType = "Added"
+                });
+
+                if (!preview && addedDoc.FilePath != null)
+                {
+                    await File.WriteAllTextAsync(addedDoc.FilePath, text.ToString());
+                }
+            }
+
+            // Changed documents
+            foreach (var changedDocId in projectChanges.GetChangedDocuments())
+            {
+                var oldDoc = _solution!.GetDocument(changedDocId);
+                var newDoc = changedSolution.GetDocument(changedDocId);
+                if (oldDoc == null || newDoc == null) continue;
+
+                var oldText = await oldDoc.GetTextAsync();
+                var newText = await newDoc.GetTextAsync();
+                var changes = newText.GetTextChanges(oldText).ToList();
+
+                changedDocuments.Add(new
+                {
+                    filePath = newDoc.FilePath,
+                    fileName = newDoc.Name,
+                    isNewFile = false,
+                    changeCount = changes.Count,
+                    newText = preview ? newText.ToString() : null,
+                    changes = preview ? changes.Select(c => new
+                    {
+                        span = new { start = c.Span.Start, end = c.Span.End, length = c.Span.Length },
+                        oldText = oldText.ToString(c.Span),
+                        newText = c.NewText
+                    }).ToList() : null,
+                    changeType = "Modified"
+                });
+
+                if (!preview && newDoc.FilePath != null)
+                {
+                    await File.WriteAllTextAsync(newDoc.FilePath, newText.ToString());
+                    _solution = changedSolution;
+                }
+            }
+
+            // Removed documents
+            foreach (var removedDocId in projectChanges.GetRemovedDocuments())
+            {
+                var removedDoc = _solution!.GetDocument(removedDocId);
+                if (removedDoc == null) continue;
+
+                changedDocuments.Add(new
+                {
+                    filePath = removedDoc.FilePath,
+                    fileName = removedDoc.Name,
+                    isNewFile = false,
+                    changeType = "Removed"
+                });
+
+                if (!preview && removedDoc.FilePath != null && File.Exists(removedDoc.FilePath))
+                {
+                    File.Delete(removedDoc.FilePath);
+                }
+            }
+        }
+
+        return CreateSuccessResponse(
+            data: new
+            {
+                applied = !preview,
+                actionTitle = selectedAction.Title,
+                actionKind = matchingAction.kind,
+                changedFiles = changedDocuments,
+                preview
+            },
+            suggestedNextTools: preview
+                ? new[] { $"apply_code_action_by_title with preview=false to apply changes to disk" }
+                : new[] { "get_diagnostics to verify the action resolved any issues" },
+            totalCount: changedDocuments.Count,
+            returnedCount: changedDocuments.Count
+        );
+    }
+
+    #endregion
+
+    #region Phase 3: Convenience Tools (Tier 2)
+
+    /// <summary>
+    /// Implement missing interface/abstract members.
+    /// </summary>
+    public async Task<object> ImplementMissingMembersAsync(
+        string filePath,
+        int line,
+        int column,
+        bool preview = true)
+    {
+        // This is a convenience wrapper around apply_code_action_by_title
+        // Looking for actions like "Implement interface", "Implement abstract class"
+        var actionsResult = await GetCodeActionsAtPositionAsync(
+            filePath, line, column,
+            includeCodeFixes: true,
+            includeRefactorings: true);
+
+        // Check if we got actions
+        var resultDict = actionsResult as dynamic;
+        if (resultDict?.success != true)
+        {
+            return actionsResult;
+        }
+
+        // Look for implement actions
+        var implementTitles = new[]
+        {
+            "Implement interface",
+            "Implement abstract class",
+            "Implement all members explicitly",
+            "Implement remaining members",
+            "Implement missing members"
+        };
+
+        foreach (var title in implementTitles)
+        {
+            var result = await ApplyCodeActionByTitleAsync(
+                filePath, line, column, title,
+                preview: preview);
+
+            var dict = result as dynamic;
+            if (dict?.success == true)
+            {
+                return result;
+            }
+        }
+
+        return CreateErrorResponse(
+            ErrorCodes.SymbolNotFound,
+            "No 'implement members' action found at this position",
+            hint: "Position cursor on a class that implements an interface or extends an abstract class",
+            context: new { filePath, line, column }
+        );
+    }
+
+    /// <summary>
+    /// Encapsulate a field into a property.
+    /// </summary>
+    public async Task<object> EncapsulateFieldAsync(
+        string filePath,
+        int line,
+        int column,
+        bool preview = true)
+    {
+        // Look for encapsulate field actions
+        var encapsulateTitles = new[]
+        {
+            "Encapsulate field",
+            "Encapsulate field (and use property)",
+            "Encapsulate field (but still use field)"
+        };
+
+        foreach (var title in encapsulateTitles)
+        {
+            var result = await ApplyCodeActionByTitleAsync(
+                filePath, line, column, title,
+                preview: preview);
+
+            var dict = result as dynamic;
+            if (dict?.success == true)
+            {
+                return result;
+            }
+        }
+
+        return CreateErrorResponse(
+            ErrorCodes.SymbolNotFound,
+            "No 'encapsulate field' action found at this position",
+            hint: "Position cursor on a field declaration",
+            context: new { filePath, line, column }
+        );
+    }
+
+    /// <summary>
+    /// Inline a variable.
+    /// </summary>
+    public async Task<object> InlineVariableAsync(
+        string filePath,
+        int line,
+        int column,
+        bool preview = true)
+    {
+        var inlineTitles = new[]
+        {
+            "Inline variable",
+            "Inline temporary variable",
+            "Inline 'temp'"
+        };
+
+        foreach (var title in inlineTitles)
+        {
+            var result = await ApplyCodeActionByTitleAsync(
+                filePath, line, column, title,
+                preview: preview);
+
+            var dict = result as dynamic;
+            if (dict?.success == true)
+            {
+                return result;
+            }
+        }
+
+        // Try partial match with "Inline"
+        var inlineResult = await ApplyCodeActionByTitleAsync(
+            filePath, line, column, "Inline",
+            preview: preview);
+
+        var inlineDict = inlineResult as dynamic;
+        if (inlineDict?.success == true)
+        {
+            return inlineResult;
+        }
+
+        return CreateErrorResponse(
+            ErrorCodes.SymbolNotFound,
+            "No 'inline variable' action found at this position",
+            hint: "Position cursor on a variable that can be inlined",
+            context: new { filePath, line, column }
+        );
+    }
+
+    /// <summary>
+    /// Extract an expression to a variable.
+    /// </summary>
+    public async Task<object> ExtractVariableAsync(
+        string filePath,
+        int line,
+        int column,
+        int? endLine = null,
+        int? endColumn = null,
+        bool preview = true)
+    {
+        var extractTitles = new[]
+        {
+            "Introduce local",
+            "Extract local variable",
+            "Introduce variable for",
+            "Extract variable"
+        };
+
+        foreach (var title in extractTitles)
+        {
+            var result = await ApplyCodeActionByTitleAsync(
+                filePath, line, column, title,
+                endLine, endColumn,
+                preview: preview);
+
+            var dict = result as dynamic;
+            if (dict?.success == true)
+            {
+                return result;
+            }
+        }
+
+        // Try partial match
+        var extractResult = await ApplyCodeActionByTitleAsync(
+            filePath, line, column, "Introduce",
+            endLine, endColumn,
+            preview: preview);
+
+        var extractDict = extractResult as dynamic;
+        if (extractDict?.success == true)
+        {
+            return extractResult;
+        }
+
+        return CreateErrorResponse(
+            ErrorCodes.SymbolNotFound,
+            "No 'extract variable' action found at this position",
+            hint: "Select an expression to extract",
+            context: new { filePath, line, column, endLine, endColumn }
+        );
+    }
+
+    #endregion
+
+    #region Phase 3: Custom Tools (Tier 3)
+
+    /// <summary>
+    /// Get complexity metrics for a method or file.
+    /// </summary>
+    public async Task<object> GetComplexityMetricsAsync(
+        string filePath,
+        int? line = null,
+        int? column = null,
+        List<string>? metrics = null)
+    {
+        EnsureSolutionLoaded();
+
+        Document document;
+        try
+        {
+            document = await GetDocumentAsync(filePath);
+        }
+        catch (FileNotFoundException)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.FileNotInSolution,
+                $"File not found in solution: {filePath}",
+                hint: "Check the file path or reload the solution",
+                context: new { filePath }
+            );
+        }
+
+        var syntaxTree = await document.GetSyntaxTreeAsync();
+        var semanticModel = await document.GetSemanticModelAsync();
+
+        if (syntaxTree == null || semanticModel == null)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AnalysisFailed,
+                "Could not analyze file",
+                context: new { filePath }
+            );
+        }
+
+        var root = await syntaxTree.GetRootAsync();
+
+        // Default to all metrics if none specified
+        var requestedMetrics = metrics ?? new List<string>
+        {
+            "cyclomatic", "nesting", "loc", "parameters", "cognitive"
+        };
+
+        // If line is specified, find the method at that position
+        if (line.HasValue)
+        {
+            var position = GetPosition(syntaxTree, line.Value, column ?? 0);
+            var node = root.FindToken(position).Parent;
+
+            // Find containing method
+            var methodNode = node?.AncestorsAndSelf()
+                .OfType<MethodDeclarationSyntax>()
+                .FirstOrDefault();
+
+            if (methodNode == null)
+            {
+                // Try property accessor
+                var accessor = node?.AncestorsAndSelf()
+                    .OfType<AccessorDeclarationSyntax>()
+                    .FirstOrDefault();
+
+                if (accessor == null)
+                {
+                    return CreateErrorResponse(
+                        ErrorCodes.SymbolNotFound,
+                        "No method or property accessor found at this position",
+                        hint: "Position cursor inside a method body",
+                        context: new { filePath, line, column }
+                    );
+                }
+
+                // Analyze accessor
+                var accessorMetrics = CalculateComplexityMetrics(accessor, requestedMetrics);
+                return CreateSuccessResponse(
+                    data: new
+                    {
+                        scope = "accessor",
+                        name = accessor.Parent is PropertyDeclarationSyntax prop
+                            ? $"{prop.Identifier.Text}.{accessor.Keyword.Text}"
+                            : accessor.Keyword.Text,
+                        metrics = accessorMetrics
+                    },
+                    suggestedNextTools: new[]
+                    {
+                        accessorMetrics.TryGetValue("cyclomatic", out var accCC) && (int)accCC > 10
+                            ? "Consider refactoring - cyclomatic complexity > 10"
+                            : null
+                    }.Where(s => s != null).ToArray()!
+                );
+            }
+
+            var methodMetrics = CalculateComplexityMetrics(methodNode, requestedMetrics);
+            var methodSymbol = semanticModel.GetDeclaredSymbol(methodNode);
+
+            return CreateSuccessResponse(
+                data: new
+                {
+                    scope = "method",
+                    name = methodSymbol?.Name ?? methodNode.Identifier.Text,
+                    containingType = methodSymbol?.ContainingType?.Name,
+                    metrics = methodMetrics
+                },
+                suggestedNextTools: new[]
+                {
+                    methodMetrics.TryGetValue("cyclomatic", out var cc) && (int)cc > 10
+                        ? "Consider refactoring - cyclomatic complexity > 10"
+                        : null,
+                    methodMetrics.TryGetValue("nesting", out var nest) && (int)nest > 4
+                        ? "Consider refactoring - nesting depth > 4"
+                        : null
+                }.Where(s => s != null).ToArray()!
+            );
+        }
+
+        // Analyze whole file - get metrics for all methods
+        var methods = root.DescendantNodes()
+            .OfType<MethodDeclarationSyntax>()
+            .Select(m =>
+            {
+                var symbol = semanticModel.GetDeclaredSymbol(m);
+                var methodMetrics = CalculateComplexityMetrics(m, requestedMetrics);
+                return new
+                {
+                    name = symbol?.Name ?? m.Identifier.Text,
+                    containingType = symbol?.ContainingType?.Name,
+                    line = m.GetLocation().GetLineSpan().StartLinePosition.Line,
+                    metrics = methodMetrics
+                };
+            })
+            .ToList();
+
+        // Calculate file-level totals
+        var fileTotals = new Dictionary<string, object>();
+        foreach (var metric in requestedMetrics)
+        {
+            if (metric == "cyclomatic")
+            {
+                var total = methods.Sum(m => m.metrics.TryGetValue("cyclomatic", out var v) ? (int)v : 0);
+                var avg = methods.Count > 0 ? (double)total / methods.Count : 0;
+                fileTotals["avgCyclomatic"] = Math.Round(avg, 2);
+                fileTotals["maxCyclomatic"] = methods.Max(m => m.metrics.TryGetValue("cyclomatic", out var v) ? (int)v : 0);
+            }
+            else if (metric == "nesting")
+            {
+                fileTotals["maxNesting"] = methods.Count > 0
+                    ? methods.Max(m => m.metrics.TryGetValue("nesting", out var v) ? (int)v : 0)
+                    : 0;
+            }
+            else if (metric == "loc")
+            {
+                fileTotals["totalLoc"] = methods.Sum(m => m.metrics.TryGetValue("loc", out var v) ? (int)v : 0);
+            }
+        }
+
+        return CreateSuccessResponse(
+            data: new
+            {
+                scope = "file",
+                filePath,
+                methodCount = methods.Count,
+                fileTotals,
+                methods
+            },
+            totalCount: methods.Count,
+            returnedCount: methods.Count
+        );
+    }
+
+    private Dictionary<string, object> CalculateComplexityMetrics(SyntaxNode node, List<string> requestedMetrics)
+    {
+        var result = new Dictionary<string, object>();
+
+        foreach (var metric in requestedMetrics)
+        {
+            switch (metric.ToLowerInvariant())
+            {
+                case "cyclomatic":
+                    result["cyclomatic"] = CalculateCyclomaticComplexity(node);
+                    break;
+                case "nesting":
+                    result["nesting"] = CalculateNestingDepth(node);
+                    break;
+                case "loc":
+                    result["loc"] = CalculateLinesOfCode(node);
+                    break;
+                case "parameters":
+                    result["parameters"] = CountParameters(node);
+                    break;
+                case "cognitive":
+                    result["cognitive"] = CalculateCognitiveComplexity(node);
+                    break;
+            }
+        }
+
+        return result;
+    }
+
+    private int CalculateCyclomaticComplexity(SyntaxNode node)
+    {
+        // Start with 1 (the method itself is one path)
+        int complexity = 1;
+
+        foreach (var descendant in node.DescendantNodes())
+        {
+            switch (descendant)
+            {
+                case IfStatementSyntax:
+                case ConditionalExpressionSyntax: // ?:
+                case CaseSwitchLabelSyntax:
+                case CasePatternSwitchLabelSyntax:
+                case WhileStatementSyntax:
+                case ForStatementSyntax:
+                case ForEachStatementSyntax:
+                case CatchClauseSyntax:
+                case ConditionalAccessExpressionSyntax: // ?.
+                    complexity++;
+                    break;
+                case BinaryExpressionSyntax binary when
+                    binary.Kind() == SyntaxKind.LogicalAndExpression ||
+                    binary.Kind() == SyntaxKind.LogicalOrExpression ||
+                    binary.Kind() == SyntaxKind.CoalesceExpression: // ??
+                    complexity++;
+                    break;
+            }
+        }
+
+        return complexity;
+    }
+
+    private int CalculateNestingDepth(SyntaxNode node)
+    {
+        int maxDepth = 0;
+        CalculateNestingDepthRecursive(node, 0, ref maxDepth);
+        return maxDepth;
+    }
+
+    private void CalculateNestingDepthRecursive(SyntaxNode node, int currentDepth, ref int maxDepth)
+    {
+        foreach (var child in node.ChildNodes())
+        {
+            int newDepth = currentDepth;
+
+            if (child is IfStatementSyntax ||
+                child is WhileStatementSyntax ||
+                child is ForStatementSyntax ||
+                child is ForEachStatementSyntax ||
+                child is SwitchStatementSyntax ||
+                child is TryStatementSyntax ||
+                child is LockStatementSyntax ||
+                child is UsingStatementSyntax)
+            {
+                newDepth = currentDepth + 1;
+                maxDepth = Math.Max(maxDepth, newDepth);
+            }
+
+            CalculateNestingDepthRecursive(child, newDepth, ref maxDepth);
+        }
+    }
+
+    private int CalculateLinesOfCode(SyntaxNode node)
+    {
+        var text = node.ToFullString();
+        var lines = text.Split('\n')
+            .Where(line =>
+            {
+                var trimmed = line.Trim();
+                // Exclude empty lines and comment-only lines
+                return !string.IsNullOrWhiteSpace(trimmed) &&
+                       !trimmed.StartsWith("//") &&
+                       !trimmed.StartsWith("/*") &&
+                       !trimmed.StartsWith("*");
+            })
+            .Count();
+        return lines;
+    }
+
+    private int CountParameters(SyntaxNode node)
+    {
+        if (node is MethodDeclarationSyntax method)
+        {
+            return method.ParameterList.Parameters.Count;
+        }
+        return 0;
+    }
+
+    private int CalculateCognitiveComplexity(SyntaxNode node)
+    {
+        // Cognitive complexity is similar to cyclomatic but penalizes nesting
+        int complexity = 0;
+        CalculateCognitiveComplexityRecursive(node, 0, ref complexity);
+        return complexity;
+    }
+
+    private void CalculateCognitiveComplexityRecursive(SyntaxNode node, int nestingLevel, ref int complexity)
+    {
+        foreach (var child in node.ChildNodes())
+        {
+            int increment = 0;
+            int newNesting = nestingLevel;
+
+            switch (child)
+            {
+                case IfStatementSyntax:
+                case WhileStatementSyntax:
+                case ForStatementSyntax:
+                case ForEachStatementSyntax:
+                case SwitchStatementSyntax:
+                case CatchClauseSyntax:
+                    increment = 1 + nestingLevel; // Base + nesting penalty
+                    newNesting = nestingLevel + 1;
+                    break;
+                case ConditionalExpressionSyntax: // ?:
+                    increment = 1 + nestingLevel;
+                    break;
+                case BinaryExpressionSyntax binary when
+                    binary.Kind() == SyntaxKind.LogicalAndExpression ||
+                    binary.Kind() == SyntaxKind.LogicalOrExpression:
+                    increment = 1; // No nesting penalty for && and ||
+                    break;
+                case ElseClauseSyntax:
+                    increment = 1; // else adds complexity
+                    break;
+            }
+
+            complexity += increment;
+            CalculateCognitiveComplexityRecursive(child, newNesting, ref complexity);
+        }
+    }
+
+    /// <summary>
+    /// Add null check guard clauses to method parameters.
+    /// </summary>
+    public async Task<object> AddNullChecksAsync(
+        string filePath,
+        int line,
+        int column,
+        bool preview = true)
+    {
+        EnsureSolutionLoaded();
+
+        Document document;
+        try
+        {
+            document = await GetDocumentAsync(filePath);
+        }
+        catch (FileNotFoundException)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.FileNotInSolution,
+                $"File not found in solution: {filePath}",
+                hint: "Check the file path or reload the solution",
+                context: new { filePath }
+            );
+        }
+
+        var syntaxTree = await document.GetSyntaxTreeAsync();
+        var semanticModel = await document.GetSemanticModelAsync();
+
+        if (syntaxTree == null || semanticModel == null)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AnalysisFailed,
+                "Could not analyze file",
+                context: new { filePath }
+            );
+        }
+
+        var root = await syntaxTree.GetRootAsync();
+        var position = GetPosition(syntaxTree, line, column);
+        var node = root.FindToken(position).Parent;
+
+        // Find the method
+        var methodNode = node?.AncestorsAndSelf()
+            .OfType<MethodDeclarationSyntax>()
+            .FirstOrDefault();
+
+        if (methodNode == null)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.NotAMethod,
+                "No method found at this position",
+                hint: "Position cursor on a method declaration",
+                context: new { filePath, line, column }
+            );
+        }
+
+        // Get parameters that are reference types and could be null
+        var nullableParams = methodNode.ParameterList.Parameters
+            .Where(p =>
+            {
+                var paramSymbol = semanticModel.GetDeclaredSymbol(p);
+                if (paramSymbol == null) return false;
+
+                var type = paramSymbol.Type;
+                // Check if it's a reference type or nullable value type
+                return type.IsReferenceType ||
+                       type.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T;
+            })
+            .Select(p => p.Identifier.Text)
+            .ToList();
+
+        if (nullableParams.Count == 0)
+        {
+            return CreateSuccessResponse(
+                data: new
+                {
+                    message = "No nullable parameters found that need null checks",
+                    methodName = methodNode.Identifier.Text
+                }
+            );
+        }
+
+        // Generate null check code
+        var nullChecks = new StringBuilder();
+        foreach (var param in nullableParams)
+        {
+            nullChecks.AppendLine($"        ArgumentNullException.ThrowIfNull({param});");
+        }
+
+        // Find where to insert (after opening brace of method body)
+        var body = methodNode.Body;
+        if (body == null)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AnalysisFailed,
+                "Method has no body (possibly expression-bodied)",
+                hint: "This tool works with block-bodied methods",
+                context: new { methodName = methodNode.Identifier.Text }
+            );
+        }
+
+        var openBrace = body.OpenBraceToken;
+        var insertPosition = openBrace.Span.End;
+
+        // Get the text and create the modified version
+        var sourceText = await document.GetTextAsync();
+        var newText = sourceText.Replace(new TextSpan(insertPosition, 0), "\n" + nullChecks.ToString());
+
+        if (preview)
+        {
+            return CreateSuccessResponse(
+                data: new
+                {
+                    preview = true,
+                    methodName = methodNode.Identifier.Text,
+                    parametersWithNullChecks = nullableParams,
+                    generatedCode = nullChecks.ToString().Trim(),
+                    changes = new[]
+                    {
+                        new
+                        {
+                            filePath,
+                            insertAfterLine = openBrace.GetLocation().GetLineSpan().StartLinePosition.Line,
+                            newCode = nullChecks.ToString().Trim()
+                        }
+                    }
+                },
+                suggestedNextTools: new[] { "add_null_checks with preview=false to apply" }
+            );
+        }
+
+        // Apply the change
+        await File.WriteAllTextAsync(filePath, newText.ToString());
+
+        // Reload solution to pick up changes
+        _documentCache.Clear();
+
+        return CreateSuccessResponse(
+            data: new
+            {
+                applied = true,
+                methodName = methodNode.Identifier.Text,
+                parametersWithNullChecks = nullableParams,
+                generatedCode = nullChecks.ToString().Trim()
+            },
+            suggestedNextTools: new[] { "get_diagnostics to verify changes" }
+        );
+    }
+
+    /// <summary>
+    /// Generate Equals, GetHashCode, and operators for a type.
+    /// </summary>
+    public async Task<object> GenerateEqualityMembersAsync(
+        string filePath,
+        int line,
+        int column,
+        bool includeOperators = true,
+        bool preview = true)
+    {
+        EnsureSolutionLoaded();
+
+        Document document;
+        try
+        {
+            document = await GetDocumentAsync(filePath);
+        }
+        catch (FileNotFoundException)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.FileNotInSolution,
+                $"File not found in solution: {filePath}",
+                hint: "Check the file path or reload the solution",
+                context: new { filePath }
+            );
+        }
+
+        var syntaxTree = await document.GetSyntaxTreeAsync();
+        var semanticModel = await document.GetSemanticModelAsync();
+
+        if (syntaxTree == null || semanticModel == null)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AnalysisFailed,
+                "Could not analyze file",
+                context: new { filePath }
+            );
+        }
+
+        var root = await syntaxTree.GetRootAsync();
+        var position = GetPosition(syntaxTree, line, column);
+        var node = root.FindToken(position).Parent;
+
+        // Find the type declaration
+        var typeNode = node?.AncestorsAndSelf()
+            .OfType<TypeDeclarationSyntax>()
+            .FirstOrDefault();
+
+        if (typeNode == null)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.NotAType,
+                "No type declaration found at this position",
+                hint: "Position cursor on a class or struct declaration",
+                context: new { filePath, line, column }
+            );
+        }
+
+        var typeSymbol = semanticModel.GetDeclaredSymbol(typeNode) as INamedTypeSymbol;
+        if (typeSymbol == null)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AnalysisFailed,
+                "Could not get type symbol",
+                context: new { typeName = typeNode.Identifier.Text }
+            );
+        }
+
+        var typeName = typeSymbol.Name;
+
+        // Get all fields and auto-properties to include in equality
+        var members = typeSymbol.GetMembers()
+            .Where(m =>
+                (m is IFieldSymbol field && !field.IsStatic && !field.IsConst) ||
+                (m is IPropertySymbol prop && !prop.IsStatic && prop.GetMethod != null))
+            .Select(m => m.Name)
+            .ToList();
+
+        if (members.Count == 0)
+        {
+            return CreateSuccessResponse(
+                data: new
+                {
+                    message = "No instance fields or properties found to compare",
+                    typeName
+                }
+            );
+        }
+
+        // Generate Equals method
+        var equalsCode = new StringBuilder();
+        equalsCode.AppendLine($@"
+    public override bool Equals(object? obj)
+    {{
+        return obj is {typeName} other && Equals(other);
+    }}
+
+    public bool Equals({typeName}? other)
+    {{
+        if (other is null) return false;
+        if (ReferenceEquals(this, other)) return true;
+        return {string.Join(" && ", members.Select(m => $"{m} == other.{m}"))};
+    }}
+
+    public override int GetHashCode()
+    {{
+        return HashCode.Combine({string.Join(", ", members.Take(8))});
+    }}");
+
+        if (includeOperators)
+        {
+            equalsCode.AppendLine($@"
+    public static bool operator ==({typeName}? left, {typeName}? right)
+    {{
+        return Equals(left, right);
+    }}
+
+    public static bool operator !=({typeName}? left, {typeName}? right)
+    {{
+        return !Equals(left, right);
+    }}");
+        }
+
+        // Find where to insert (before closing brace of type)
+        var closeBrace = typeNode.CloseBraceToken;
+        var insertPosition = closeBrace.SpanStart;
+
+        if (preview)
+        {
+            return CreateSuccessResponse(
+                data: new
+                {
+                    preview = true,
+                    typeName,
+                    membersCompared = members,
+                    includeOperators,
+                    generatedCode = equalsCode.ToString().Trim()
+                },
+                suggestedNextTools: new[] { "generate_equality_members with preview=false to apply" }
+            );
+        }
+
+        // Apply the change
+        var sourceText = await document.GetTextAsync();
+        var newText = sourceText.Replace(new TextSpan(insertPosition, 0), equalsCode.ToString());
+        await File.WriteAllTextAsync(filePath, newText.ToString());
+
+        // Clear cache
+        _documentCache.Clear();
+
+        return CreateSuccessResponse(
+            data: new
+            {
+                applied = true,
+                typeName,
+                membersCompared = members,
+                includeOperators
+            },
+            suggestedNextTools: new[] { "get_diagnostics to verify changes" }
         );
     }
 
