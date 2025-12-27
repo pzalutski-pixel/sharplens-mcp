@@ -72,6 +72,7 @@ Claude Code has native LSP support for basic navigation (go-to-definition, find 
 | Environment Variable | Description | Default |
 |---------------------|-------------|---------|
 | `DOTNET_SOLUTION_PATH` | Path to `.sln` file to auto-load on startup | None (must call `load_solution`) |
+| `SHARPLENS_ABSOLUTE_PATHS` | Use absolute paths instead of relative | `false` (relative paths save tokens) |
 | `ROSLYN_LOG_LEVEL` | Logging verbosity: `Trace`, `Debug`, `Information`, `Warning`, `Error` | `Information` |
 | `ROSLYN_TIMEOUT_SECONDS` | Timeout for long-running operations | `30` |
 | `ROSLYN_MAX_DIAGNOSTICS` | Maximum diagnostics to return | `100` |

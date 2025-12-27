@@ -104,6 +104,7 @@ public class RoslynService
     private readonly Dictionary<string, Document> _documentCache = new();
     private readonly int _maxDiagnostics;
     private readonly int _timeoutSeconds;
+    private readonly bool _useAbsolutePaths;
 
     private DateTime? _solutionLoadedAt;
 
@@ -113,6 +114,7 @@ public class RoslynService
             ? maxDiag : 100;
         _timeoutSeconds = int.TryParse(Environment.GetEnvironmentVariable("ROSLYN_TIMEOUT_SECONDS"), out var timeout)
             ? timeout : 30;
+        _useAbsolutePaths = Environment.GetEnvironmentVariable("SHARPLENS_ABSOLUTE_PATHS")?.ToLower() == "true";
     }
 
     // Helper method for glob pattern matching (supports * and ? wildcards)
@@ -172,6 +174,50 @@ public class RoslynService
         };
     }
 
+    /// <summary>
+    /// Formats a file path as relative or absolute based on configuration.
+    /// Default is relative paths to save tokens. Set SHARPLENS_ABSOLUTE_PATHS=true for absolute.
+    /// Normalizes path separators to forward slashes for cross-platform consistency.
+    /// </summary>
+    private string FormatPath(string? absolutePath)
+    {
+        if (string.IsNullOrEmpty(absolutePath))
+            return absolutePath ?? "";
+
+        if (_useAbsolutePaths || _solution?.FilePath == null)
+            return NormalizePath(absolutePath);
+
+        var solutionDir = Path.GetDirectoryName(_solution.FilePath);
+        if (string.IsNullOrEmpty(solutionDir))
+            return NormalizePath(absolutePath);
+
+        try
+        {
+            var relativePath = Path.GetRelativePath(solutionDir, absolutePath);
+            return NormalizePath(relativePath);
+        }
+        catch
+        {
+            return NormalizePath(absolutePath); // Fallback to absolute on any error
+        }
+    }
+
+    /// <summary>
+    /// Normalizes path separators to forward slashes for cross-platform consistency.
+    /// </summary>
+    private static string NormalizePath(string path)
+    {
+        return path.Replace('\\', '/');
+    }
+
+    /// <summary>
+    /// Platform-aware path comparison: case-insensitive on Windows, case-sensitive on Linux/macOS.
+    /// Matches file system behavior on each platform.
+    /// </summary>
+    private static StringComparison PathComparison => OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
+
     #endregion
 
     #region Type Resolution Helpers
@@ -230,7 +276,7 @@ public class RoslynService
     /// <summary>
     /// Gets the source location of a symbol, if available.
     /// </summary>
-    private static object? GetSymbolLocation(ISymbol symbol)
+    private object? GetSymbolLocation(ISymbol symbol)
     {
         var location = symbol.Locations.FirstOrDefault(loc => loc.IsInSource);
         if (location == null) return null;
@@ -238,7 +284,7 @@ public class RoslynService
         var lineSpan = location.GetLineSpan();
         return new
         {
-            filePath = lineSpan.Path,
+            filePath = FormatPath(lineSpan.Path),
             line = lineSpan.StartLinePosition.Line,
             column = lineSpan.StartLinePosition.Character
         };
@@ -546,7 +592,7 @@ public class RoslynService
 
             referenceList.Add(new
             {
-                filePath = refDocument.FilePath,
+                filePath = FormatPath(refDocument.FilePath),
                 line = lineSpan.StartLinePosition.Line,
                 column = lineSpan.StartLinePosition.Character,
                 lineText,
@@ -667,7 +713,7 @@ public class RoslynService
                 },
                 definition = new
                 {
-                    filePath = defLineSpan.Path,
+                    filePath = FormatPath(defLineSpan.Path),
                     line = defLineSpan.StartLinePosition.Line,
                     column = defLineSpan.StartLinePosition.Character,
                     endLine = defLineSpan.EndLinePosition.Line,
@@ -779,7 +825,7 @@ public class RoslynService
                     var lineSpan = loc.GetLineSpan();
                     return new
                     {
-                        filePath = lineSpan.Path,
+                        filePath = FormatPath(lineSpan.Path),
                         line = lineSpan.StartLinePosition.Line,
                         column = lineSpan.StartLinePosition.Character
                     };
@@ -998,7 +1044,7 @@ public class RoslynService
                     containingNamespace = symbol.ContainingNamespace?.ToDisplayString(),
                     location = new
                     {
-                        filePath = lineSpan.Path,
+                        filePath = FormatPath(lineSpan.Path),
                         line = lineSpan.StartLinePosition.Line,
                         column = lineSpan.StartLinePosition.Character
                     }
@@ -1120,7 +1166,7 @@ public class RoslynService
                 id = d.Id,
                 severity = d.Severity.ToString(),
                 message = d.GetMessage(),
-                filePath = lineSpan.Path,
+                filePath = FormatPath(lineSpan.Path),
                 line = lineSpan.StartLinePosition.Line,
                 column = lineSpan.StartLinePosition.Character,
                 endLine = lineSpan.EndLinePosition.Line,
@@ -1263,7 +1309,7 @@ public class RoslynService
                 severity = diagnostic.Severity.ToString(),
                 location = new
                 {
-                    filePath = lineSpan.Path,
+                    filePath = FormatPath(lineSpan.Path),
                     startLine = lineSpan.StartLinePosition.Line,
                     startColumn = lineSpan.StartLinePosition.Character,
                     endLine = lineSpan.EndLinePosition.Line,
@@ -1469,7 +1515,7 @@ public class RoslynService
                 var text = await addedDoc.GetTextAsync();
                 changedDocuments.Add(new
                 {
-                    filePath = addedDoc.FilePath ?? $"NewFile_{addedDoc.Name}",
+                    filePath = FormatPath(addedDoc.FilePath) ?? $"NewFile_{addedDoc.Name}",
                     fileName = addedDoc.Name,
                     isNewFile = true,
                     newText = preview ? text.ToString() : null,
@@ -1497,7 +1543,7 @@ public class RoslynService
 
                 changedDocuments.Add(new
                 {
-                    filePath = newDoc.FilePath,
+                    filePath = FormatPath(newDoc.FilePath),
                     fileName = newDoc.Name,
                     isNewFile = false,
                     changeCount = changes.Count,
@@ -1529,7 +1575,7 @@ public class RoslynService
 
                 changedDocuments.Add(new
                 {
-                    filePath = removedDoc.FilePath,
+                    filePath = FormatPath(removedDoc.FilePath),
                     fileName = removedDoc.Name,
                     isNewFile = false,
                     changeType = "Removed"
@@ -1853,7 +1899,7 @@ public class RoslynService
                     .Select(d => new
                     {
                         name = d.Name,
-                        filePath = d.FilePath,
+                        filePath = FormatPath(d.FilePath),
                         folders = d.Folders.ToList()
                     })
                     .ToList()
@@ -1865,7 +1911,7 @@ public class RoslynService
             projects.Add(new
             {
                 name = project.Name,
-                filePath = project.FilePath,
+                filePath = FormatPath(project.FilePath),
                 language = project.Language,
                 outputPath = project.OutputFilePath,
                 targetFramework = project.CompilationOptions?.Platform.ToString(),
@@ -2015,7 +2061,7 @@ public class RoslynService
 
                     processedFiles.Add(new
                     {
-                        filePath = document.FilePath,
+                        filePath = FormatPath(document.FilePath),
                         fileName = Path.GetFileName(document.FilePath),
                         projectName = project.Name,
                         usingCount = usings.Count,
@@ -2032,7 +2078,7 @@ public class RoslynService
                 {
                     processedFiles.Add(new
                     {
-                        filePath = document.FilePath,
+                        filePath = FormatPath(document.FilePath),
                         fileName = Path.GetFileName(document.FilePath),
                         projectName = project.Name,
                         error = ex.Message
@@ -2101,7 +2147,7 @@ public class RoslynService
 
                     processedFiles.Add(new
                     {
-                        filePath = document.FilePath,
+                        filePath = FormatPath(document.FilePath),
                         fileName = Path.GetFileName(document.FilePath),
                         projectName = project.Name,
                         preview
@@ -2117,7 +2163,7 @@ public class RoslynService
                 {
                     processedFiles.Add(new
                     {
-                        filePath = document.FilePath,
+                        filePath = FormatPath(document.FilePath),
                         fileName = Path.GetFileName(document.FilePath),
                         projectName = project.Name,
                         error = ex.Message
@@ -2246,7 +2292,7 @@ public class RoslynService
                 isStatic = m.IsStatic,
                 location = lineSpan != null ? new
                 {
-                    filePath = lineSpan.Value.Path,
+                    filePath = FormatPath(lineSpan.Value.Path),
                     line = lineSpan.Value.StartLinePosition.Line,
                     column = lineSpan.Value.StartLinePosition.Character
                 } : null
@@ -2488,7 +2534,7 @@ public class RoslynService
                     },
                     location = new
                     {
-                        filePath = callerDocument.FilePath,
+                        filePath = FormatPath(callerDocument.FilePath),
                         line = lineSpan.StartLinePosition.Line,
                         column = lineSpan.StartLinePosition.Character,
                         lineText
@@ -2629,7 +2675,7 @@ public class RoslynService
                                 fullyQualifiedName = typeSymbol.ToDisplayString(),
                                 kind,
                                 accessibility = typeSymbol.DeclaredAccessibility.ToString(),
-                                filePath = lineSpan.Path,
+                                filePath = FormatPath(lineSpan.Path),
                                 line = lineSpan.StartLinePosition.Line,
                                 column = lineSpan.StartLinePosition.Character
                             });
@@ -2696,7 +2742,7 @@ public class RoslynService
                                 kind,
                                 accessibility = member.DeclaredAccessibility.ToString(),
                                 containingType = member.ContainingType?.ToDisplayString(),
-                                filePath = lineSpan.Path,
+                                filePath = FormatPath(lineSpan.Path),
                                 line = lineSpan.StartLinePosition.Line,
                                 column = lineSpan.StartLinePosition.Character
                             });
@@ -2848,7 +2894,7 @@ public class RoslynService
                         // Summary: Just file path and count
                         changes.Add(new
                         {
-                            filePath = oldDocument.FilePath,
+                            filePath = FormatPath(oldDocument.FilePath),
                             changeCount = textChanges.Count()
                         });
                     }
@@ -2868,7 +2914,7 @@ public class RoslynService
 
                         changes.Add(new
                         {
-                            filePath = oldDocument.FilePath,
+                            filePath = FormatPath(oldDocument.FilePath),
                             changeCount = textChanges.Count(),
                             changes = documentChanges,
                             truncated = textChanges.Count() > 20
@@ -2894,7 +2940,7 @@ public class RoslynService
 
                         changes.Add(new
                         {
-                            filePath = oldDocument.FilePath,
+                            filePath = FormatPath(oldDocument.FilePath),
                             changeCount = textChanges.Count(),
                             changes = documentChanges,
                             truncated = textChanges.Count() > 20
@@ -3379,7 +3425,7 @@ public class RoslynService
                 isExternal = !location?.IsInSource ?? true,
                 location = lineSpan != null ? new
                 {
-                    filePath = lineSpan.Value.Path,
+                    filePath = FormatPath(lineSpan.Value.Path),
                     line = lineSpan.Value.StartLinePosition.Line,
                     column = lineSpan.Value.StartLinePosition.Character
                 } : null
@@ -3410,7 +3456,7 @@ public class RoslynService
                     isExternal = !location?.IsInSource ?? true,
                     location = lineSpan != null ? new
                     {
-                        filePath = lineSpan.Value.Path,
+                        filePath = FormatPath(lineSpan.Value.Path),
                         line = lineSpan.Value.StartLinePosition.Line,
                         column = lineSpan.Value.StartLinePosition.Character
                     } : null
@@ -3970,7 +4016,7 @@ public class ValidationClass {{
 
             impactedLocations.Add(new
             {
-                filePath = lineSpan.Path,
+                filePath = FormatPath(lineSpan.Path),
                 line = lineSpan.StartLinePosition.Line,
                 column = lineSpan.StartLinePosition.Character,
                 impact,
@@ -4130,7 +4176,7 @@ public class ValidationClass {{
                 totalOverloads = methods.Count,
                 location = new
                 {
-                    filePath = lineSpan.Path,
+                    filePath = FormatPath(lineSpan.Path),
                     startLine = lineSpan.StartLinePosition.Line,
                     endLine = lineSpan.EndLinePosition.Line
                 },
@@ -4256,7 +4302,7 @@ public class ValidationClass {{
 
         var document = _solution!.Projects
             .SelectMany(p => p.Documents)
-            .FirstOrDefault(d => d.FilePath?.Equals(filePath, StringComparison.OrdinalIgnoreCase) == true);
+            .FirstOrDefault(d => d.FilePath != null && d.FilePath.Equals(filePath, PathComparison));
 
         if (document == null)
         {
@@ -4426,7 +4472,7 @@ public class ValidationClass {{
 
         var document = _solution!.Projects
             .SelectMany(p => p.Documents)
-            .FirstOrDefault(d => d.FilePath?.Equals(filePath, StringComparison.OrdinalIgnoreCase) == true);
+            .FirstOrDefault(d => d.FilePath != null && d.FilePath.Equals(filePath, PathComparison));
 
         if (document == null)
         {
@@ -4577,7 +4623,7 @@ public class ValidationClass {{
                     var lineSpan = location.Location.GetLineSpan();
                     callSites.Add(new
                     {
-                        filePath = refFilePath,
+                        filePath = FormatPath(refFilePath),
                         line = lineSpan.StartLinePosition.Line,
                         column = lineSpan.StartLinePosition.Character
                     });
@@ -4662,7 +4708,7 @@ public class ValidationClass {{
 
         var document = _solution!.Projects
             .SelectMany(p => p.Documents)
-            .FirstOrDefault(d => d.FilePath?.Equals(filePath, StringComparison.OrdinalIgnoreCase) == true);
+            .FirstOrDefault(d => d.FilePath != null && d.FilePath.Equals(filePath, PathComparison));
 
         if (document == null)
         {
@@ -5024,7 +5070,7 @@ public class ValidationClass {{
         var document = _solution!.Projects
             .SelectMany(p => p.Documents)
             .FirstOrDefault(d => d.FilePath != null &&
-                Path.GetFullPath(d.FilePath) == Path.GetFullPath(filePath));
+                string.Equals(Path.GetFullPath(d.FilePath), Path.GetFullPath(filePath), PathComparison));
 
         if (document == null)
             throw new FileNotFoundException($"Document not found in solution: {filePath}");
@@ -5180,7 +5226,7 @@ public class ValidationClass {{
         {
             result["location"] = new
             {
-                filePath = lineSpan.Value.Path,
+                filePath = FormatPath(lineSpan.Value.Path),
                 line = lineSpan.Value.StartLinePosition.Line,
                 column = lineSpan.Value.StartLinePosition.Character
             };
@@ -5384,7 +5430,7 @@ public class ValidationClass {{
                     ["containingNamespace"] = symbol.ContainingNamespace?.ToDisplayString() ?? "",
                     ["location"] = new
                     {
-                        filePath = lineSpan.Path,
+                        filePath = FormatPath(lineSpan.Path),
                         line = lineSpan.StartLinePosition.Line,
                         column = lineSpan.StartLinePosition.Character
                     }
@@ -5445,7 +5491,7 @@ public class ValidationClass {{
             isAbstract = typeSymbol.IsAbstract,
             location = lineSpan.HasValue ? new
             {
-                filePath = lineSpan.Value.Path,
+                filePath = FormatPath(lineSpan.Value.Path),
                 line = lineSpan.Value.StartLinePosition.Line,
                 column = lineSpan.Value.StartLinePosition.Character
             } : null
@@ -6638,7 +6684,7 @@ public class ValidationClass {{
                         var lineSpan = l.GetLineSpan();
                         return new
                         {
-                            filePath = lineSpan.Path,
+                            filePath = FormatPath(lineSpan.Path),
                             line = lineSpan.StartLinePosition.Line
                         };
                     }).Take(3).ToList()
@@ -6813,7 +6859,7 @@ public class ValidationClass {{
         return CreateSuccessResponse(
             data: new
             {
-                filePath = document.FilePath,
+                filePath = FormatPath(document.FilePath),
                 projectName = document.Project.Name,
                 @namespace = namespaceDecl?.Name.ToString(),
                 diagnosticSummary = diagnostics,
@@ -7059,7 +7105,7 @@ public class ValidationClass {{
                 var text = await addedDoc.GetTextAsync();
                 changedDocuments.Add(new
                 {
-                    filePath = addedDoc.FilePath ?? $"NewFile_{addedDoc.Name}",
+                    filePath = FormatPath(addedDoc.FilePath) ?? $"NewFile_{addedDoc.Name}",
                     fileName = addedDoc.Name,
                     isNewFile = true,
                     newText = preview ? text.ToString() : null,
@@ -7085,7 +7131,7 @@ public class ValidationClass {{
 
                 changedDocuments.Add(new
                 {
-                    filePath = newDoc.FilePath,
+                    filePath = FormatPath(newDoc.FilePath),
                     fileName = newDoc.Name,
                     isNewFile = false,
                     changeCount = changes.Count,
@@ -7114,7 +7160,7 @@ public class ValidationClass {{
 
                 changedDocuments.Add(new
                 {
-                    filePath = removedDoc.FilePath,
+                    filePath = FormatPath(removedDoc.FilePath),
                     fileName = removedDoc.Name,
                     isNewFile = false,
                     changeType = "Removed"

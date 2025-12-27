@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.1] - 2025-12-27
+
+### Added
+- Relative paths by default - saves tokens in AI agent context (configurable via `SHARPLENS_ABSOLUTE_PATHS=true`)
+- Cross-platform path normalization (forward slashes on all platforms)
+- Platform-aware file path comparison (case-insensitive on Windows, case-sensitive on Linux/macOS)
+
+### Changed
+- All file paths now return relative to solution directory by default
+- Paths use forward slashes consistently across Windows/Linux/macOS
+- File lookups now match file system behavior on each platform
+
 ## [1.2.0] - 2025-12-27
 
 ### Added

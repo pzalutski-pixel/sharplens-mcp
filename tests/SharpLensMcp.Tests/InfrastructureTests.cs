@@ -107,4 +107,30 @@ public class InfrastructureTests : RoslynServiceTestBase
         var data = GetData(result);
         data["mermaid"]?.Value<string>().Should().Contain("graph");
     }
+
+    [Fact]
+    public async Task Paths_AreRelativeByDefault()
+    {
+        // Act - search for a symbol to get file paths
+        var result = await Service.SearchSymbolsAsync("RoslynService", kind: "Class", maxResults: 1);
+
+        // Assert
+        AssertSuccess(result);
+        var data = GetData(result);
+        var symbols = data["results"] as JArray;
+        symbols.Should().NotBeNull();
+        symbols!.Count.Should().BeGreaterThan(0);
+
+        // Path is inside location object
+        var location = symbols[0]["location"];
+        location.Should().NotBeNull();
+        var filePath = location!["filePath"]?.Value<string>();
+        filePath.Should().NotBeNull();
+        filePath.Should().NotStartWith("C:");
+        filePath.Should().NotStartWith("/");
+        // Should use forward slashes for cross-platform consistency
+        filePath.Should().NotContain("\\");
+        // Should be a relative path like "src/RoslynService.cs"
+        filePath.Should().StartWith("src/");
+    }
 }
