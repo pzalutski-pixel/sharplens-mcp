@@ -25,6 +25,60 @@ dotnet build -c Release
 dotnet publish -c Release -o ./publish
 ```
 
+## Claude Code Setup
+
+1. **Install the tool globally**:
+```bash
+dotnet tool install -g SharpLensMcp
+```
+
+2. **Create `.mcp.json` in your project root**:
+```json
+{
+  "mcpServers": {
+    "sharplens": {
+      "type": "stdio",
+      "command": "sharplens",
+      "args": [],
+      "env": {
+        "DOTNET_SOLUTION_PATH": "/path/to/your/Solution.sln"
+      }
+    }
+  }
+}
+```
+
+3. **Restart Claude Code** to load the MCP server
+
+4. **Verify** by asking Claude to run a health check on the Roslyn server
+
+### Why Use This with Claude Code?
+
+Claude Code has native LSP support for basic navigation (go-to-definition, find references). SharpLensMcp adds **deep semantic analysis**:
+
+| Capability | Native LSP | SharpLensMcp |
+|------------|------------|--------------|
+| Go to definition | ✅ | ✅ |
+| Find references | ✅ | ✅ |
+| Find async methods missing CancellationToken | ❌ | ✅ |
+| Impact analysis (what breaks?) | ❌ | ✅ |
+| Dead code detection | ❌ | ✅ |
+| Complexity metrics | ❌ | ✅ |
+| Safe refactoring with preview | ❌ | ✅ |
+| Batch operations | ❌ | ✅ |
+
+## Configuration
+
+| Environment Variable | Description | Default |
+|---------------------|-------------|---------|
+| `DOTNET_SOLUTION_PATH` | Path to `.sln` file to auto-load on startup | None (must call `load_solution`) |
+| `ROSLYN_LOG_LEVEL` | Logging verbosity: `Trace`, `Debug`, `Information`, `Warning`, `Error` | `Information` |
+| `ROSLYN_TIMEOUT_SECONDS` | Timeout for long-running operations | `30` |
+| `ROSLYN_MAX_DIAGNOSTICS` | Maximum diagnostics to return | `100` |
+| `ROSLYN_ENABLE_SEMANTIC_CACHE` | Enable semantic model caching | `true` (set to `false` to disable) |
+
+If `DOTNET_SOLUTION_PATH` is not set, you must call the `load_solution` tool before using other tools.
+
 ## Features
 
 - **57 Semantic Analysis Tools** - Navigation, refactoring, code generation, diagnostics
@@ -107,9 +161,9 @@ dotnet publish -c Release -o ./publish
 | `dependency_graph` | Project dependencies |
 | `get_code_fixes` / `apply_code_fix` | Automated fixes |
 
-## Configure MCP Client
+## Other MCP Clients
 
-Add to your MCP client configuration:
+For MCP clients other than Claude Code, add to your configuration:
 
 ```json
 {
