@@ -4147,6 +4147,102 @@ public class ValidationClass {{
     }
 
     /// <summary>
+    /// Gets source code for multiple methods in a single call (batch optimization).
+    /// </summary>
+    public async Task<object> GetMethodSourceBatchAsync(
+        List<Dictionary<string, object>> methods,
+        int maxMethods = 20)
+    {
+        EnsureSolutionLoaded();
+
+        if (methods == null || methods.Count == 0)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                "methods array is required and must not be empty",
+                hint: "Provide an array like [{typeName: 'MyClass', methodName: 'MyMethod'}, ...]",
+                context: new { parameter = "methods" }
+            );
+        }
+
+        if (methods.Count > maxMethods)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                $"Too many methods requested ({methods.Count}). Maximum is {maxMethods}",
+                hint: $"Split request into batches of {maxMethods} or fewer"
+            );
+        }
+
+        var results = new List<object>();
+        var errors = new List<object>();
+
+        foreach (var methodReq in methods)
+        {
+            var typeName = methodReq.TryGetValue("typeName", out var tn) ? tn?.ToString() : null;
+            var methodName = methodReq.TryGetValue("methodName", out var mn) ? mn?.ToString() : null;
+            int? overloadIndex = methodReq.TryGetValue("overloadIndex", out var oi) && oi != null
+                ? Convert.ToInt32(oi)
+                : null;
+
+            if (string.IsNullOrWhiteSpace(typeName) || string.IsNullOrWhiteSpace(methodName))
+            {
+                errors.Add(new
+                {
+                    typeName,
+                    methodName,
+                    success = false,
+                    error = "typeName and methodName are required"
+                });
+                continue;
+            }
+
+            var result = await GetMethodSourceAsync(typeName, methodName, overloadIndex);
+
+            // Check if result was successful
+            var resultDict = result as dynamic;
+            if (resultDict?.success == true)
+            {
+                results.Add(new
+                {
+                    typeName,
+                    methodName,
+                    success = true,
+                    data = resultDict.data
+                });
+            }
+            else
+            {
+                errors.Add(new
+                {
+                    typeName,
+                    methodName,
+                    success = false,
+                    error = resultDict?.error
+                });
+            }
+        }
+
+        return CreateSuccessResponse(
+            data: new
+            {
+                totalRequested = methods.Count,
+                successCount = results.Count,
+                errorCount = errors.Count,
+                results,
+                errors = errors.Count > 0 ? errors : null
+            },
+            suggestedNextTools: new[]
+            {
+                results.Count > 0 ? "analyze_method for deeper analysis of specific methods" : null,
+                errors.Count > 0 ? "Check type/method names - some were not found" : null
+            }.Where(s => s != null).ToArray()!,
+            totalCount: methods.Count,
+            returnedCount: results.Count
+        );
+    }
+
+    /// <summary>
     /// Generates a constructor from fields and/or properties of a type.
     /// </summary>
     public async Task<object> GenerateConstructorAsync(
@@ -6466,13 +6562,15 @@ public class ValidationClass {{
 
     /// <summary>
     /// Gets comprehensive analysis of a method in a single call.
-    /// Combines signature, callers, and suggests data flow analysis.
+    /// Combines signature, callers, outgoing calls, and suggests data flow analysis.
     /// </summary>
     public async Task<object> AnalyzeMethodAsync(
         string typeName,
         string methodName,
         bool includeCallers = true,
-        int maxCallers = 20)
+        bool includeOutgoingCalls = false,
+        int maxCallers = 20,
+        int maxOutgoingCalls = 50)
     {
         EnsureSolutionLoaded();
 
@@ -6549,6 +6647,80 @@ public class ValidationClass {{
                 .ToList();
         }
 
+        // Get outgoing calls if requested
+        List<object>? outgoingCalls = null;
+        var totalOutgoingCalls = 0;
+        if (includeOutgoingCalls)
+        {
+            var location = method.Locations.FirstOrDefault(l => l.IsInSource);
+            if (location?.SourceTree != null)
+            {
+                var root = await location.SourceTree.GetRootAsync();
+                var node = root.FindNode(location.SourceSpan);
+                var methodDecl = node.AncestorsAndSelf().OfType<MethodDeclarationSyntax>().FirstOrDefault();
+
+                if (methodDecl != null)
+                {
+                    var document = _solution!.GetDocument(location.SourceTree);
+                    var semanticModel = document != null ? await document.GetSemanticModelAsync() : null;
+
+                    if (semanticModel != null)
+                    {
+                        var calls = new List<object>();
+                        var visited = new HashSet<string>();
+
+                        // Find method invocations
+                        foreach (var invocation in methodDecl.DescendantNodes().OfType<InvocationExpressionSyntax>())
+                        {
+                            var symbolInfo = semanticModel.GetSymbolInfo(invocation);
+                            if (symbolInfo.Symbol is IMethodSymbol calledMethod)
+                            {
+                                var key = calledMethod.ToDisplayString();
+                                if (visited.Contains(key)) continue;
+                                visited.Add(key);
+
+                                var callLoc = calledMethod.Locations.FirstOrDefault(l => l.IsInSource);
+                                calls.Add(new
+                                {
+                                    method = calledMethod.ToDisplayString(),
+                                    shortName = $"{calledMethod.ContainingType?.Name}.{calledMethod.Name}",
+                                    returnType = calledMethod.ReturnType.ToDisplayString(),
+                                    isAsync = calledMethod.IsAsync,
+                                    isExternal = callLoc == null
+                                });
+                            }
+                        }
+
+                        // Find property accesses
+                        foreach (var access in methodDecl.DescendantNodes().OfType<MemberAccessExpressionSyntax>())
+                        {
+                            var symbolInfo = semanticModel.GetSymbolInfo(access);
+                            if (symbolInfo.Symbol is IPropertySymbol prop)
+                            {
+                                var key = prop.ToDisplayString();
+                                if (visited.Contains(key)) continue;
+                                visited.Add(key);
+
+                                var propLoc = prop.Locations.FirstOrDefault(l => l.IsInSource);
+                                calls.Add(new
+                                {
+                                    method = prop.ToDisplayString(),
+                                    shortName = $"{prop.ContainingType?.Name}.{prop.Name}",
+                                    returnType = prop.Type.ToDisplayString(),
+                                    isAsync = false,
+                                    isProperty = true,
+                                    isExternal = propLoc == null
+                                });
+                            }
+                        }
+
+                        totalOutgoingCalls = calls.Count;
+                        outgoingCalls = calls.Take(maxOutgoingCalls).ToList();
+                    }
+                }
+            }
+        }
+
         return CreateSuccessResponse(
             data: new
             {
@@ -6556,6 +6728,9 @@ public class ValidationClass {{
                 callers,
                 totalCallers,
                 callersShown = callers?.Count ?? 0,
+                outgoingCalls,
+                totalOutgoingCalls,
+                outgoingCallsShown = outgoingCalls?.Count ?? 0,
                 location = GetSymbolLocation(method),
                 overloadCount = type.GetMembers(methodName).OfType<IMethodSymbol>().Count()
             },

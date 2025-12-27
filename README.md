@@ -3,7 +3,7 @@
 [![NuGet](https://img.shields.io/nuget/v/SharpLensMcp.svg)](https://www.nuget.org/packages/SharpLensMcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Model Context Protocol (MCP) server providing **57 AI-optimized tools** for .NET/C# semantic code analysis, navigation, refactoring, and code generation using Microsoft Roslyn.
+A Model Context Protocol (MCP) server providing **58 AI-optimized tools** for .NET/C# semantic code analysis, navigation, refactoring, and code generation using Microsoft Roslyn.
 
 Built for AI coding agents - provides compiler-accurate code understanding that AI cannot infer from reading source files alone.
 
@@ -79,9 +79,27 @@ Claude Code has native LSP support for basic navigation (go-to-definition, find 
 
 If `DOTNET_SOLUTION_PATH` is not set, you must call the `load_solution` tool before using other tools.
 
+## AI Agent Configuration Tips
+
+AI models may have trained bias toward using their native tools (Grep, Read, LSP) instead of MCP server tools, even when SharpLensMcp provides better capabilities.
+
+**To ensure optimal tool usage:**
+
+1. **Claude Code**: Add to your project's `CLAUDE.md`:
+   ```
+   For C# code analysis, prefer SharpLensMcp tools over native tools:
+   - Use `roslyn:search_symbols` instead of Grep for finding symbols
+   - Use `roslyn:get_method_source` instead of Read for viewing methods
+   - Use `roslyn:find_references` for semantic (not text) references
+   ```
+
+2. **Other MCP clients**: Configure tool priority in your agent's system prompt
+
+The semantic analysis from Roslyn is more accurate than text-based search, especially for overloaded methods, partial classes, and inheritance hierarchies.
+
 ## Features
 
-- **57 Semantic Analysis Tools** - Navigation, refactoring, code generation, diagnostics
+- **58 Semantic Analysis Tools** - Navigation, refactoring, code generation, diagnostics
 - **AI-Optimized Descriptions** - Clear USAGE/OUTPUT/WORKFLOW patterns
 - **Structured Responses** - Consistent `success/error/data` format with `suggestedNextTools`
 - **Zero-Based Coordinates** - Clear warnings to prevent off-by-one errors
@@ -143,13 +161,14 @@ If `DOTNET_SOLUTION_PATH` is not set, you must call the `load_solution` tool bef
 | `add_null_checks` | Generate ArgumentNullException guards |
 | `generate_equality_members` | Equals/GetHashCode/operators |
 
-### Compound Tools (5 tools)
+### Compound Tools (6 tools)
 | Tool | Description |
 |------|-------------|
 | `get_type_overview` | Full type info in one call |
-| `analyze_method` | Signature + callers + location |
+| `analyze_method` | Signature + callers + outgoing calls + location |
 | `get_file_overview` | File summary with diagnostics |
 | `get_method_source` | Source code by name |
+| `get_method_source_batch` | Multiple method sources in one call |
 | `get_instantiation_options` | How to create a type |
 
 ### Infrastructure (5 tools)

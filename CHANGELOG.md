@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.2.0] - 2025-12-27
+
+### Added
+- `get_method_source_batch` - Get source code for multiple methods in one call (reduces round trips when tracing code flows)
+- `includeOutgoingCalls` parameter for `analyze_method` - Now returns what methods a method calls, not just who calls it
+- AI Agent Configuration Tips section in README
+
+### Changed
+- Tool count increased from 57 to 58
+- `analyze_method` now supports comprehensive method analysis in a single call (signature + callers + outgoing calls)
+
 ## [1.1.1] - 2025-12-27
 
 ### Changed

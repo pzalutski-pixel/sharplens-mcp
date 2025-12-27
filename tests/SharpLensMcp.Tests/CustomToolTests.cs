@@ -283,4 +283,128 @@ public class CustomToolTests : RoslynServiceTestBase
     }
 
     #endregion
+
+    #region Method Source Batch Tests
+
+    [Fact]
+    public async Task GetMethodSourceBatch_WithMultipleMethods_ReturnsAllSources()
+    {
+        // Act
+        var result = await Service.GetMethodSourceBatchAsync(
+            new List<Dictionary<string, object>>
+            {
+                new() { ["typeName"] = "RoslynService", ["methodName"] = "LoadSolutionAsync" },
+                new() { ["typeName"] = "RoslynService", ["methodName"] = "GetHealthCheckAsync" }
+            });
+
+        // Assert
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["totalRequested"]?.Value<int>().Should().Be(2);
+        data["successCount"]?.Value<int>().Should().Be(2);
+
+        var results = data["results"] as JArray;
+        results.Should().NotBeNull();
+        results!.Count.Should().Be(2);
+
+        foreach (var methodResult in results)
+        {
+            methodResult["success"]?.Value<bool>().Should().BeTrue();
+            methodResult["data"]?["fullSource"].Should().NotBeNull();
+        }
+    }
+
+    [Fact]
+    public async Task GetMethodSourceBatch_WithNonExistentMethod_ReturnsPartialResults()
+    {
+        // Act
+        var result = await Service.GetMethodSourceBatchAsync(
+            new List<Dictionary<string, object>>
+            {
+                new() { ["typeName"] = "RoslynService", ["methodName"] = "LoadSolutionAsync" },
+                new() { ["typeName"] = "RoslynService", ["methodName"] = "NonExistentMethod12345" }
+            });
+
+        // Assert
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["successCount"]?.Value<int>().Should().Be(1);
+        data["errorCount"]?.Value<int>().Should().Be(1);
+    }
+
+    [Fact]
+    public async Task GetMethodSourceBatch_WithEmptyList_ReturnsError()
+    {
+        // Act
+        var result = await Service.GetMethodSourceBatchAsync(
+            new List<Dictionary<string, object>>());
+
+        // Assert - should return error for empty list
+        var json = JObject.FromObject(result);
+        json["success"]?.Value<bool>().Should().BeFalse();
+    }
+
+    #endregion
+
+    #region Analyze Method with Outgoing Calls Tests
+
+    [Fact]
+    public async Task AnalyzeMethod_WithOutgoingCalls_ReturnsCallsInfo()
+    {
+        // Act
+        var result = await Service.AnalyzeMethodAsync(
+            typeName: "RoslynService",
+            methodName: "LoadSolutionAsync",
+            includeCallers: true,
+            includeOutgoingCalls: true);
+
+        // Assert
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["signature"].Should().NotBeNull();
+        data["outgoingCalls"].Should().NotBeNull();
+        data["totalOutgoingCalls"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
+    }
+
+    [Fact]
+    public async Task AnalyzeMethod_WithoutOutgoingCalls_DoesNotIncludeThem()
+    {
+        // Act
+        var result = await Service.AnalyzeMethodAsync(
+            typeName: "RoslynService",
+            methodName: "GetHealthCheckAsync",
+            includeCallers: true,
+            includeOutgoingCalls: false);
+
+        // Assert
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["signature"].Should().NotBeNull();
+        // outgoingCalls should be null when not requested
+        data["outgoingCalls"]?.Type.Should().Be(JTokenType.Null);
+    }
+
+    [Fact]
+    public async Task AnalyzeMethod_WithBothCallersAndOutgoing_ReturnsComplete()
+    {
+        // Act
+        var result = await Service.AnalyzeMethodAsync(
+            typeName: "RoslynService",
+            methodName: "FindTypeByNameAsync",
+            includeCallers: true,
+            includeOutgoingCalls: true,
+            maxCallers: 5,
+            maxOutgoingCalls: 10);
+
+        // Assert
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["signature"].Should().NotBeNull();
+        data["callers"].Should().NotBeNull();
+        data["outgoingCalls"].Should().NotBeNull();
+        data["callersShown"]?.Value<int>().Should().BeLessThanOrEqualTo(5);
+        data["outgoingCallsShown"]?.Value<int>().Should().BeLessThanOrEqualTo(10);
+    }
+
+    #endregion
 }

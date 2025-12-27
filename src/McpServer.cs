@@ -706,9 +706,9 @@ USAGE: get_type_overview(""MyService"") - returns everything you need to underst
             (object)new
             {
                 name = "roslyn:analyze_method",
-                description = @"Get comprehensive method analysis in ONE CALL: signature + callers + location.
+                description = @"Get comprehensive method analysis in ONE CALL: signature + callers + outgoing calls + location.
 
-USAGE: analyze_method(""MyService"", ""ProcessData"") or analyze_method(""MyClass"", ""Calculate"", includeCallers=true)",
+USAGE: analyze_method(""MyService"", ""ProcessData"") or analyze_method(""MyClass"", ""Calculate"", includeCallers=true, includeOutgoingCalls=true)",
                 inputSchema = new
                 {
                     type = "object",
@@ -717,7 +717,9 @@ USAGE: analyze_method(""MyService"", ""ProcessData"") or analyze_method(""MyClas
                         typeName = new { type = "string", description = "Containing type name" },
                         methodName = new { type = "string", description = "Method name" },
                         includeCallers = new { type = "boolean", description = "Include caller analysis (default: true)" },
-                        maxCallers = new { type = "integer", description = "Max callers to return (default: 20)" }
+                        includeOutgoingCalls = new { type = "boolean", description = "Include methods/properties this method calls (default: false)" },
+                        maxCallers = new { type = "integer", description = "Max callers to return (default: 20)" },
+                        maxOutgoingCalls = new { type = "integer", description = "Max outgoing calls to return (default: 50)" }
                     },
                     required = new[] { "typeName", "methodName" }
                 }
@@ -870,6 +872,40 @@ OUTPUT: Full method source including signature, body, location (file + line numb
                         overloadIndex = new { type = "integer", description = "Which overload to get (0-based, default: 0)" }
                     },
                     required = new[] { "typeName", "methodName" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:get_method_source_batch",
+                description = @"Get source code for multiple methods in a single call (batch optimization).
+
+USAGE: get_method_source_batch(methods: [{typeName: 'ServiceA', methodName: 'Process'}, {typeName: 'ServiceB', methodName: 'Handle'}])
+OUTPUT: Results array with source for each method, plus errors array for any that failed.
+BENEFIT: One call instead of multiple - reduces round trips when tracing code flows.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        methods = new
+                        {
+                            type = "array",
+                            description = "Array of method requests",
+                            items = new
+                            {
+                                type = "object",
+                                properties = new
+                                {
+                                    typeName = new { type = "string", description = "Containing type name" },
+                                    methodName = new { type = "string", description = "Method name" },
+                                    overloadIndex = new { type = "integer", description = "Which overload (0-based, optional)" }
+                                },
+                                required = new[] { "typeName", "methodName" }
+                            }
+                        },
+                        maxMethods = new { type = "integer", description = "Maximum methods to process (default: 20)" }
+                    },
+                    required = new[] { "methods" }
                 }
             },
             (object)new
@@ -1383,7 +1419,9 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
                     arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required"),
                     arguments?["methodName"]?.GetValue<string>() ?? throw new Exception("methodName required"),
                     arguments?["includeCallers"]?.GetValue<bool>() ?? true,
-                    arguments?["maxCallers"]?.GetValue<int>() ?? 20),
+                    arguments?["includeOutgoingCalls"]?.GetValue<bool>() ?? false,
+                    arguments?["maxCallers"]?.GetValue<int>() ?? 20,
+                    arguments?["maxOutgoingCalls"]?.GetValue<int>() ?? 50),
 
                 "roslyn:get_file_overview" => await _roslynService.GetFileOverviewAsync(
                     arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required")),
@@ -1423,6 +1461,10 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
                     arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required"),
                     arguments?["methodName"]?.GetValue<string>() ?? throw new Exception("methodName required"),
                     arguments?["overloadIndex"]?.GetValue<int>()),
+
+                "roslyn:get_method_source_batch" => await _roslynService.GetMethodSourceBatchAsync(
+                    ParseMethodBatchRequests(arguments?["methods"]),
+                    arguments?["maxMethods"]?.GetValue<int>() ?? 20),
 
                 "roslyn:generate_constructor" => await _roslynService.GenerateConstructorAsync(
                     arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
@@ -1599,6 +1641,29 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
             }
         }
         return changes;
+    }
+
+    private List<Dictionary<string, object>> ParseMethodBatchRequests(JsonNode? methodsNode)
+    {
+        var methods = new List<Dictionary<string, object>>();
+        if (methodsNode is JsonArray array)
+        {
+            foreach (var item in array)
+            {
+                if (item is JsonObject obj)
+                {
+                    var method = new Dictionary<string, object>();
+                    if (obj["typeName"] != null)
+                        method["typeName"] = obj["typeName"]!.GetValue<string>();
+                    if (obj["methodName"] != null)
+                        method["methodName"] = obj["methodName"]!.GetValue<string>();
+                    if (obj["overloadIndex"] != null)
+                        method["overloadIndex"] = obj["overloadIndex"]!.GetValue<int>();
+                    methods.Add(method);
+                }
+            }
+        }
+        return methods;
     }
 
     private async Task LogAsync(string level, string message)

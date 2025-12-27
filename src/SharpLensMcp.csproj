@@ -7,16 +7,17 @@
     <LangVersion>latest</LangVersion>
 
     <!-- Package metadata -->
-    <Version>1.1.1</Version>
+    <Version>1.2.0</Version>
     <Authors>Peter Zalutski</Authors>
     <Copyright>Copyright (c) 2025 Peter Zalutski</Copyright>
-    <Description>MCP server providing 57 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
+    <Description>MCP server providing 58 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/pzalutski-pixel/sharplens-mcp</PackageProjectUrl>
     <RepositoryUrl>https://github.com/pzalutski-pixel/sharplens-mcp</RepositoryUrl>
     <PackageTags>mcp;roslyn;csharp;dotnet;code-analysis;ai;semantic-analysis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
+v1.2.0: Added get_method_source_batch for batch method lookups. Enhanced analyze_method with includeOutgoingCalls parameter.
 v1.1.1: Documentation update - Added Claude Code setup guide and configuration reference.
 v1.1.0: Added 10 new tools (57 total).
     </PackageReleaseNotes>
