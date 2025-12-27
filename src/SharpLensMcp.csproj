@@ -7,7 +7,7 @@
     <LangVersion>latest</LangVersion>
 
     <!-- Package metadata -->
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
     <Authors>Peter Zalutski</Authors>
     <Copyright>Copyright (c) 2025 Peter Zalutski</Copyright>
     <Description>MCP server providing 57 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
@@ -17,11 +17,8 @@
     <PackageTags>mcp;roslyn;csharp;dotnet;code-analysis;ai;semantic-analysis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
-v1.1.0: Added 10 new tools (57 total):
-- get_code_actions_at_position, apply_code_action_by_title
-- implement_missing_members, encapsulate_field, inline_variable, extract_variable
-- generate_equality_members, add_null_checks, get_complexity_metrics
-- get_type_members_batch for batch lookups
+v1.1.1: Documentation update - Added Claude Code setup guide and configuration reference.
+v1.1.0: Added 10 new tools (57 total).
     </PackageReleaseNotes>
 
     <!-- .NET Tool packaging -->

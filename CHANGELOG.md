@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1] - 2025-12-27
+
+### Changed
+- Added Claude Code setup guide with step-by-step instructions
+- Added configuration reference for all environment variables
+- Added comparison table: SharpLensMcp vs native LSP capabilities
+
 ## [1.1.0] - 2025-12-27
 
 ### Added
