@@ -98,6 +98,40 @@ AI models may have trained bias toward using their native tools (Grep, Read, LSP
 
 The semantic analysis from Roslyn is more accurate than text-based search, especially for overloaded methods, partial classes, and inheritance hierarchies.
 
+## Agent Responsibility: Document Synchronization
+
+**Important:** SharpLensMcp maintains an in-memory representation of your solution for fast queries. When files are modified externally (via Edit/Write tools), the agent is responsible for synchronizing changes.
+
+### When to call `sync_documents`:
+
+| Action | Call sync_documents? |
+|--------|---------------------|
+| Used Edit tool to modify .cs files | ✅ **Yes** |
+| Used Write tool to create new .cs files | ✅ **Yes** |
+| Deleted .cs files | ✅ **Yes** |
+| Used SharpLensMcp refactoring tools (rename, extract, etc.) | ❌ No (auto-updated) |
+| Modified .csproj files | ❌ No (use `load_solution` instead) |
+
+### Usage:
+
+```
+# After editing specific files
+sync_documents(filePaths: ["src/MyClass.cs", "src/MyService.cs"])
+
+# After bulk changes - sync all documents
+sync_documents()
+```
+
+### Why this design?
+
+This mirrors how LSP (Language Server Protocol) works - the client (editor) notifies the server of changes. This approach:
+- Eliminates race conditions (agent controls timing)
+- Avoids file watcher complexity and platform quirks
+- Is faster than full solution reload
+- Gives agents explicit control over workspace state
+
+**If you don't sync:** Queries may return stale data (old method signatures, missing new files, etc.)
+
 ## Features
 
 - **58 Semantic Analysis Tools** - Navigation, refactoring, code generation, diagnostics

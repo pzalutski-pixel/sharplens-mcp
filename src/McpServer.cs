@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace SharpLensMcp;
@@ -163,6 +163,36 @@ public class McpServer
                         solutionPath = new { type = "string", description = "Absolute path to .sln file" }
                     },
                     required = new[] { "solutionPath" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:sync_documents",
+                description = @"Synchronize document changes from disk into the loaded solution. Call this after using Edit/Write tools to ensure Roslyn has fresh content.
+
+USAGE:
+- sync_documents(filePaths: [""src/Foo.cs"", ""src/Bar.cs""]) - sync specific files
+- sync_documents() - sync ALL documents (refresh entire solution)
+
+WHEN TO CALL:
+- After using Edit tool to modify .cs files
+- After using Write tool to create new .cs files
+- After deleting .cs files
+- NOT needed after using SharpLensMcp refactoring tools (they auto-update)
+
+HANDLES: Modified files (updates content), new files (adds to solution), deleted files (removes from solution).
+Much faster than load_solution - only updates documents, doesn't re-parse projects.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        filePaths = new {
+                            type = "array",
+                            items = new { type = "string" },
+                            description = "Optional: specific file paths to sync. If omitted, syncs ALL documents from disk."
+                        }
+                    }
                 }
             },
             (object)new
@@ -1242,6 +1272,9 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
                 "roslyn:load_solution" => await _roslynService.LoadSolutionAsync(
                     arguments?["solutionPath"]?.GetValue<string>() ?? throw new Exception("solutionPath required")),
 
+                "roslyn:sync_documents" => await _roslynService.SyncDocumentsAsync(
+                    ParseStringArray(arguments?["filePaths"])),
+
                 "roslyn:get_symbol_info" => await _roslynService.GetSymbolInfoAsync(
                     arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
                     arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
@@ -1664,6 +1697,17 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
             }
         }
         return methods;
+    }
+
+    private List<string>? ParseStringArray(JsonNode? arrayNode)
+    {
+        if (arrayNode is not JsonArray array)
+            return null;
+
+        return array
+            .Where(item => item != null)
+            .Select(item => item!.GetValue<string>())
+            .ToList();
     }
 
     private async Task LogAsync(string level, string message)

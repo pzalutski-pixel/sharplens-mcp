@@ -1,4 +1,4 @@
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CodeActions;
 using Microsoft.CodeAnalysis.CodeFixes;
 using Microsoft.CodeAnalysis.CodeRefactorings;
@@ -334,6 +334,175 @@ public class RoslynService
                 "get_diagnostics to check for issues"
             }
         );
+    }
+
+    /// <summary>
+    /// Synchronize document changes from disk into the loaded solution.
+    /// Agent is responsible for calling this after using Edit/Write tools.
+    /// </summary>
+    public async Task<object> SyncDocumentsAsync(List<string>? filePaths)
+    {
+        if (_solution == null || _workspace == null)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.SolutionNotLoaded,
+                "No solution loaded. Call load_solution first.",
+                hint: "Use load_solution before syncing documents"
+            );
+        }
+
+        var solutionDir = Path.GetDirectoryName(_solution.FilePath);
+        var updated = new List<string>();
+        var added = new List<string>();
+        var removed = new List<string>();
+        var errors = new List<object>();
+
+        // Get all documents in solution for lookup
+        var documentsByPath = _solution.Projects
+            .SelectMany(p => p.Documents)
+            .Where(d => d.FilePath != null)
+            .ToDictionary(
+                d => Path.GetFullPath(d.FilePath!),
+                d => d,
+                PathComparison == StringComparison.OrdinalIgnoreCase
+                    ? StringComparer.OrdinalIgnoreCase
+                    : StringComparer.Ordinal
+            );
+
+        // Determine which files to sync
+        IEnumerable<string> pathsToSync;
+        if (filePaths != null && filePaths.Count > 0)
+        {
+            // Sync specific files
+            pathsToSync = filePaths.Select(p =>
+            {
+                if (Path.IsPathRooted(p))
+                    return Path.GetFullPath(p);
+                return Path.GetFullPath(Path.Combine(solutionDir ?? "", p));
+            });
+        }
+        else
+        {
+            // Sync all documents - check each for changes
+            pathsToSync = documentsByPath.Keys.ToList();
+        }
+
+        foreach (var fullPath in pathsToSync)
+        {
+            try
+            {
+                var fileExists = File.Exists(fullPath);
+                var docExists = documentsByPath.TryGetValue(fullPath, out var existingDoc);
+
+                if (fileExists && docExists)
+                {
+                    // Update existing document
+                    var newText = await File.ReadAllTextAsync(fullPath);
+                    var sourceText = SourceText.From(newText, Encoding.UTF8);
+                    _solution = _solution.WithDocumentText(existingDoc!.Id, sourceText);
+                    updated.Add(FormatPath(fullPath));
+                }
+                else if (fileExists && !docExists)
+                {
+                    // Add new document - need to find the right project
+                    var project = FindProjectForFile(fullPath);
+                    if (project != null)
+                    {
+                        var newText = await File.ReadAllTextAsync(fullPath);
+                        var sourceText = SourceText.From(newText, Encoding.UTF8);
+                        var docId = DocumentId.CreateNewId(project.Id);
+                        var fileName = Path.GetFileName(fullPath);
+
+                        // Determine folders from path relative to project
+                        var projectDir = Path.GetDirectoryName(project.FilePath);
+                        var folders = new List<string>();
+                        if (projectDir != null && fullPath.StartsWith(projectDir, PathComparison))
+                        {
+                            var relativePath = Path.GetRelativePath(projectDir, fullPath);
+                            var relativeDir = Path.GetDirectoryName(relativePath);
+                            if (!string.IsNullOrEmpty(relativeDir))
+                            {
+                                folders = relativeDir.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).ToList();
+                            }
+                        }
+
+                        _solution = _solution.AddDocument(docId, fileName, sourceText, folders, fullPath);
+                        added.Add(FormatPath(fullPath));
+                    }
+                    else
+                    {
+                        errors.Add(new { path = FormatPath(fullPath), error = "Could not determine project for file" });
+                    }
+                }
+                else if (!fileExists && docExists)
+                {
+                    // Remove deleted document
+                    _solution = _solution.RemoveDocument(existingDoc!.Id);
+                    removed.Add(FormatPath(fullPath));
+                }
+                // else: file doesn't exist and not in solution - nothing to do
+            }
+            catch (Exception ex)
+            {
+                errors.Add(new { path = FormatPath(fullPath), error = ex.Message });
+            }
+        }
+
+        // Apply changes to workspace
+        if (updated.Count > 0 || added.Count > 0 || removed.Count > 0)
+        {
+            _workspace.TryApplyChanges(_solution);
+            _documentCache.Clear(); // Clear cache after sync
+        }
+
+        return CreateSuccessResponse(
+            data: new
+            {
+                updated = updated.Count,
+                added = added.Count,
+                removed = removed.Count,
+                totalSynced = updated.Count + added.Count + removed.Count,
+                updatedFiles = updated,
+                addedFiles = added,
+                removedFiles = removed,
+                errors = errors.Count > 0 ? errors : null
+            },
+            suggestedNextTools: new[]
+            {
+                "get_diagnostics to check for errors after sync",
+                "search_symbols to find updated code"
+            }
+        );
+    }
+
+    /// <summary>
+    /// Find the best project for a file based on its path.
+    /// </summary>
+    private Project? FindProjectForFile(string filePath)
+    {
+        if (_solution == null) return null;
+
+        var fileDir = Path.GetDirectoryName(filePath);
+        if (fileDir == null) return null;
+
+        // Find project whose directory is an ancestor of the file
+        Project? bestMatch = null;
+        int bestMatchLength = 0;
+
+        foreach (var project in _solution.Projects)
+        {
+            var projectDir = Path.GetDirectoryName(project.FilePath);
+            if (projectDir != null && fileDir.StartsWith(projectDir, PathComparison))
+            {
+                if (projectDir.Length > bestMatchLength)
+                {
+                    bestMatch = project;
+                    bestMatchLength = projectDir.Length;
+                }
+            }
+        }
+
+        return bestMatch;
     }
 
     public async Task<object> GetHealthCheckAsync()

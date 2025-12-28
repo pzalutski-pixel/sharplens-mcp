@@ -7,7 +7,7 @@
     <LangVersion>latest</LangVersion>
 
     <!-- Package metadata -->
-    <Version>1.2.1</Version>
+    <Version>1.2.2</Version>
     <Authors>Peter Zalutski</Authors>
     <Copyright>Copyright (c) 2025 Peter Zalutski</Copyright>
     <Description>MCP server providing 58 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
@@ -17,6 +17,7 @@
     <PackageTags>mcp;roslyn;csharp;dotnet;code-analysis;ai;semantic-analysis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
+v1.2.2: Added sync_documents for agent-controlled document synchronization after external edits.
 v1.2.1: Relative paths by default (saves tokens). Cross-platform path normalization.
 v1.2.0: Added get_method_source_batch for batch method lookups. Enhanced analyze_method with includeOutgoingCalls parameter.
 v1.1.1: Documentation update - Added Claude Code setup guide and configuration reference.

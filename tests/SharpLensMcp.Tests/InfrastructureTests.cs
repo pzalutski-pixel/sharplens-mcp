@@ -1,4 +1,4 @@
-using FluentAssertions;
+﻿using FluentAssertions;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
@@ -132,5 +132,50 @@ public class InfrastructureTests : RoslynServiceTestBase
         filePath.Should().NotContain("\\");
         // Should be a relative path like "src/RoslynService.cs"
         filePath.Should().StartWith("src/");
+    }
+
+    [Fact]
+    public async Task SyncDocuments_WithNoFiles_SyncsAllDocuments()
+    {
+        // Act - sync all documents (no specific files)
+        var result = await Service.SyncDocumentsAsync(null);
+
+        // Assert
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["totalSynced"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
+        data["updated"].Should().NotBeNull();
+        data["added"].Should().NotBeNull();
+        data["removed"].Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task SyncDocuments_WithSpecificFile_SyncsOnlyThatFile()
+    {
+        // Act - sync a specific file
+        var result = await Service.SyncDocumentsAsync(new List<string> { "src/RoslynService.cs" });
+
+        // Assert
+        AssertSuccess(result);
+        var data = GetData(result);
+        // File exists, should be in updated list
+        var updatedFiles = data["updatedFiles"] as JArray;
+        updatedFiles.Should().NotBeNull();
+
+        // Should have synced exactly 1 file
+        data["totalSynced"]?.Value<int>().Should().Be(1);
+    }
+
+    [Fact]
+    public async Task SyncDocuments_WithNonExistentFile_HandlesGracefully()
+    {
+        // Act - sync a file that doesn't exist and isn't in solution
+        var result = await Service.SyncDocumentsAsync(new List<string> { "src/NonExistent.cs" });
+
+        // Assert
+        AssertSuccess(result);
+        var data = GetData(result);
+        // Nothing to sync for non-existent file not in solution
+        data["totalSynced"]?.Value<int>().Should().Be(0);
     }
 }

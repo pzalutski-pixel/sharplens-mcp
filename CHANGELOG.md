@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.2] - 2025-12-28
+
+### Added
+- `sync_documents` infrastructure tool - Synchronize file changes from disk into the loaded solution
+  - Faster than `load_solution` - only updates changed documents, doesn't re-parse projects
+  - Handles modified files, new files, and deleted files
+  - Supports specific file list or sync all documents
+- Agent Responsibility documentation in README explaining sync workflow
+
+### Changed
+- Agents are now responsible for calling `sync_documents` after using Edit/Write tools
+- SharpLensMcp refactoring tools continue to auto-update (no sync needed)
+
 ## [1.2.1] - 2025-12-27
 
 ### Added
