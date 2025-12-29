@@ -448,11 +448,10 @@ public class RoslynService
             }
         }
 
-        // Apply changes to workspace
+        // Clear cache after sync (no need to call TryApplyChanges - we're syncing FROM disk, not TO disk)
         if (updated.Count > 0 || added.Count > 0 || removed.Count > 0)
         {
-            _workspace.TryApplyChanges(_solution);
-            _documentCache.Clear(); // Clear cache after sync
+            _documentCache.Clear();
         }
 
         return CreateSuccessResponse(

@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.2.3] - 2025-12-28
+
+### Fixed
+- Removed erroneous `TryApplyChanges` call in `sync_documents` that caused Roslyn to add `<Compile Include>` entries to SDK-style .csproj files (known Roslyn issue #36781)
+
 ## [1.2.2] - 2025-12-28
 
 ### Added
