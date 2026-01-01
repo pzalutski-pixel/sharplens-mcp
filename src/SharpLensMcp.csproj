@@ -7,7 +7,7 @@
     <LangVersion>latest</LangVersion>
 
     <!-- Package metadata -->
-    <Version>1.2.3</Version>
+    <Version>1.2.4</Version>
     <Authors>Peter Zalutski</Authors>
     <Copyright>Copyright (c) 2025 Peter Zalutski</Copyright>
     <Description>MCP server providing 58 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
@@ -17,6 +17,7 @@
     <PackageTags>mcp;roslyn;csharp;dotnet;code-analysis;ai;semantic-analysis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
+v1.2.4: Added GitHub Actions CI/CD for trusted builds. Source Link enabled for source traceability.
 v1.2.3: Fixed sync_documents adding unwanted Compile Include entries to .csproj files.
 v1.2.2: Added sync_documents for agent-controlled document synchronization after external edits.
 v1.2.1: Relative paths by default (saves tokens). Cross-platform path normalization.
