@@ -28,6 +28,14 @@ v1.1.0: Added 10 new tools (57 total).
     <!-- .NET Tool packaging -->
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>sharplens</ToolCommandName>
+
+    <!-- Source Link and deterministic builds for supply chain trust -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
   </PropertyGroup>
 
   <ItemGroup>
@@ -35,6 +43,7 @@ v1.1.0: Added 10 new tools (57 total).
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.9.2" />
     <PackageReference Include="Microsoft.CodeAnalysis.Features" Version="4.9.2" />
     <PackageReference Include="Microsoft.Build.Locator" Version="1.6.10" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
   </ItemGroup>
 
   <ItemGroup>
