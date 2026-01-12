@@ -41,7 +41,7 @@ dotnet tool install -g SharpLensMcp
       "command": "sharplens",
       "args": [],
       "env": {
-        "DOTNET_SOLUTION_PATH": "/path/to/your/Solution.sln"
+        "DOTNET_SOLUTION_PATH": "/path/to/your/Solution.sln (or .slnx)"
       }
     }
   }
@@ -71,7 +71,7 @@ Claude Code has native LSP support for basic navigation (go-to-definition, find 
 
 | Environment Variable | Description | Default |
 |---------------------|-------------|---------|
-| `DOTNET_SOLUTION_PATH` | Path to `.sln` file to auto-load on startup | None (must call `load_solution`) |
+| `DOTNET_SOLUTION_PATH` | Path to `.sln` or `.slnx` file to auto-load on startup | None (must call `load_solution`) |
 | `SHARPLENS_ABSOLUTE_PATHS` | Use absolute paths instead of relative | `false` (relative paths save tokens) |
 | `ROSLYN_LOG_LEVEL` | Logging verbosity: `Trace`, `Debug`, `Information`, `Warning`, `Error` | `Information` |
 | `ROSLYN_TIMEOUT_SECONDS` | Timeout for long-running operations | `30` |
@@ -210,7 +210,7 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 | Tool | Description |
 |------|-------------|
 | `health_check` | Server status |
-| `load_solution` | Load .sln for analysis |
+| `load_solution` | Load .sln/.slnx for analysis |
 | `get_project_structure` | Solution structure |
 | `dependency_graph` | Project dependencies |
 | `get_code_fixes` / `apply_code_fix` | Automated fixes |
@@ -226,7 +226,7 @@ For MCP clients other than Claude Code, add to your configuration:
       "command": "sharplens",
       "args": [],
       "env": {
-        "DOTNET_SOLUTION_PATH": "/path/to/your/Solution.sln"
+        "DOTNET_SOLUTION_PATH": "/path/to/your/Solution.sln (or .slnx)"
       }
     }
   }
@@ -235,7 +235,7 @@ For MCP clients other than Claude Code, add to your configuration:
 
 ## Usage
 
-1. **Load a solution**: Call `roslyn:load_solution` with path to `.sln` file (or set `DOTNET_SOLUTION_PATH`)
+1. **Load a solution**: Call `roslyn:load_solution` with path to `.sln` or `.slnx` file (or set `DOTNET_SOLUTION_PATH`)
 2. **Analyze code**: Use any of the 57 tools for navigation, analysis, refactoring
 3. **Refactor safely**: Preview changes before applying with `preview: true`
 

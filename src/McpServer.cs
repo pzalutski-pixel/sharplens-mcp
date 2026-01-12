@@ -28,10 +28,12 @@ public class McpServer
         {
             try
             {
-                // If it's a directory, try to find a .sln file
+                // If it's a directory, try to find a .sln or .slnx file
                 if (Directory.Exists(solutionPath))
                 {
-                    var slnFiles = Directory.GetFiles(solutionPath, "*.sln");
+                    var slnFiles = Directory.GetFiles(solutionPath, "*.sln")
+                        .Concat(Directory.GetFiles(solutionPath, "*.slnx"))
+                        .ToArray();
                     if (slnFiles.Length > 0)
                     {
                         solutionPath = slnFiles[0];
@@ -160,7 +162,7 @@ public class McpServer
                     type = "object",
                     properties = new
                     {
-                        solutionPath = new { type = "string", description = "Absolute path to .sln file" }
+                        solutionPath = new { type = "string", description = "Absolute path to .sln or .slnx file" }
                     },
                     required = new[] { "solutionPath" }
                 }
