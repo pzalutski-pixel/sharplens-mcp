@@ -309,10 +309,10 @@ public class RoslynService
         _documentCache.Clear();
 
         _workspace = MSBuildWorkspace.Create();
-        _workspace.WorkspaceFailed += (sender, args) =>
+        _workspace.RegisterWorkspaceFailedHandler(args =>
         {
-            Console.Error.WriteLine($"[Warning] Workspace: {args.Diagnostic.Message}");
-        };
+            Logger.Log("Workspace", LogLevel.Warning, args.Diagnostic.Message);
+        });
 
         _solution = await _workspace.OpenSolutionAsync(solutionPath);
         _solutionLoadedAt = DateTime.UtcNow;
@@ -1670,7 +1670,7 @@ public class RoslynService
 
         // Collect all changed documents
         var changedDocuments = new List<object>();
-        var solutionChanges = changedSolution.GetChanges(_solution!);
+        var solutionChanges = changedSolution!.GetChanges(_solution!);
 
         foreach (var projectChanges in solutionChanges.GetProjectChanges())
         {
@@ -2087,7 +2087,7 @@ public class RoslynService
                 referenceCount,
                 references = includeReferences ? (referenceCount > 100 ? references!.Concat(new[] { $"... and {referenceCount - 100} more" }).ToList() : references) : null,
                 projectReferences,
-                documents = includeDocuments ? (documentCount > 500 ? documents!.Concat(new[] { new { name = $"... and {documentCount - 500} more documents", filePath = (string?)null, folders = new List<string>() } }).ToList() : documents) : null
+                documents = includeDocuments ? (documentCount > 500 ? documents!.Concat(new[] { new { name = $"... and {documentCount - 500} more documents", filePath = "", folders = new List<string>() } }).ToList() : documents) : null               
             });
         }
 
@@ -7260,7 +7260,7 @@ public class ValidationClass {{
 
         // Collect all changed documents (reuse pattern from ApplyCodeFixAsync)
         var changedDocuments = new List<object>();
-        var solutionChanges = changedSolution.GetChanges(_solution!);
+        var solutionChanges = changedSolution!.GetChanges(_solution!);
 
         foreach (var projectChanges in solutionChanges.GetProjectChanges())
         {

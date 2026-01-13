@@ -5,12 +5,12 @@ namespace SharpLensMcp;
 
 public class McpServer
 {
-    private readonly RoslynService _roslynService;
+    private readonly ProcessManager _processManager;
     private readonly JsonSerializerOptions _jsonOptions;
 
-    public McpServer()
+    public McpServer(ProcessManager processManager)
     {
-        _roslynService = new RoslynService();
+        _processManager = processManager ?? throw new ArgumentNullException(nameof(processManager));
         _jsonOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -20,7 +20,7 @@ public class McpServer
 
     public async Task RunAsync()
     {
-        await LogAsync("Information", "Roslyn MCP Server starting...");
+        Log(LogLevel.Information, "Roslyn MCP Server starting...");
 
         // Auto-load solution from environment variable
         var solutionPath = Environment.GetEnvironmentVariable("DOTNET_SOLUTION_PATH");
@@ -42,13 +42,18 @@ public class McpServer
 
                 if (File.Exists(solutionPath))
                 {
-                    await LogAsync("Information", $"Auto-loading solution: {solutionPath}");
-                    await _roslynService.LoadSolutionAsync(solutionPath);
+                    Log(LogLevel.Information, $"Auto-loading solution: {solutionPath}");
+                    var proxy = await _processManager.EnsureWorkerAsync();
+                    await proxy.InvokeToolAsync("load_solution", new Dictionary<string, object?>
+                    {
+                        ["solutionPath"] = solutionPath
+                    });
+                    _processManager.LastLoadedSolutionPath = solutionPath;
                 }
             }
             catch (Exception ex)
             {
-                await LogAsync("Warning", $"Failed to auto-load solution: {ex.Message}");
+                Log(LogLevel.Warning, $"Failed to auto-load solution: {ex.Message}");
             }
         }
 
@@ -63,14 +68,14 @@ public class McpServer
                 var line = await reader.ReadLineAsync();
                 if (line == null)
                 {
-                    await LogAsync("Information", "Received EOF on stdin, shutting down");
+                    Log(LogLevel.Information, "Received EOF on stdin, shutting down");
                     break;
                 }
 
                 if (string.IsNullOrWhiteSpace(line))
                     continue;
 
-                await LogAsync("Debug", $"Received request: {line}");
+                Log(LogLevel.Debug, $"Received request: {line}");
 
                 var response = await HandleRequestAsync(line);
 
@@ -78,11 +83,11 @@ public class McpServer
                 await writer.WriteLineAsync(responseJson);
                 await writer.FlushAsync();
 
-                await LogAsync("Debug", $"Sent response: {responseJson}");
+                Log(LogLevel.Debug, $"Sent response: {responseJson}");
             }
             catch (Exception ex)
             {
-                await LogAsync("Error", $"Error in main loop: {ex}");
+                Log(LogLevel.Error, $"Error in main loop: {ex}");
             }
         }
     }
@@ -116,7 +121,7 @@ public class McpServer
         }
         catch (Exception ex)
         {
-            await LogAsync("Error", $"Error handling request: {ex}");
+            Log(LogLevel.Error, $"Error handling request: {ex}");
             return CreateErrorResponse(null, -32603, $"Internal error: {ex.Message}");
         }
     }
@@ -165,6 +170,26 @@ public class McpServer
                         solutionPath = new { type = "string", description = "Absolute path to .sln or .slnx file" }
                     },
                     required = new[] { "solutionPath" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:unload_solution",
+                description = @"Unload solution and release all file locks (including source generator DLLs). Call before rebuilding projects with source generators. Must call load_solution again to continue analysis.
+
+WORKFLOW:
+1. Call unload_solution before running builds
+2. Perform your build (dotnet build, etc.)
+3. Call load_solution to resume analysis
+
+This terminates the worker process to release all file handles held by MSBuildWorkspace.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        force = new { type = "boolean", description = "Force kill worker if graceful shutdown times out (default: true)" }
+                    }
                 }
             },
             (object)new
@@ -1267,334 +1292,87 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
                 return CreateErrorResponse(id, -32602, "Invalid params: missing tool name");
             }
 
-            var result = name switch
+            object result;
+
+            // Handle unload_solution locally (terminates worker)
+            if (name == "roslyn:unload_solution")
             {
-                "roslyn:health_check" => await _roslynService.GetHealthCheckAsync(),
+                var force = arguments?["force"]?.GetValue<bool>() ?? true;
+                await _processManager.ShutdownWorkerAsync(force);
+                result = new
+                {
+                    success = true,
+                    data = new
+                    {
+                        message = "Solution unloaded. Worker process terminated. File locks released.",
+                        lastSolutionPath = _processManager.LastLoadedSolutionPath
+                    },
+                    metadata = new
+                    {
+                        suggestedNextTools = new[] { "load_solution" }
+                    }
+                };
+            }
+            // Handle health_check with worker status
+            else if (name == "roslyn:health_check")
+            {
+                var workerInfo = new
+                {
+                    workerRunning = _processManager.IsWorkerRunning,
+                    workerPid = _processManager.WorkerProcessId,
+                    workerUptime = _processManager.WorkerUptime?.ToString(@"hh\:mm\:ss"),
+                    lastLoadedSolution = _processManager.LastLoadedSolutionPath
+                };
 
-                "roslyn:load_solution" => await _roslynService.LoadSolutionAsync(
-                    arguments?["solutionPath"]?.GetValue<string>() ?? throw new Exception("solutionPath required")),
+                if (_processManager.IsWorkerRunning)
+                {
+                    // Get health check from worker
+                    var proxy = await _processManager.EnsureWorkerAsync();
+                    var workerHealth = await proxy.InvokeToolAsync("health_check", null);
 
-                "roslyn:sync_documents" => await _roslynService.SyncDocumentsAsync(
-                    ParseStringArray(arguments?["filePaths"])),
-
-                "roslyn:get_symbol_info" => await _roslynService.GetSymbolInfoAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required")),
-
-                "roslyn:go_to_definition" => await _roslynService.GoToDefinitionAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required")),
-
-                "roslyn:find_references" => await _roslynService.FindReferencesAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["maxResults"]?.GetValue<int>()),
-
-                "roslyn:find_implementations" => await _roslynService.FindImplementationsAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["maxResults"]?.GetValue<int>()),
-
-                "roslyn:get_type_hierarchy" => await _roslynService.GetTypeHierarchyAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["maxDerivedTypes"]?.GetValue<int>()),
-
-                "roslyn:search_symbols" => await _roslynService.SearchSymbolsAsync(
-                    arguments?["query"]?.GetValue<string>() ?? throw new Exception("query required"),
-                    arguments?["kind"]?.GetValue<string>(),
-                    arguments?["maxResults"]?.GetValue<int>() ?? 50,
-                    arguments?["namespaceFilter"]?.GetValue<string>(),
-                    arguments?["offset"]?.GetValue<int>() ?? 0),
-
-                "roslyn:semantic_query" => await _roslynService.SemanticQueryAsync(
-                    arguments?["kinds"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList(),
-                    arguments?["isAsync"]?.GetValue<bool?>(),
-                    arguments?["namespaceFilter"]?.GetValue<string>(),
-                    arguments?["accessibility"]?.GetValue<string>(),
-                    arguments?["isStatic"]?.GetValue<bool?>(),
-                    arguments?["type"]?.GetValue<string>(),
-                    arguments?["returnType"]?.GetValue<string>(),
-                    arguments?["attributes"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList(),
-                    arguments?["parameterIncludes"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList(),
-                    arguments?["parameterExcludes"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList(),
-                    arguments?["maxResults"]?.GetValue<int>()),
-
-                "roslyn:get_diagnostics" => await _roslynService.GetDiagnosticsAsync(
-                    arguments?["filePath"]?.GetValue<string>(),
-                    arguments?["projectPath"]?.GetValue<string>(),
-                    arguments?["severity"]?.GetValue<string>(),
-                    arguments?["includeHidden"]?.GetValue<bool>() ?? false),
-
-                "roslyn:get_code_fixes" => await _roslynService.GetCodeFixesAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["diagnosticId"]?.GetValue<string>() ?? throw new Exception("diagnosticId required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required")),
-
-                "roslyn:apply_code_fix" => await _roslynService.ApplyCodeFixAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["diagnosticId"]?.GetValue<string>() ?? throw new Exception("diagnosticId required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["fixIndex"]?.GetValue<int?>(),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
-
-                "roslyn:get_project_structure" => await _roslynService.GetProjectStructureAsync(
-                    arguments?["includeReferences"]?.GetValue<bool>() ?? true,
-                    arguments?["includeDocuments"]?.GetValue<bool>() ?? false,
-                    arguments?["projectNamePattern"]?.GetValue<string>(),
-                    arguments?["maxProjects"]?.GetValue<int>(),
-                    arguments?["summaryOnly"]?.GetValue<bool>() ?? false),
-
-                "roslyn:organize_usings" => await _roslynService.OrganizeUsingsAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required")),
-
-                "roslyn:organize_usings_batch" => await _roslynService.OrganizeUsingsBatchAsync(
-                    arguments?["projectName"]?.GetValue<string>(),
-                    arguments?["filePattern"]?.GetValue<string>(),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
-
-                "roslyn:format_document_batch" => await _roslynService.FormatDocumentBatchAsync(
-                    arguments?["projectName"]?.GetValue<string>(),
-                    arguments?["includeTests"]?.GetValue<bool>() ?? true,
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
-
-                "roslyn:get_method_overloads" => await _roslynService.GetMethodOverloadsAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required")),
-
-                "roslyn:get_containing_member" => await _roslynService.GetContainingMemberAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required")),
-
-                "roslyn:find_callers" => await _roslynService.FindCallersAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["maxResults"]?.GetValue<int>()),
-
-                "roslyn:find_unused_code" => await _roslynService.FindUnusedCodeAsync(
-                    arguments?["projectName"]?.GetValue<string>(),
-                    arguments?["includePrivate"]?.GetValue<bool>() ?? true,
-                    arguments?["includeInternal"]?.GetValue<bool>() ?? false,
-                    arguments?["symbolKindFilter"]?.GetValue<string>(),
-                    arguments?["maxResults"]?.GetValue<int>()),
-
-                "roslyn:rename_symbol" => await _roslynService.RenameSymbolAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["newName"]?.GetValue<string>() ?? throw new Exception("newName required"),
-                    arguments?["preview"]?.GetValue<bool>() ?? true,
-                    arguments?["maxFiles"]?.GetValue<int>(),
-                    arguments?["verbosity"]?.GetValue<string>()),
-
-                "roslyn:extract_interface" => await _roslynService.ExtractInterfaceAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["interfaceName"]?.GetValue<string>() ?? throw new Exception("interfaceName required"),
-                    arguments?["includeMemberNames"]?.AsArray()?.Select(n => n?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList()),
-
-                "roslyn:dependency_graph" => await _roslynService.GetDependencyGraphAsync(
-                    arguments?["format"]?.GetValue<string>()),
-
-                // ============ NEW TOOLS: Name-Based Type Discovery ============
-
-                "roslyn:get_type_members" => await _roslynService.GetTypeMembersAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required"),
-                    arguments?["includeInherited"]?.GetValue<bool>() ?? false,
-                    arguments?["memberKind"]?.GetValue<string>(),
-                    arguments?["verbosity"]?.GetValue<string>() ?? "compact",
-                    arguments?["maxResults"]?.GetValue<int>() ?? 100),
-
-                "roslyn:get_method_signature" => await _roslynService.GetMethodSignatureAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required"),
-                    arguments?["methodName"]?.GetValue<string>() ?? throw new Exception("methodName required"),
-                    arguments?["overloadIndex"]?.GetValue<int?>()),
-
-                "roslyn:get_attributes" => await _roslynService.GetAttributesAsync(
-                    arguments?["attributeName"]?.GetValue<string>() ?? throw new Exception("attributeName required"),
-                    arguments?["scope"]?.GetValue<string>(),
-                    arguments?["parseGodotHints"]?.GetValue<bool>() ?? true,
-                    arguments?["maxResults"]?.GetValue<int>() ?? 100),
-
-                "roslyn:get_derived_types" => await _roslynService.GetDerivedTypesAsync(
-                    arguments?["baseTypeName"]?.GetValue<string>() ?? throw new Exception("baseTypeName required"),
-                    arguments?["includeTransitive"]?.GetValue<bool>() ?? true,
-                    arguments?["maxResults"]?.GetValue<int>() ?? 100),
-
-                "roslyn:get_base_types" => await _roslynService.GetBaseTypesAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required")),
-
-                "roslyn:analyze_data_flow" => await _roslynService.AnalyzeDataFlowAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["startLine"]?.GetValue<int>() ?? throw new Exception("startLine required"),
-                    arguments?["endLine"]?.GetValue<int>() ?? throw new Exception("endLine required")),
-
-                "roslyn:analyze_control_flow" => await _roslynService.AnalyzeControlFlowAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["startLine"]?.GetValue<int>() ?? throw new Exception("startLine required"),
-                    arguments?["endLine"]?.GetValue<int>() ?? throw new Exception("endLine required")),
-
-                // ============ COMPOUND TOOLS ============
-
-                "roslyn:get_type_overview" => await _roslynService.GetTypeOverviewAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required")),
-
-                "roslyn:analyze_method" => await _roslynService.AnalyzeMethodAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required"),
-                    arguments?["methodName"]?.GetValue<string>() ?? throw new Exception("methodName required"),
-                    arguments?["includeCallers"]?.GetValue<bool>() ?? true,
-                    arguments?["includeOutgoingCalls"]?.GetValue<bool>() ?? false,
-                    arguments?["maxCallers"]?.GetValue<int>() ?? 20,
-                    arguments?["maxOutgoingCalls"]?.GetValue<int>() ?? 50),
-
-                "roslyn:get_file_overview" => await _roslynService.GetFileOverviewAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required")),
-
-                // Phase 2: AI-Focused Tools
-                "roslyn:get_missing_members" => await _roslynService.GetMissingMembersAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required")),
-
-                "roslyn:get_outgoing_calls" => await _roslynService.GetOutgoingCallsAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["maxDepth"]?.GetValue<int>()),
-
-                "roslyn:validate_code" => await _roslynService.ValidateCodeAsync(
-                    arguments?["code"]?.GetValue<string>() ?? throw new Exception("code required"),
-                    arguments?["contextFilePath"]?.GetValue<string>(),
-                    arguments?["standalone"]?.GetValue<bool>() ?? false),
-
-                "roslyn:check_type_compatibility" => await _roslynService.CheckTypeCompatibilityAsync(
-                    arguments?["sourceType"]?.GetValue<string>() ?? throw new Exception("sourceType required"),
-                    arguments?["targetType"]?.GetValue<string>() ?? throw new Exception("targetType required")),
-
-                "roslyn:get_instantiation_options" => await _roslynService.GetInstantiationOptionsAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required")),
-
-                "roslyn:analyze_change_impact" => await _roslynService.AnalyzeChangeImpactAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["changeType"]?.GetValue<string>() ?? throw new Exception("changeType required"),
-                    arguments?["newValue"]?.GetValue<string>()),
-
-                "roslyn:get_method_source" => await _roslynService.GetMethodSourceAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required"),
-                    arguments?["methodName"]?.GetValue<string>() ?? throw new Exception("methodName required"),
-                    arguments?["overloadIndex"]?.GetValue<int>()),
-
-                "roslyn:get_method_source_batch" => await _roslynService.GetMethodSourceBatchAsync(
-                    ParseMethodBatchRequests(arguments?["methods"]),
-                    arguments?["maxMethods"]?.GetValue<int>() ?? 20),
-
-                "roslyn:generate_constructor" => await _roslynService.GenerateConstructorAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["includeProperties"]?.GetValue<bool>() ?? false,
-                    arguments?["initializeToDefault"]?.GetValue<bool>() ?? false),
-
-                "roslyn:change_signature" => await _roslynService.ChangeSignatureAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    ParseSignatureChanges(arguments?["changes"]),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
-
-                "roslyn:extract_method" => await _roslynService.ExtractMethodAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["startLine"]?.GetValue<int>() ?? throw new Exception("startLine required"),
-                    arguments?["endLine"]?.GetValue<int>() ?? throw new Exception("endLine required"),
-                    arguments?["methodName"]?.GetValue<string>() ?? throw new Exception("methodName required"),
-                    arguments?["accessibility"]?.GetValue<string>() ?? "private",
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
-
-                "roslyn:get_code_actions_at_position" => await _roslynService.GetCodeActionsAtPositionAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["endLine"]?.GetValue<int?>(),
-                    arguments?["endColumn"]?.GetValue<int?>(),
-                    arguments?["includeCodeFixes"]?.GetValue<bool>() ?? true,
-                    arguments?["includeRefactorings"]?.GetValue<bool>() ?? true),
-
-                "roslyn:apply_code_action_by_title" => await _roslynService.ApplyCodeActionByTitleAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["title"]?.GetValue<string>() ?? throw new Exception("title required"),
-                    arguments?["endLine"]?.GetValue<int?>(),
-                    arguments?["endColumn"]?.GetValue<int?>(),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
-
-                "roslyn:implement_missing_members" => await _roslynService.ImplementMissingMembersAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
-
-                "roslyn:encapsulate_field" => await _roslynService.EncapsulateFieldAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
-
-                "roslyn:inline_variable" => await _roslynService.InlineVariableAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
-
-                "roslyn:extract_variable" => await _roslynService.ExtractVariableAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["endLine"]?.GetValue<int?>(),
-                    arguments?["endColumn"]?.GetValue<int?>(),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
-
-                "roslyn:get_complexity_metrics" => await _roslynService.GetComplexityMetricsAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int?>(),
-                    arguments?["column"]?.GetValue<int?>(),
-                    arguments?["metrics"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList()),
-
-                "roslyn:add_null_checks" => await _roslynService.AddNullChecksAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
-
-                "roslyn:generate_equality_members" => await _roslynService.GenerateEqualityMembersAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["includeOperators"]?.GetValue<bool>() ?? true,
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
-
-                "roslyn:get_type_members_batch" => await _roslynService.GetTypeMembersBatchAsync(
-                    arguments?["typeNames"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList() ?? throw new Exception("typeNames required"),
-                    arguments?["includeInherited"]?.GetValue<bool>() ?? false,
-                    arguments?["memberKind"]?.GetValue<string>(),
-                    arguments?["verbosity"]?.GetValue<string>() ?? "compact",
-                    arguments?["maxResultsPerType"]?.GetValue<int>() ?? 50),
-
-                _ => throw new Exception($"Unknown tool: {name}")
-            };
+                    // Merge worker info into result
+                    result = new
+                    {
+                        success = true,
+                        data = new
+                        {
+                            workerProcess = workerInfo,
+                            workerStatus = workerHealth
+                        }
+                    };
+                }
+                else
+                {
+                    result = new
+                    {
+                        success = true,
+                        data = new
+                        {
+                            workerProcess = workerInfo,
+                            workerStatus = (object?)null,
+                            message = "Worker not running. Call any tool to start worker, or load_solution to load a solution."
+                        }
+                    };
+                }
+            }
+            // Track solution path on load_solution
+            else if (name == "roslyn:load_solution")
+            {
+                var solutionPath = arguments?["solutionPath"]?.GetValue<string>();
+                var proxy = await _processManager.EnsureWorkerAsync();
+                result = await proxy.InvokeToolAsync(
+                    StripRoslynPrefix(name),
+                    ConvertArgumentsToDict(arguments));
+                _processManager.LastLoadedSolutionPath = solutionPath;
+            }
+            // All other tools: forward to worker
+            else
+            {
+                var proxy = await _processManager.EnsureWorkerAsync();
+                result = await proxy.InvokeToolAsync(
+                    StripRoslynPrefix(name),
+                    ConvertArgumentsToDict(arguments));
+            }
 
             // Wrap result in MCP content format
             var mpcResult = new
@@ -1613,14 +1391,53 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
         }
         catch (FileNotFoundException ex)
         {
-            await LogAsync("Error", $"File not found: {ex.Message}");
+            Log(LogLevel.Error, $"File not found: {ex.Message}");
             return CreateErrorResponse(id, -32602, $"File not found: {ex.Message}");
+        }
+        catch (TimeoutException ex)
+        {
+            Log(LogLevel.Error, $"Worker timeout: {ex.Message}");
+            return CreateErrorResponse(id, -32603, $"Worker timeout: {ex.Message}");
         }
         catch (Exception ex)
         {
-            await LogAsync("Error", $"Error executing tool: {ex}");
+            Log(LogLevel.Error, $"Error executing tool: {ex}");
             return CreateErrorResponse(id, -32603, $"Internal error: {ex.Message}");
         }
+    }
+
+    private static string StripRoslynPrefix(string toolName)
+    {
+        return toolName.StartsWith("roslyn:") ? toolName.Substring(7) : toolName;
+    }
+
+    private static Dictionary<string, object?>? ConvertArgumentsToDict(JsonObject? arguments)
+    {
+        if (arguments == null) return null;
+
+        var dict = new Dictionary<string, object?>();
+        foreach (var prop in arguments)
+        {
+            dict[prop.Key] = ConvertJsonNode(prop.Value);
+        }
+        return dict;
+    }
+
+    private static object? ConvertJsonNode(JsonNode? node)
+    {
+        if (node == null) return null;
+
+        return node switch
+        {
+            JsonValue value => value.TryGetValue<bool>(out var b) ? b :
+                               value.TryGetValue<int>(out var i) ? i :
+                               value.TryGetValue<double>(out var d) ? d :
+                               value.TryGetValue<string>(out var s) ? s :
+                               value.ToString(),
+            JsonArray array => array.Select(ConvertJsonNode).ToList(),
+            JsonObject obj => obj.ToDictionary(p => p.Key, p => ConvertJsonNode(p.Value)),
+            _ => node.ToString()
+        };
     }
 
     private object CreateSuccessResponse(int? id, object result)
@@ -1647,86 +1464,5 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
         };
     }
 
-    private List<SignatureChange> ParseSignatureChanges(JsonNode? changesNode)
-    {
-        var changes = new List<SignatureChange>();
-        if (changesNode is JsonArray array)
-        {
-            foreach (var item in array)
-            {
-                if (item is JsonObject obj)
-                {
-                    var change = new SignatureChange
-                    {
-                        Action = obj["action"]?.GetValue<string>() ?? "",
-                        Name = obj["name"]?.GetValue<string>(),
-                        Type = obj["type"]?.GetValue<string>(),
-                        NewName = obj["newName"]?.GetValue<string>(),
-                        DefaultValue = obj["defaultValue"]?.GetValue<string>(),
-                        Position = obj["position"]?.GetValue<int>()
-                    };
-
-                    if (obj["order"] is JsonArray orderArray)
-                    {
-                        change.Order = orderArray.Select(o => o?.GetValue<string>() ?? "").ToList();
-                    }
-
-                    changes.Add(change);
-                }
-            }
-        }
-        return changes;
-    }
-
-    private List<Dictionary<string, object>> ParseMethodBatchRequests(JsonNode? methodsNode)
-    {
-        var methods = new List<Dictionary<string, object>>();
-        if (methodsNode is JsonArray array)
-        {
-            foreach (var item in array)
-            {
-                if (item is JsonObject obj)
-                {
-                    var method = new Dictionary<string, object>();
-                    if (obj["typeName"] != null)
-                        method["typeName"] = obj["typeName"]!.GetValue<string>();
-                    if (obj["methodName"] != null)
-                        method["methodName"] = obj["methodName"]!.GetValue<string>();
-                    if (obj["overloadIndex"] != null)
-                        method["overloadIndex"] = obj["overloadIndex"]!.GetValue<int>();
-                    methods.Add(method);
-                }
-            }
-        }
-        return methods;
-    }
-
-    private List<string>? ParseStringArray(JsonNode? arrayNode)
-    {
-        if (arrayNode is not JsonArray array)
-            return null;
-
-        return array
-            .Where(item => item != null)
-            .Select(item => item!.GetValue<string>())
-            .ToList();
-    }
-
-    private async Task LogAsync(string level, string message)
-    {
-        var logLevel = Environment.GetEnvironmentVariable("ROSLYN_LOG_LEVEL") ?? "Information";
-        if (ShouldLog(level, logLevel))
-        {
-            await Console.Error.WriteLineAsync($"[{DateTime.Now:HH:mm:ss}] [{level}] {message}");
-        }
-    }
-
-    private bool ShouldLog(string messageLevel, string configuredLevel)
-    {
-        var levels = new[] { "Debug", "Information", "Warning", "Error" };
-        var messageIndex = Array.IndexOf(levels, messageLevel);
-        var configuredIndex = Array.IndexOf(levels, configuredLevel);
-
-        return messageIndex >= configuredIndex;
-    }
+    private static void Log(LogLevel level, string message) => Logger.Log("McpServer", level, message);
 }
