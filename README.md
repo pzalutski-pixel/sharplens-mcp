@@ -258,7 +258,7 @@ Microsoft.CodeAnalysis (Roslyn)
 
 ## Requirements
 
-- .NET 8.0 SDK/Runtime
+- **.NET 8.0 SDK or later** — works with .NET 8, 9, 10, and future versions. Analyzes any .NET 8+ project/solution.
 - MCP-compatible AI agent
 
 ## Development

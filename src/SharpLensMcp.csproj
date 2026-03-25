@@ -2,12 +2,13 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
+    <RollForward>LatestMajor</RollForward>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
 
     <!-- Package metadata -->
-    <Version>1.2.5</Version>
+    <Version>1.3.0</Version>
     <Authors>Peter Zalutski</Authors>
     <Copyright>Copyright (c) 2025 Peter Zalutski</Copyright>
     <Description>MCP server providing 58 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
@@ -17,6 +18,7 @@
     <PackageTags>mcp;roslyn;csharp;dotnet;code-analysis;ai;semantic-analysis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
+v1.3.0: Fixed MSBuild locator for .NET 9/10+. RollForward enabled. Upgraded MSBuildLocator to 1.11.2. Works with .NET 8+.
 v1.2.5: Added .slnx solution format support. Upgraded to Roslyn 5.0.0.
 v1.2.4: Added GitHub Actions CI/CD for trusted builds. Source Link enabled for source traceability.
 v1.2.3: Fixed sync_documents adding unwanted Compile Include entries to .csproj files.
@@ -41,10 +43,11 @@ v1.1.0: Added 10 new tools (57 total).
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Build.Framework" Version="17.11.31" ExcludeAssets="runtime" PrivateAssets="all" />
     <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="5.0.0" />
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="5.0.0" />
     <PackageReference Include="Microsoft.CodeAnalysis.Features" Version="5.0.0" />
-    <PackageReference Include="Microsoft.Build.Locator" Version="1.6.10" />
+    <PackageReference Include="Microsoft.Build.Locator" Version="1.11.2" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
   </ItemGroup>
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.3.0] - 2026-03-25
+
+### Fixed
+- MSBuild locator fails with "No instances of MSBuild could be detected" when only .NET 9/10+ SDK is installed (GitHub issue #3)
+
+### Changed
+- Added `RollForward=LatestMajor` so the tool runs on any .NET 8+ runtime
+- Upgraded Microsoft.Build.Locator from 1.6.10 to 1.11.2 for cross-SDK compatibility
+- Improved error message when no compatible SDK is found
+
 ## [1.2.3] - 2025-12-28
 
 ### Fixed
