@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.3.1] - 2026-03-25
+
+### Added
+- npm wrapper package — install via `npx -y sharplens-mcp` for standard MCP server config
+- Release workflow now publishes to both NuGet and npm
+
 ## [1.3.0] - 2026-03-25
 
 ### Fixed
