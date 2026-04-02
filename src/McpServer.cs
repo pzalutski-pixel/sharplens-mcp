@@ -94,10 +94,10 @@ public class McpServer
             var request = JsonSerializer.Deserialize<JsonObject>(requestJson);
             if (request == null)
             {
-                return CreateErrorResponse(null, -32700, "Parse error");
+                return CreateErrorResponse((string?)null, -32700, "Parse error");
             }
 
-            var id = request["id"]?.GetValue<int>();
+            var id = request["id"]?.AsValue().DeepClone();
             var method = request["method"]?.GetValue<string>();
             var paramsNode = request["params"];
 
@@ -121,7 +121,7 @@ public class McpServer
         }
     }
 
-    private Task<object> HandleInitializeAsync(int? id)
+    private Task<object> HandleInitializeAsync(JsonNode? id)
     {
         var response = CreateSuccessResponse(id, new
         {
@@ -138,8 +138,8 @@ public class McpServer
         });
         return Task.FromResult(response);
     }
-
-    private Task<object> HandleListToolsAsync(int? id)
+    
+    private Task<object> HandleListToolsAsync(JsonNode? id)
     {
         var tools = new List<object>
         {
@@ -1254,8 +1254,8 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
 
         return Task.FromResult(CreateSuccessResponse(id, new { tools }));
     }
-
-    private async Task<object> HandleToolCallAsync(int? id, JsonObject? paramsNode)
+    
+    private async Task<object> HandleToolCallAsync(JsonNode? id, JsonObject? paramsNode)
     {
         try
         {
@@ -1623,7 +1623,7 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
         }
     }
 
-    private object CreateSuccessResponse(int? id, object result)
+    private object CreateSuccessResponse(JsonNode? id, object result)
     {
         return new
         {
@@ -1632,8 +1632,8 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
             result
         };
     }
-
-    private object CreateErrorResponse(int? id, int code, string message)
+    
+    private object CreateErrorResponse(JsonNode? id, int code, string message)
     {
         return new
         {
