@@ -5,16 +5,24 @@ namespace SharpLensMcp;
 
 public class McpServer
 {
+    private const string ProtocolVersion = "2024-11-05";
+    private static readonly string ServerVersion = typeof(McpServer).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
+
+    private static readonly string[] LogLevels = { "Debug", "Information", "Warning", "Error" };
+
     private readonly RoslynService _roslynService;
     private readonly JsonSerializerOptions _jsonOptions;
+    private readonly string _logLevel;
 
     public McpServer()
     {
         _roslynService = new RoslynService();
+        _logLevel = Environment.GetEnvironmentVariable("ROSLYN_LOG_LEVEL") ?? "Information";
         _jsonOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-            WriteIndented = false
+            WriteIndented = false,
+            Converters = { new RequestId.Converter() }
         };
     }
 
@@ -87,17 +95,22 @@ public class McpServer
         }
     }
 
-    private async Task<object> HandleRequestAsync(string requestJson)
+    internal async Task<object> HandleRequestAsync(string requestJson)
     {
         try
         {
             var request = JsonSerializer.Deserialize<JsonObject>(requestJson);
             if (request == null)
             {
-                return CreateErrorResponse(null, -32700, "Parse error");
+                return CreateErrorResponse((RequestId?)null, -32700, "Parse error");
             }
 
-            var id = request["id"]?.GetValue<int>();
+            RequestId? id = null;
+            var idNode = request["id"];
+            if (idNode != null)
+            {
+                id = JsonSerializer.Deserialize<RequestId>(idNode, _jsonOptions);
+            }
             var method = request["method"]?.GetValue<string>();
             var paramsNode = request["params"];
 
@@ -117,29 +130,29 @@ public class McpServer
         catch (Exception ex)
         {
             await LogAsync("Error", $"Error handling request: {ex}");
-            return CreateErrorResponse(null, -32603, $"Internal error: {ex.Message}");
+            return CreateErrorResponse((RequestId?)null, -32603, $"Internal error: {ex.Message}");
         }
     }
 
-    private Task<object> HandleInitializeAsync(int? id)
+    private Task<object> HandleInitializeAsync(RequestId? id)
     {
         var response = CreateSuccessResponse(id, new
         {
-            protocolVersion = "2024-11-05",
+            protocolVersion = ProtocolVersion,
             capabilities = new
             {
                 tools = new { }
             },
             serverInfo = new
             {
-                name = "Roslyn MCP Server",
-                version = "1.0.0"
+                name = "SharpLensMcp",
+                version = ServerVersion
             }
         });
         return Task.FromResult(response);
     }
 
-    private Task<object> HandleListToolsAsync(int? id)
+    private Task<object> HandleListToolsAsync(RequestId? id)
     {
         var tools = new List<object>
         {
@@ -1255,7 +1268,7 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
         return Task.FromResult(CreateSuccessResponse(id, new { tools }));
     }
 
-    private async Task<object> HandleToolCallAsync(int? id, JsonObject? paramsNode)
+    private async Task<object> HandleToolCallAsync(RequestId? id, JsonObject? paramsNode)
     {
         try
         {
@@ -1623,7 +1636,7 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
         }
     }
 
-    private object CreateSuccessResponse(int? id, object result)
+    private object CreateSuccessResponse(RequestId? id, object result)
     {
         return new
         {
@@ -1633,7 +1646,7 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
         };
     }
 
-    private object CreateErrorResponse(int? id, int code, string message)
+    private object CreateErrorResponse(RequestId? id, int code, string message)
     {
         return new
         {
@@ -1714,19 +1727,16 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
 
     private async Task LogAsync(string level, string message)
     {
-        var logLevel = Environment.GetEnvironmentVariable("ROSLYN_LOG_LEVEL") ?? "Information";
-        if (ShouldLog(level, logLevel))
+        if (ShouldLog(level))
         {
             await Console.Error.WriteLineAsync($"[{DateTime.Now:HH:mm:ss}] [{level}] {message}");
         }
     }
 
-    private bool ShouldLog(string messageLevel, string configuredLevel)
+    private bool ShouldLog(string messageLevel)
     {
-        var levels = new[] { "Debug", "Information", "Warning", "Error" };
-        var messageIndex = Array.IndexOf(levels, messageLevel);
-        var configuredIndex = Array.IndexOf(levels, configuredLevel);
-
+        var messageIndex = Array.IndexOf(LogLevels, messageLevel);
+        var configuredIndex = Array.IndexOf(LogLevels, _logLevel);
         return messageIndex >= configuredIndex;
     }
 }

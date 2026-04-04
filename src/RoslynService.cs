@@ -12,91 +12,6 @@ using System.Text;
 
 namespace SharpLensMcp;
 
-#region Infrastructure Classes
-
-/// <summary>
-/// Error codes for consistent error handling across all tools.
-/// </summary>
-public static class ErrorCodes
-{
-    public const string SolutionNotLoaded = "SOLUTION_NOT_LOADED";
-    public const string FileNotFound = "FILE_NOT_FOUND";
-    public const string FileNotInSolution = "FILE_NOT_IN_SOLUTION";
-    public const string SymbolNotFound = "SYMBOL_NOT_FOUND";
-    public const string TypeNotFound = "TYPE_NOT_FOUND";
-    public const string NotAType = "NOT_A_TYPE";
-    public const string NotAMethod = "NOT_A_METHOD";
-    public const string AnalysisFailed = "ANALYSIS_FAILED";
-    public const string InvalidParameter = "INVALID_PARAMETER";
-    public const string Timeout = "TIMEOUT";
-}
-
-/// <summary>
-/// Structured error with recovery guidance for AI agents.
-/// </summary>
-public class RoslynError
-{
-    public string Code { get; set; } = "";
-    public string Message { get; set; } = "";
-    public string? Hint { get; set; }
-    public object? Context { get; set; }
-}
-
-/// <summary>
-/// Response metadata for AI workflow guidance.
-/// </summary>
-public class ResponseMetadata
-{
-    public int? TotalCount { get; set; }
-    public int? ReturnedCount { get; set; }
-    public bool? Truncated { get; set; }
-    public string[]? SuggestedNextTools { get; set; }
-    public string? Verbosity { get; set; }
-}
-
-/// <summary>
-/// Represents a single change to a method signature.
-/// </summary>
-public class SignatureChange
-{
-    /// <summary>
-    /// Action: "add", "remove", "rename", "reorder"
-    /// </summary>
-    public string Action { get; set; } = "";
-
-    /// <summary>
-    /// Parameter name (for remove, rename) or new parameter name (for add)
-    /// </summary>
-    public string? Name { get; set; }
-
-    /// <summary>
-    /// Parameter type (for add)
-    /// </summary>
-    public string? Type { get; set; }
-
-    /// <summary>
-    /// New name (for rename)
-    /// </summary>
-    public string? NewName { get; set; }
-
-    /// <summary>
-    /// Default value (for add)
-    /// </summary>
-    public string? DefaultValue { get; set; }
-
-    /// <summary>
-    /// Position to insert (for add), -1 means end
-    /// </summary>
-    public int? Position { get; set; }
-
-    /// <summary>
-    /// New parameter order (for reorder)
-    /// </summary>
-    public List<string>? Order { get; set; }
-}
-
-#endregion
-
 public class RoslynService
 {
     private MSBuildWorkspace? _workspace;
@@ -309,10 +224,10 @@ public class RoslynService
         _documentCache.Clear();
 
         _workspace = MSBuildWorkspace.Create();
-        _workspace.WorkspaceFailed += (sender, args) =>
+        _workspace.RegisterWorkspaceFailedHandler(args =>
         {
             Console.Error.WriteLine($"[Warning] Workspace: {args.Diagnostic.Message}");
-        };
+        });
 
         _solution = await _workspace.OpenSolutionAsync(solutionPath);
         _solutionLoadedAt = DateTime.UtcNow;
@@ -1658,7 +1573,7 @@ public class RoslynService
             }
         }
 
-        if (changedSolution == _solution)
+        if (changedSolution == null || changedSolution == _solution)
         {
             return CreateErrorResponse(
                 ErrorCodes.AnalysisFailed,
@@ -2087,7 +2002,7 @@ public class RoslynService
                 referenceCount,
                 references = includeReferences ? (referenceCount > 100 ? references!.Concat(new[] { $"... and {referenceCount - 100} more" }).ToList() : references) : null,
                 projectReferences,
-                documents = includeDocuments ? (documentCount > 500 ? documents!.Concat(new[] { new { name = $"... and {documentCount - 500} more documents", filePath = (string?)null, folders = new List<string>() } }).ToList() : documents) : null
+                documents = includeDocuments ? (documentCount > 500 ? documents!.Concat(new[] { new { name = $"... and {documentCount - 500} more documents", filePath = string.Empty, folders = new List<string>() } }).ToList() : documents) : null
             });
         }
 
@@ -7248,7 +7163,7 @@ public class ValidationClass {{
             }
         }
 
-        if (changedSolution == _solution)
+        if (changedSolution == null || changedSolution == _solution)
         {
             return CreateErrorResponse(
                 ErrorCodes.AnalysisFailed,

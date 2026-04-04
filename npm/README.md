@@ -32,8 +32,10 @@ A Model Context Protocol (MCP) server providing **58 AI-optimized tools** for .N
 This is a thin npm wrapper around the [SharpLensMcp](https://www.nuget.org/packages/SharpLensMcp) .NET global tool. It:
 
 1. Checks that the .NET SDK is installed
-2. Installs the SharpLensMcp .NET tool if not already present
+2. Installs or updates the SharpLensMcp .NET tool to the exact version matching this npm package
 3. Launches `sharplens` and pipes stdin/stdout for MCP protocol communication
+
+The npm package version and .NET tool version are always kept in sync.
 
 ## Features
 
@@ -41,5 +43,11 @@ This is a thin npm wrapper around the [SharpLensMcp](https://www.nuget.org/packa
 - **AI-Optimized** — structured responses with suggested next tools
 - **Safe Refactoring** — preview changes before applying
 - **Batch Operations** — multiple lookups in one call
+
+## Uninstall
+
+If installed globally: `npm uninstall -g sharplens-mcp` (automatically removes the .NET tool)
+
+If used via npx: `dotnet tool uninstall --global SharpLensMcp`
 
 For full documentation, see the [GitHub repository](https://github.com/pzalutski-pixel/sharplens-mcp).

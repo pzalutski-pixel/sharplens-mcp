@@ -1,20 +1,12 @@
 #!/usr/bin/env node
 
 const { execSync, spawn } = require("child_process");
+const { version } = require("../package.json");
 
 function hasDotnet() {
   try {
     execSync("dotnet --version", { stdio: "ignore" });
     return true;
-  } catch {
-    return false;
-  }
-}
-
-function isToolInstalled() {
-  try {
-    const output = execSync("dotnet tool list --global", { encoding: "utf8" });
-    return output.toLowerCase().includes("sharplensmcp");
   } catch {
     return false;
   }
@@ -27,16 +19,17 @@ if (!hasDotnet()) {
   process.exit(1);
 }
 
-if (!isToolInstalled()) {
-  process.stderr.write("Installing SharpLensMcp .NET tool...\n");
-  try {
-    execSync("dotnet tool install --global SharpLensMcp", {
-      stdio: "inherit",
-    });
-  } catch {
-    process.stderr.write("Error: Failed to install SharpLensMcp.\n");
-    process.exit(1);
-  }
+process.stderr.write(`Ensuring SharpLensMcp v${version} is installed...\n`);
+try {
+  execSync(
+    `dotnet tool update --global SharpLensMcp --version ${version}`,
+    { stdio: ["ignore", "ignore", "inherit"] }
+  );
+} catch {
+  process.stderr.write(
+    `Error: Failed to install/update SharpLensMcp v${version}.\n`
+  );
+  process.exit(1);
 }
 
 const args = process.argv.slice(2);

@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.4.0] - 2026-04-04
+
+### Fixed
+- JSON-RPC `id` field now accepts string and integer per spec (was integer-only). Fixes issue reported in PR #5 where clients sending GUID/string IDs would crash.
+
+### Changed
+- Added `RequestId` struct with proper `IEquatable`, JSON converter, and spec-compliant validation (string or integer only)
+- Extracted `ErrorCodes`, `RoslynError`, `ResponseMetadata`, `SignatureChange` into own files (were inline in RoslynService.cs)
+- Server version in initialize response now reads from assembly instead of hardcoded "1.0.0"
+- Protocol version and log levels are now constants, log level read once at startup
+- Replaced obsolete `WorkspaceFailed` event with `RegisterWorkspaceFailedHandler`
+- Fixed all nullable reference warnings (proper null checks instead of suppression)
+- Added `InternalsVisibleTo` for test project, added McpServer integration tests
+- npm launcher now pins .NET tool version to match npm package version, preventing version drift
+- npm launcher uses `dotnet tool update` for install/upgrade in one step
+- Added `preuninstall` script for global npm installs to clean up .NET tool
+
 ## [1.3.2] - 2026-03-25
 
 ### Fixed
