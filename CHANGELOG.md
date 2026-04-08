@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.4.2] - 2026-04-08
+
+### Changed
+- Split release workflow into separate jobs (build-and-test, publish-nuget, publish-npm, publish-mcp-registry) for reliability and proper dependency ordering
+
 ## [1.4.1] - 2026-04-08
 
 ### Added
