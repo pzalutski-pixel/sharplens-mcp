@@ -306,3 +306,4 @@ dotnet publish -c Release -o ./publish
 ## License
 
 MIT - See [LICENSE](LICENSE) for details.
+<!-- mcp-name: io.github.pzalutski-pixel/sharplens -->

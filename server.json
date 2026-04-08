@@ -1,0 +1,69 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.pzalutski-pixel/sharplens",
+  "title": "SharpLens",
+  "description": "58 semantic C#/.NET analysis tools via Roslyn: navigation, refactoring, code generation.",
+  "repository": {
+    "url": "https://github.com/pzalutski-pixel/sharplens-mcp",
+    "source": "github"
+  },
+  "version": "1.4.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "sharplens-mcp",
+      "version": "1.4.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "DOTNET_SOLUTION_PATH",
+          "description": "Path to .sln or .slnx file to auto-load on startup",
+          "format": "string"
+        },
+        {
+          "name": "ROSLYN_LOG_LEVEL",
+          "description": "Logging verbosity: Trace, Debug, Information, Warning, Error",
+          "format": "string",
+          "default": "Information"
+        },
+        {
+          "name": "ROSLYN_TIMEOUT_SECONDS",
+          "description": "Timeout for long-running operations",
+          "format": "number",
+          "default": "30"
+        }
+      ]
+    },
+    {
+      "registryType": "nuget",
+      "identifier": "SharpLensMcp",
+      "version": "1.4.0",
+      "runtimeHint": "dotnet tool run",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "DOTNET_SOLUTION_PATH",
+          "description": "Path to .sln or .slnx file to auto-load on startup",
+          "format": "string"
+        },
+        {
+          "name": "ROSLYN_LOG_LEVEL",
+          "description": "Logging verbosity: Trace, Debug, Information, Warning, Error",
+          "format": "string",
+          "default": "Information"
+        },
+        {
+          "name": "ROSLYN_TIMEOUT_SECONDS",
+          "description": "Timeout for long-running operations",
+          "format": "number",
+          "default": "30"
+        }
+      ]
+    }
+  ]
+}

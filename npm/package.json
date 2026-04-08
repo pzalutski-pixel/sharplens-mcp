@@ -23,6 +23,7 @@
     "url": "https://github.com/pzalutski-pixel/sharplens-mcp"
   },
   "author": "Peter Zalutski",
+  "mcpName": "io.github.pzalutski-pixel/sharplens",
   "engines": {
     "node": ">=16"
   }
