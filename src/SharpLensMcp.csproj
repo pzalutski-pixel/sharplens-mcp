@@ -8,16 +8,17 @@
     <LangVersion>latest</LangVersion>
 
     <!-- Package metadata -->
-    <Version>1.4.2</Version>
+    <Version>1.5.0</Version>
     <Authors>Peter Zalutski</Authors>
     <Copyright>Copyright (c) 2025 Peter Zalutski</Copyright>
-    <Description>MCP server providing 58 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
+    <Description>MCP server providing 62 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/pzalutski-pixel/sharplens-mcp</PackageProjectUrl>
     <RepositoryUrl>https://github.com/pzalutski-pixel/sharplens-mcp</RepositoryUrl>
     <PackageTags>mcp;roslyn;csharp;dotnet;code-analysis;ai;semantic-analysis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
+v1.5.0: Added 7 discovery tools: attribute usages, DI registrations, reflection detection, circular dependencies, NuGet dependencies, source generators, generated code viewer.
 v1.4.2: Split release workflow into separate jobs for reliability. MCP Registry publishing.
 v1.4.1: Added MCP Registry publishing. Listed on registry.modelcontextprotocol.io.
 v1.4.0: Fixed JSON-RPC id handling to accept string and integer per spec. npm launcher now pins version.

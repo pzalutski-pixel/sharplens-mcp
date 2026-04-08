@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.5.0] - 2026-04-08
+
+### Added
+- `find_attribute_usages` — find all types/members decorated with a specific attribute
+- `get_di_registrations` — scan for DI service registrations (AddScoped, AddTransient, etc.)
+- `find_reflection_usage` — detect dynamic/reflection-based usage invisible to static analysis
+- `find_circular_dependencies` — detect cycles in project or namespace dependency graphs
+- `get_nuget_dependencies` — list NuGet package references per project with versions
+- `get_source_generators` — list active source generators and their generated output
+- `get_generated_code` — view source code produced by a source generator
+- 16 new tests for discovery tools
+
+### Changed
+- Tool count increased from 55 to 62
+- Refactored RoslynService into 9 partial class files by concern (Navigation, Analysis, Refactoring, TypeDiscovery, Compound, CodeActions, CodeGeneration, Discovery)
+
 ## [1.4.2] - 2026-04-08
 
 ### Changed

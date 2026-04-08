@@ -12,9 +12,10 @@ public class NavigationTests : RoslynServiceTestBase
     [Fact]
     public async Task GetSymbolInfo_OnClassName_ReturnsTypeInfo()
     {
-        // RoslynService class is at beginning of file
-        // Line numbers are 0-based for the tool
-        var result = await Service.GetSymbolInfoAsync(RoslynServicePath, line: 10, column: 20);
+        // Find the line with "public class RoslynService" dynamically
+        var lines = File.ReadAllLines(RoslynServicePath);
+        var classLine = Array.FindIndex(lines, l => l.Contains("class RoslynService"));
+        var result = await Service.GetSymbolInfoAsync(RoslynServicePath, line: classLine, column: 20);
 
         AssertSuccess(result);
         var data = GetData(result);

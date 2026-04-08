@@ -1263,6 +1263,145 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
                     required = new[] { "typeNames" }
                 }
             }
+            ,
+            (object)new
+            {
+                name = "roslyn:find_attribute_usages",
+                description = @"Find all types and members decorated with a specific attribute.
+
+USAGE: find_attribute_usages(attributeName: ""Authorize"")
+USAGE: find_attribute_usages(attributeName: ""HttpGet"", projectName: ""MyApi"")
+
+OUTPUT: List of symbols with the attribute, their kind, arguments, and source location.
+Use for: finding all API endpoints, authorization points, serialization config, test fixtures.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        attributeName = new { type = "string", description = "Attribute name (e.g. 'Authorize', 'HttpGet', 'Obsolete')" },
+                        projectName = new { type = "string", description = "Filter to specific project" },
+                        maxResults = new { type = "integer", description = "Maximum results (default: 100)" }
+                    },
+                    required = new[] { "attributeName" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:get_di_registrations",
+                description = @"Scan for dependency injection service registrations (AddScoped, AddTransient, AddSingleton, etc.).
+
+USAGE: get_di_registrations()
+USAGE: get_di_registrations(projectName: ""MyApi"")
+
+OUTPUT: List of DI registrations with lifetime, service type, implementation type, and location.
+Use for: understanding service wiring, finding missing registrations, auditing lifetimes.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        projectName = new { type = "string", description = "Filter to specific project" }
+                    }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:find_reflection_usage",
+                description = @"Detect dynamic/reflection-based type and method usage that is invisible to static reference searches.
+
+USAGE: find_reflection_usage()
+USAGE: find_reflection_usage(projectName: ""MyApp"", maxResults: 50)
+
+OUTPUT: List of reflection API calls with the API used, context, and location.
+Use for: finding hidden dependencies before refactoring, security audits, understanding dynamic behavior.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        projectName = new { type = "string", description = "Filter to specific project" },
+                        maxResults = new { type = "integer", description = "Maximum results (default: 100)" }
+                    }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:find_circular_dependencies",
+                description = @"Detect cycles in project or namespace dependency graphs.
+
+USAGE: find_circular_dependencies() — project-level cycles
+USAGE: find_circular_dependencies(level: ""namespace"") — namespace-level cycles
+
+OUTPUT: Dependency graph with any detected cycles listed.
+Use for: architecture analysis, identifying tightly coupled components.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        level = new { type = "string", description = "'project' (default) or 'namespace'" }
+                    }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:get_nuget_dependencies",
+                description = @"List NuGet package references per project with versions.
+
+USAGE: get_nuget_dependencies()
+USAGE: get_nuget_dependencies(projectName: ""MyApp"")
+
+OUTPUT: List of projects with their NuGet packages, versions, and asset settings.
+Use for: dependency audits, version checks, understanding external dependencies.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        projectName = new { type = "string", description = "Filter to specific project" }
+                    }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:get_source_generators",
+                description = @"List active source generators and their generated output per project.
+
+USAGE: get_source_generators()
+USAGE: get_source_generators(projectName: ""MyApp"")
+
+OUTPUT: List of generators with their assembly info and generated files.
+Use for: understanding generated code, debugging generator issues.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        projectName = new { type = "string", description = "Filter to specific project" }
+                    }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:get_generated_code",
+                description = @"View the source code produced by a source generator.
+
+USAGE: get_generated_code(projectName: ""MyApp"", generatedFileName: ""MyType.g.cs"")
+
+OUTPUT: Full source code of the generated file.
+Use get_source_generators first to discover available generated files.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        projectName = new { type = "string", description = "Project containing the generated file" },
+                        generatedFileName = new { type = "string", description = "Name of the generated file" }
+                    },
+                    required = new[] { "projectName", "generatedFileName" }
+                }
+            }
         };
 
         return Task.FromResult(CreateSuccessResponse(id, new { tools }));
@@ -1605,6 +1744,31 @@ BENEFIT: One call instead of multiple - reduces context usage for AI agents",
                     arguments?["memberKind"]?.GetValue<string>(),
                     arguments?["verbosity"]?.GetValue<string>() ?? "compact",
                     arguments?["maxResultsPerType"]?.GetValue<int>() ?? 50),
+
+                "roslyn:find_attribute_usages" => await _roslynService.FindAttributeUsagesAsync(
+                    arguments?["attributeName"]?.GetValue<string>() ?? throw new Exception("attributeName required"),
+                    arguments?["projectName"]?.GetValue<string>(),
+                    arguments?["maxResults"]?.GetValue<int>() ?? 100),
+
+                "roslyn:get_di_registrations" => await _roslynService.GetDiRegistrationsAsync(
+                    arguments?["projectName"]?.GetValue<string>()),
+
+                "roslyn:find_reflection_usage" => await _roslynService.FindReflectionUsageAsync(
+                    arguments?["projectName"]?.GetValue<string>(),
+                    arguments?["maxResults"]?.GetValue<int>() ?? 100),
+
+                "roslyn:find_circular_dependencies" => await _roslynService.FindCircularDependenciesAsync(
+                    arguments?["level"]?.GetValue<string>()),
+
+                "roslyn:get_nuget_dependencies" => await _roslynService.GetNuGetDependenciesAsync(
+                    arguments?["projectName"]?.GetValue<string>()),
+
+                "roslyn:get_source_generators" => await _roslynService.GetSourceGeneratorsAsync(
+                    arguments?["projectName"]?.GetValue<string>()),
+
+                "roslyn:get_generated_code" => await _roslynService.GetGeneratedCodeAsync(
+                    arguments?["projectName"]?.GetValue<string>() ?? throw new Exception("projectName required"),
+                    arguments?["generatedFileName"]?.GetValue<string>() ?? throw new Exception("generatedFileName required")),
 
                 _ => throw new Exception($"Unknown tool: {name}")
             };

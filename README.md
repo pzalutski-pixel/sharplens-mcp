@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/sharplens-mcp.svg)](https://www.npmjs.com/package/sharplens-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Model Context Protocol (MCP) server providing **58 AI-optimized tools** for .NET/C# semantic code analysis, navigation, refactoring, and code generation using Microsoft Roslyn.
+A Model Context Protocol (MCP) server providing **62 AI-optimized tools** for .NET/C# semantic code analysis, navigation, refactoring, and code generation using Microsoft Roslyn.
 
 Built for AI coding agents - provides compiler-accurate code understanding that AI cannot infer from reading source files alone.
 
@@ -142,7 +142,7 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 
 ## Features
 
-- **58 Semantic Analysis Tools** - Navigation, refactoring, code generation, diagnostics
+- **62 Semantic Analysis Tools** - Navigation, refactoring, code generation, diagnostics, discovery
 - **AI-Optimized Descriptions** - Clear USAGE/OUTPUT/WORKFLOW patterns
 - **Structured Responses** - Consistent `success/error/data` format with `suggestedNextTools`
 - **Zero-Based Coordinates** - Clear warnings to prevent off-by-one errors
@@ -151,7 +151,7 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 
 ## Tool Categories
 
-### Navigation & Discovery (13 tools)
+### Navigation & Discovery (17 tools)
 | Tool | Description |
 |------|-------------|
 | `get_symbol_info` | Semantic info at position |
@@ -167,8 +167,12 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 | `get_method_signature` | Detailed signature by name |
 | `get_derived_types` | Find all subclasses |
 | `get_base_types` | Full inheritance chain |
+| `get_attributes` | List attributes on a symbol |
+| `get_containing_member` | Enclosing symbol at position |
+| `get_method_overloads` | All overloads of a method |
+| `find_attribute_usages` | Find types/members by attribute |
 
-### Analysis (9 tools)
+### Analysis (11 tools)
 | Tool | Description |
 |------|-------------|
 | `get_diagnostics` | Compiler errors/warnings |
@@ -180,8 +184,10 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 | `find_unused_code` | Dead code detection |
 | `validate_code` | Compile check without writing |
 | `get_complexity_metrics` | Cyclomatic, nesting, LOC, cognitive |
+| `find_circular_dependencies` | Project and namespace cycle detection |
+| `get_missing_members` | Unimplemented interface/abstract members |
 
-### Refactoring (13 tools)
+### Refactoring (14 tools)
 | Tool | Description |
 |------|-------------|
 | `rename_symbol` | Safe rename across solution |
@@ -191,6 +197,7 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 | `generate_constructor` | From fields/properties |
 | `organize_usings` | Sort and remove unused |
 | `organize_usings_batch` | Batch organize multiple files |
+| `format_document_batch` | Batch format files in project |
 | `get_code_actions_at_position` | All Roslyn refactorings at position |
 | `apply_code_action_by_title` | Apply any refactoring by title |
 | `implement_missing_members` | Generate interface stubs |
@@ -214,14 +221,25 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 | `get_method_source_batch` | Multiple method sources in one call |
 | `get_instantiation_options` | How to create a type |
 
-### Infrastructure (5 tools)
+### Discovery (2 tools)
+| Tool | Description |
+|------|-------------|
+| `get_di_registrations` | Scan DI service registrations |
+| `find_reflection_usage` | Detect reflection/dynamic usage |
+
+### Infrastructure (10 tools)
 | Tool | Description |
 |------|-------------|
 | `health_check` | Server status |
 | `load_solution` | Load .sln/.slnx for analysis |
+| `sync_documents` | Sync file changes into loaded solution |
 | `get_project_structure` | Solution structure |
 | `dependency_graph` | Project dependencies |
-| `get_code_fixes` / `apply_code_fix` | Automated fixes |
+| `get_code_fixes` | Available fixes for a diagnostic |
+| `apply_code_fix` | Apply a specific code fix |
+| `get_nuget_dependencies` | NuGet package listing per project |
+| `get_source_generators` | List active source generators |
+| `get_generated_code` | View generated source code |
 
 ## Other MCP Clients
 
