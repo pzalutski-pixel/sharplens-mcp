@@ -120,4 +120,22 @@ public class McpServerTests
         response["id"]!.GetValue<long>().Should().Be(1);
         response["result"].Should().NotBeNull();
     }
+
+    [Fact]
+    public async Task HandleRequest_NotificationInitialized_ReturnsNull()
+    {
+        var request = """{"jsonrpc":"2.0","method":"notifications/initialized"}""";
+        var response = await _server.HandleRequestAsync(request);
+
+        response.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task HandleRequest_NotificationWithNoId_ReturnsNull()
+    {
+        var request = """{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"abc"}}""";
+        var response = await _server.HandleRequestAsync(request);
+
+        response.Should().BeNull();
+    }
 }

@@ -82,11 +82,14 @@ public class McpServer
 
                 var response = await HandleRequestAsync(line);
 
-                var responseJson = JsonSerializer.Serialize(response, _jsonOptions);
-                await writer.WriteLineAsync(responseJson);
-                await writer.FlushAsync();
+                if (response != null)
+                {
+                    var responseJson = JsonSerializer.Serialize(response, _jsonOptions);
+                    await writer.WriteLineAsync(responseJson);
+                    await writer.FlushAsync();
 
-                await LogAsync("Debug", $"Sent response: {responseJson}");
+                    await LogAsync("Debug", $"Sent response: {responseJson}");
+                }
             }
             catch (Exception ex)
             {
@@ -95,7 +98,7 @@ public class McpServer
         }
     }
 
-    internal async Task<object> HandleRequestAsync(string requestJson)
+    internal async Task<object?> HandleRequestAsync(string requestJson)
     {
         try
         {
@@ -117,6 +120,13 @@ public class McpServer
             if (string.IsNullOrEmpty(method))
             {
                 return CreateErrorResponse(id, -32600, "Invalid Request: missing method");
+            }
+
+            // Notifications have no id and require no response
+            if (id == null && method.StartsWith("notifications/"))
+            {
+                await LogAsync("Debug", $"Received notification: {method}");
+                return null;
             }
 
             return method switch
