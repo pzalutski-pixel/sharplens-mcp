@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.5.1] - 2026-04-16
+
+### Fixed
+- Server sent invalid `{"id": null}` error response for `notifications/initialized`, breaking Claude Code and mcp-proxy connections (#6)
+- Notifications (messages without `id`) now correctly produce no response per JSON-RPC spec
+
 ## [1.5.0] - 2026-04-08
 
 ### Added
