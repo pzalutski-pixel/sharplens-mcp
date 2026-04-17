@@ -46,7 +46,7 @@ public partial class RoslynService
             var project = _solution!.Projects.FirstOrDefault(p => p.FilePath == projectPath);
             if (project != null)
             {
-                var compilation = await project.GetCompilationAsync();
+                var compilation = await GetProjectCompilationAsync(project);
                 if (compilation != null)
                 {
                     allDiagnostics.AddRange(compilation.GetDiagnostics());
@@ -58,7 +58,7 @@ public partial class RoslynService
             // Get diagnostics for entire solution
             foreach (var project in _solution!.Projects)
             {
-                var compilation = await project.GetCompilationAsync();
+                var compilation = await GetProjectCompilationAsync(project);
                 if (compilation != null)
                 {
                     allDiagnostics.AddRange(compilation.GetDiagnostics());

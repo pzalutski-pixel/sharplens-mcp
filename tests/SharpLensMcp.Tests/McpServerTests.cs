@@ -13,8 +13,9 @@ public class McpServerTests
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
-    private JsonObject ParseResponse(object response)
+    private JsonObject ParseResponse(object? response)
     {
+        response.Should().NotBeNull();
         var json = JsonSerializer.Serialize(response, _jsonOptions);
         return JsonSerializer.Deserialize<JsonObject>(json)!;
     }

@@ -8,6 +8,7 @@ using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Text;
 using System.Collections.Concurrent;
+using System.Collections.Immutable;
 using System.Text;
 using System.Xml.Linq;
 
@@ -18,6 +19,7 @@ public partial class RoslynService
     private MSBuildWorkspace? _workspace;
     private Solution? _solution;
     private readonly Dictionary<string, Document> _documentCache = new();
+    internal readonly ConcurrentDictionary<ProjectId, Compilation> _compilationCache = new();
     private readonly int _maxDiagnostics;
     private readonly int _timeoutSeconds;
     private readonly bool _useAbsolutePaths;
@@ -145,7 +147,7 @@ public partial class RoslynService
 
         foreach (var project in _solution!.Projects)
         {
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
 
             // Strategy 1: Fully-qualified metadata name
@@ -219,6 +221,7 @@ public partial class RoslynService
         // Dispose existing workspace
         _workspace?.Dispose();
         _documentCache.Clear();
+        _compilationCache.Clear();
 
         _workspace = MSBuildWorkspace.Create();
         _workspace.RegisterWorkspaceFailedHandler(args =>
@@ -360,10 +363,11 @@ public partial class RoslynService
             }
         }
 
-        // Clear cache after sync (no need to call TryApplyChanges - we're syncing FROM disk, not TO disk)
+        // Clear caches after sync (no need to call TryApplyChanges - we're syncing FROM disk, not TO disk)
         if (updated.Count > 0 || added.Count > 0 || removed.Count > 0)
         {
             _documentCache.Clear();
+            _compilationCache.Clear();
         }
 
         return CreateSuccessResponse(
@@ -437,7 +441,7 @@ public partial class RoslynService
         {
             foreach (var project in _solution.Projects.Take(5)) // Sample first 5 projects for quick health check
             {
-                var compilation = await project.GetCompilationAsync();
+                var compilation = await GetProjectCompilationAsync(project);
                 if (compilation != null)
                 {
                     var diagnostics = compilation.GetDiagnostics();
@@ -627,6 +631,61 @@ public partial class RoslynService
         if (_solution == null)
         {
             throw new Exception("No solution loaded. Call roslyn:load_solution first or set DOTNET_SOLUTION_PATH environment variable.");
+        }
+    }
+
+    /// <summary>
+    /// Gets the compilation for a project with source generators run.
+    /// This is the sanctioned way to get a compilation inside RoslynService —
+    /// MSBuildWorkspace.GetCompilationAsync() alone returns a pre-generator compilation,
+    /// which causes phantom errors when code references generated members.
+    ///
+    /// Thread safety: tool calls are serialized through stdio so there are no concurrent
+    /// cache misses in practice. ConcurrentDictionary is used for cheap lock-free reads.
+    /// </summary>
+    /// <summary>Test-only accessor for the loaded solution. Do not use outside tests.</summary>
+    internal Solution? GetSolutionForTesting() => _solution;
+
+    internal async Task<Compilation?> GetProjectCompilationAsync(Project project)
+    {
+        if (_compilationCache.TryGetValue(project.Id, out var cached))
+            return cached;
+
+        var baseCompilation = await project.GetCompilationAsync();
+        if (baseCompilation == null) return null;
+
+        var generators = project.AnalyzerReferences
+            .SelectMany(ar => ar.GetGenerators(LanguageNames.CSharp))
+            .ToImmutableArray();
+
+        if (generators.IsEmpty)
+        {
+            _compilationCache[project.Id] = baseCompilation;
+            return baseCompilation;
+        }
+
+        try
+        {
+            var additionalTexts = project.AdditionalDocuments
+                .Select(d => (AdditionalText)new AdditionalTextFile(d))
+                .ToImmutableArray();
+
+            var driver = CSharpGeneratorDriver.Create(
+                generators: generators,
+                additionalTexts: additionalTexts,
+                parseOptions: (CSharpParseOptions)project.ParseOptions!,
+                optionsProvider: project.AnalyzerOptions.AnalyzerConfigOptionsProvider);
+
+            driver.RunGeneratorsAndUpdateCompilation(baseCompilation, out var updated, out _);
+            _compilationCache[project.Id] = updated;
+            return updated;
+        }
+        catch (Exception ex)
+        {
+            // A misbehaving generator must not break the entire server.
+            Console.Error.WriteLine($"[Warning] Source generator failed for '{project.Name}': {ex.Message}");
+            _compilationCache[project.Id] = baseCompilation;
+            return baseCompilation;
         }
     }
 
@@ -863,7 +922,7 @@ public partial class RoslynService
             if (results.Count >= maxResultsToReturn)
                 break;
 
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
 
             // Get all symbols in the project

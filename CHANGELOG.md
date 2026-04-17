@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.5.2] - 2026-04-17
+
+### Fixed
+- Source generators weren't being run, so tools queried a pre-generator compilation. This caused phantom `CS0117` errors, missed references, and false unused-code results for any project using generators (#7)
+- `get_source_generators` now returns actual generated file names (was empty due to broken file-path heuristic)
+- `get_generated_code` now finds generator output (same root cause)
+
+### Changed
+- Added internal `GetProjectCompilationAsync` helper that runs source generators and caches the result per project. All 17 internal compilation callers migrated to use it.
+- Compilation cache invalidated alongside document cache on `load_solution`, `sync_documents`, and after code-writing tools (`add_null_checks`, `generate_equality_members`).
+
 ## [1.5.1] - 2026-04-16
 
 ### Fixed

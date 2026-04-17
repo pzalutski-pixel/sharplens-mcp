@@ -589,7 +589,7 @@ public partial class RoslynService
 
         foreach (var project in _solution!.Projects)
         {
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
 
             var symbols = compilation.GetSymbolsWithName(

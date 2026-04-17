@@ -412,7 +412,7 @@ public partial class RoslynService
             if (unusedSymbols.Count >= maxResultsToReturn)
                 break; // Stop analyzing if we hit the limit
 
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
 
             // Check if we should analyze types
@@ -1370,7 +1370,7 @@ namespace {(string.IsNullOrEmpty(nsName) ? "ValidationNamespace" : nsName)} {{
 }}";
                 syntaxTree = CSharpSyntaxTree.ParseText(wrappedCode);
                 var project = document.Project;
-                compilation = (await project.GetCompilationAsync())!
+                compilation = (await GetProjectCompilationAsync(project))!
                     .AddSyntaxTrees(syntaxTree);
             }
             else
@@ -1473,7 +1473,7 @@ public class ValidationClass {{
             );
         }
 
-        var compilation = await _solution!.Projects.First().GetCompilationAsync();
+        var compilation = await GetProjectCompilationAsync(_solution!.Projects.First());
         if (compilation == null)
         {
             return CreateErrorResponse(
@@ -1621,7 +1621,7 @@ public class ValidationClass {{
         var externalFactories = new List<object>();
         foreach (var project in _solution!.Projects)
         {
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
 
             var allTypes = compilation.GetSymbolsWithName(_ => true, SymbolFilter.Type).OfType<INamedTypeSymbol>();

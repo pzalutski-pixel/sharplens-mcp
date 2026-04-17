@@ -410,7 +410,7 @@ public partial class RoslynService
 
         foreach (var project in projectsToSearch)
         {
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
 
             foreach (var syntaxTree in compilation.SyntaxTrees)

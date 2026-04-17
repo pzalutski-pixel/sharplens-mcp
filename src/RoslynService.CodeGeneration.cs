@@ -478,6 +478,7 @@ public partial class RoslynService
 
         // Reload solution to pick up changes
         _documentCache.Clear();
+        _compilationCache.Clear();
 
         return CreateSuccessResponse(
             data: new

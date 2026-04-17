@@ -8,7 +8,7 @@
     <LangVersion>latest</LangVersion>
 
     <!-- Package metadata -->
-    <Version>1.5.1</Version>
+    <Version>1.5.2</Version>
     <Authors>Peter Zalutski</Authors>
     <Copyright>Copyright (c) 2025 Peter Zalutski</Copyright>
     <Description>MCP server providing 62 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
@@ -18,6 +18,7 @@
     <PackageTags>mcp;roslyn;csharp;dotnet;code-analysis;ai;semantic-analysis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
+v1.5.2: Run source generators so tools see generator-produced code (#7). Fixes phantom CS0117, missed references, wrong unused-code results for projects with generators.
 v1.5.1: Fixed notifications/initialized breaking MCP client connections (#6).
 v1.5.0: Added 7 discovery tools: attribute usages, DI registrations, reflection detection, circular dependencies, NuGet dependencies, source generators, generated code viewer.
 v1.4.2: Split release workflow into separate jobs for reliability. MCP Registry publishing.

@@ -19,7 +19,7 @@ public partial class RoslynService
 
         foreach (var project in projects)
         {
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
 
             foreach (var type in GetAllNamedTypes(compilation))
@@ -96,7 +96,7 @@ public partial class RoslynService
 
         foreach (var project in projects)
         {
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
 
             foreach (var document in project.Documents)
@@ -174,7 +174,7 @@ public partial class RoslynService
 
         foreach (var project in projects)
         {
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
 
             foreach (var document in project.Documents)
@@ -264,7 +264,7 @@ public partial class RoslynService
 
         foreach (var project in _solution!.Projects)
         {
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
@@ -391,22 +391,27 @@ public partial class RoslynService
 
             if (generators.Count == 0) continue;
 
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
+
+            // Post-generator compilation has extra syntax trees for generated code.
+            // Identify them as trees whose FilePath is not one of the project's own documents.
+            var projectDocumentPaths = new HashSet<string>(
+                project.Documents.Where(d => d.FilePath != null).Select(d => d.FilePath!),
+                OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
 
             var generatedFiles = new List<object>();
             foreach (var tree in compilation.SyntaxTrees)
             {
-                var filePath = tree.FilePath;
-                if (!string.IsNullOrEmpty(filePath) && filePath.Contains("Generated"))
+                if (projectDocumentPaths.Contains(tree.FilePath)) continue;
+
+                var text = await tree.GetTextAsync();
+                generatedFiles.Add(new
                 {
-                    generatedFiles.Add(new
-                    {
-                        fileName = Path.GetFileName(filePath),
-                        filePath = FormatPath(filePath),
-                        lineCount = (await tree.GetRootAsync()).GetText().Lines.Count
-                    });
-                }
+                    fileName = Path.GetFileName(tree.FilePath),
+                    hintPath = tree.FilePath,
+                    lineCount = text.Lines.Count
+                });
             }
 
             generatorResults.Add(new
@@ -439,22 +444,30 @@ public partial class RoslynService
             return CreateErrorResponse(ErrorCodes.FileNotFound, $"Project '{projectName}' not found");
         }
 
-        var compilation = await project.GetCompilationAsync();
+        var compilation = await GetProjectCompilationAsync(project);
         if (compilation == null)
         {
             return CreateErrorResponse(ErrorCodes.AnalysisFailed, "Could not get compilation");
         }
 
+        // Only search generated trees (not the project's hand-written documents).
+        var projectDocumentPaths = new HashSet<string>(
+            project.Documents.Where(d => d.FilePath != null).Select(d => d.FilePath!),
+            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
         foreach (var tree in compilation.SyntaxTrees)
         {
-            if (tree.FilePath.Contains(generatedFileName, StringComparison.OrdinalIgnoreCase))
+            if (projectDocumentPaths.Contains(tree.FilePath)) continue;
+
+            if (tree.FilePath.Contains(generatedFileName, StringComparison.OrdinalIgnoreCase) ||
+                Path.GetFileName(tree.FilePath).Contains(generatedFileName, StringComparison.OrdinalIgnoreCase))
             {
                 var text = await tree.GetTextAsync();
                 return CreateSuccessResponse(
                     data: new
                     {
                         fileName = Path.GetFileName(tree.FilePath),
-                        filePath = FormatPath(tree.FilePath),
+                        hintPath = tree.FilePath,
                         sourceCode = text.ToString(),
                         lineCount = text.Lines.Count
                     },
