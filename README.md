@@ -8,6 +8,10 @@ A Model Context Protocol (MCP) server providing **62 AI-optimized tools** for .N
 
 Built for AI coding agents - provides compiler-accurate code understanding that AI cannot infer from reading source files alone.
 
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/pzalutski-pixel-sharplens-mcp).
+
 ## Installation
 
 ### Via NuGet (Recommended)
