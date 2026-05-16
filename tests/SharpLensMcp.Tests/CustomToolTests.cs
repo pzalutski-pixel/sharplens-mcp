@@ -16,29 +16,27 @@ public class CustomToolTests : RoslynServiceTestBase
     public async Task GetComplexityMetrics_OnMethod_ReturnsAllMetrics()
     {
         var searchResult = await Service.SearchSymbolsAsync("LoadSolutionAsync", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.GetComplexityMetricsAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>());
+        AssertSuccess(result);
 
-            var result = await Service.GetComplexityMetricsAsync(file, line, col);
-            AssertSuccess(result);
+        var data = GetData(result);
+        data["scope"]?.Value<string>().Should().Be("method");
 
-            var data = GetData(result);
-            data["scope"]?.Value<string>().Should().Be("method");
-            data["metrics"].Should().NotBeNull();
-
-            var metrics = data["metrics"] as JObject;
-            metrics!["cyclomatic"].Should().NotBeNull();
-            metrics["nesting"].Should().NotBeNull();
-            metrics["loc"].Should().NotBeNull();
-            metrics["parameters"].Should().NotBeNull();
-            metrics["cognitive"].Should().NotBeNull();
-        }
+        var metrics = data["metrics"] as JObject;
+        metrics.Should().NotBeNull();
+        metrics!["cyclomatic"]?.Value<int>().Should().BeGreaterThan(0);
+        metrics["loc"]?.Value<int>().Should().BeGreaterThan(0);
+        metrics["nesting"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
+        metrics["parameters"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
+        metrics["cognitive"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
     }
 
     [Fact]
@@ -66,50 +64,45 @@ public class CustomToolTests : RoslynServiceTestBase
     public async Task GetComplexityMetrics_WithSpecificMetrics_ReturnsOnlyRequested()
     {
         var searchResult = await Service.SearchSymbolsAsync("GetHealthCheckAsync", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.GetComplexityMetricsAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            metrics: new List<string> { "cyclomatic", "loc" });
 
-            var result = await Service.GetComplexityMetricsAsync(
-                file, line, col,
-                metrics: new List<string> { "cyclomatic", "loc" });
+        AssertSuccess(result);
 
-            AssertSuccess(result);
-
-            var data = GetData(result);
-            var metrics = data["metrics"] as JObject;
-            metrics!["cyclomatic"].Should().NotBeNull();
-            metrics["loc"].Should().NotBeNull();
-        }
+        var data = GetData(result);
+        var metrics = data["metrics"] as JObject;
+        metrics!["cyclomatic"]?.Value<int>().Should().BeGreaterThan(0);
+        metrics["loc"]?.Value<int>().Should().BeGreaterThan(0);
     }
 
     [Fact]
-    public async Task GetComplexityMetrics_OnComplexMethod_ReturnsHighValues()
+    public async Task GetComplexityMetrics_OnComplexMethod_ReturnsHighCyclomatic()
     {
         var searchResult = await Service.SearchSymbolsAsync("SemanticQueryAsync", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.GetComplexityMetricsAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>());
+        AssertSuccess(result);
 
-            var result = await Service.GetComplexityMetricsAsync(file, line, col);
-            AssertSuccess(result);
-
-            var data = GetData(result);
-            var metrics = data["metrics"] as JObject;
-
-            var cyclomatic = metrics!["cyclomatic"]?.Value<int>() ?? 0;
-            cyclomatic.Should().BeGreaterOrEqualTo(1);
-        }
+        var data = GetData(result);
+        var metrics = data["metrics"] as JObject;
+        var cyclomatic = metrics!["cyclomatic"]?.Value<int>() ?? 0;
+        cyclomatic.Should().BeGreaterThan(5,
+            "SemanticQueryAsync has many conditional branches — cyclomatic must reflect that");
     }
 
     #endregion
@@ -117,42 +110,49 @@ public class CustomToolTests : RoslynServiceTestBase
     #region Null Checks Tests
 
     [Fact]
-    public async Task AddNullChecks_OnMethodWithParameters_GeneratesGuards()
+    public async Task AddNullChecks_OnLoadSolution_GeneratesGuardForStringPath()
     {
         var searchResult = await Service.SearchSymbolsAsync("LoadSolutionAsync", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.AddNullChecksAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            preview: true);
 
-            var result = await Service.AddNullChecksAsync(file, line, col, preview: true);
-
-            var json = JObject.FromObject(result);
-            // Verify it processes without error
-        }
+        AssertSuccess(result);
+        var data = GetData(result);
+        // LoadSolutionAsync takes `string solutionPath` — a null-check preview must
+        // mention ArgumentNullException (the standard guard pattern).
+        data.ToString().Should().Contain("ArgumentNullException");
     }
 
     [Fact]
-    public async Task AddNullChecks_OnMethodWithNoParameters_ReturnsNoChanges()
+    public async Task AddNullChecks_OnMethodWithNoParameters_ReturnsEmptyOrSuccess()
     {
         var searchResult = await Service.SearchSymbolsAsync("GetHealthCheckAsync", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.AddNullChecksAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            preview: true);
 
-            var result = await Service.AddNullChecksAsync(file, line, col, preview: true);
-
-            var json = JObject.FromObject(result);
-        }
+        AssertSuccess(result);
+        var data = GetData(result);
+        // GetHealthCheckAsync has no nullable reference params, so the preview
+        // should report zero generated guards.
+        var guardsAdded = data["guardsAdded"]?.Value<int>() ?? data["changesCount"]?.Value<int>() ?? 0;
+        guardsAdded.Should().Be(0,
+            "a method with no nullable reference parameters needs no guards");
     }
 
     #endregion
@@ -160,47 +160,51 @@ public class CustomToolTests : RoslynServiceTestBase
     #region Equality Members Tests
 
     [Fact]
-    public async Task GenerateEqualityMembers_OnClass_GeneratesMembers()
+    public async Task GenerateEqualityMembers_WithOperators_PreviewIncludesEqualsAndOperators()
     {
-        var searchResult = await Service.SearchSymbolsAsync("RoslynService", kind: "Class", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var searchResult = await Service.SearchSymbolsAsync("RefactoringTarget", kind: "Class", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.GenerateEqualityMembersAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            includeOperators: true,
+            preview: true);
 
-            var result = await Service.GenerateEqualityMembersAsync(
-                file, line, col,
-                includeOperators: true,
-                preview: true);
-
-            var json = JObject.FromObject(result);
-        }
+        AssertSuccess(result);
+        var data = GetData(result);
+        var text = data.ToString();
+        text.Should().Contain("Equals");
+        text.Should().Contain("GetHashCode");
+        text.Should().Contain("operator ==");
     }
 
     [Fact]
-    public async Task GenerateEqualityMembers_WithoutOperators_GeneratesOnlyMethods()
+    public async Task GenerateEqualityMembers_WithoutOperators_PreviewExcludesOperators()
     {
-        var searchResult = await Service.SearchSymbolsAsync("RoslynService", kind: "Class", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var searchResult = await Service.SearchSymbolsAsync("RefactoringTarget", kind: "Class", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.GenerateEqualityMembersAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            includeOperators: false,
+            preview: true);
 
-            var result = await Service.GenerateEqualityMembersAsync(
-                file, line, col,
-                includeOperators: false,
-                preview: true);
-
-            var json = JObject.FromObject(result);
-        }
+        AssertSuccess(result);
+        var data = GetData(result);
+        var text = data.ToString();
+        text.Should().Contain("Equals");
+        text.Should().Contain("GetHashCode");
+        text.Should().NotContain("operator ==");
     }
 
     #endregion
@@ -255,14 +259,11 @@ public class CustomToolTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task GetTypeMembersBatch_WithEmptyList_ReturnsEmpty()
+    public async Task GetTypeMembersBatch_WithEmptyList_ReturnsInvalidParameterError()
     {
-        // Act
         var result = await Service.GetTypeMembersBatchAsync(new List<string>());
 
-        // Assert
-        var json = JObject.FromObject(result);
-        // Should handle gracefully
+        AssertError(result, "INVALID");
     }
 
     [Fact]

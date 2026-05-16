@@ -43,9 +43,18 @@ public static class TestHelpers
             metadataReferences: CoreReferences
         );
 
+        // Give the document a real-looking FilePath so RoslynService.TryFindDocument
+        // can resolve it (the production path matches by FilePath, not Name).
+        var virtualPath = Path.Combine(Path.GetTempPath(), $"adhoc-{Guid.NewGuid():N}", fileName);
+        var documentInfo = DocumentInfo.Create(
+            documentId,
+            name: fileName,
+            loader: TextLoader.From(TextAndVersion.Create(SourceText.From(code), VersionStamp.Create())),
+            filePath: virtualPath);
+
         var solution = workspace.CurrentSolution
             .AddProject(projectInfo)
-            .AddDocument(documentId, fileName, SourceText.From(code));
+            .AddDocument(documentInfo);
 
         workspace.TryApplyChanges(solution);
         var document = workspace.CurrentSolution.GetDocument(documentId)!;

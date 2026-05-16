@@ -10,105 +10,115 @@ namespace SharpLensMcp.Tests;
 public class AnalysisTests : RoslynServiceTestBase
 {
     [Fact]
-    public async Task GetDiagnostics_ReturnsWarnings()
+    public async Task GetDiagnostics_ReturnsArray()
     {
-        // Act - correct signature: filePath, projectPath, severity, includeHidden
         var result = await Service.GetDiagnosticsAsync(
             filePath: null,
             projectPath: null,
             severity: null,
             includeHidden: false);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["diagnostics"].Should().NotBeNull();
+        var diagnostics = data["diagnostics"] as JArray;
+        diagnostics.Should().NotBeNull("a clean build still produces a diagnostics array, even if empty");
     }
 
     [Fact]
-    public async Task GetDiagnostics_ForSpecificFile_FiltersResults()
+    public async Task GetDiagnostics_ForSpecificFile_OnlyContainsThatFile()
     {
-        // Act
         var result = await Service.GetDiagnosticsAsync(
             filePath: RoslynServicePath,
             projectPath: null,
             severity: null,
             includeHidden: false);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         var diagnostics = data["diagnostics"] as JArray;
+        diagnostics.Should().NotBeNull();
 
-        foreach (var diag in diagnostics ?? new JArray())
+        // Every diagnostic (if any) must reference RoslynService.cs — the filter
+        // is the whole point of this test. Empty result is also acceptable for a
+        // warning-free file, but a non-RoslynService entry would mean the filter is broken.
+        foreach (var diag in diagnostics!)
         {
-            diag["filePath"]?.Value<string>().Should().Contain("RoslynService");
+            diag["filePath"]?.Value<string>().Should().EndWith("RoslynService.cs");
         }
     }
 
     [Fact]
-    public async Task GetDiagnostics_FilterBySeverity_ReturnsOnlyErrors()
+    public async Task GetDiagnostics_FilterBySeverity_OnlyErrorsOrEmpty()
     {
-        // Act
         var result = await Service.GetDiagnosticsAsync(
             filePath: null,
             projectPath: null,
             severity: "Error",
             includeHidden: false);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         var diagnostics = data["diagnostics"] as JArray;
+        diagnostics.Should().NotBeNull();
 
-        foreach (var diag in diagnostics ?? new JArray())
+        foreach (var diag in diagnostics!)
         {
-            diag["severity"]?.Value<string>().Should().Be("Error");
+            diag["severity"]?.Value<string>().Should().Be("Error",
+                "severity filter must include only Error-level diagnostics");
         }
     }
 
-    [Fact]
-    public async Task AnalyzeDataFlow_OnMethodBody_ReturnsFlowInfo()
+    private static (string file, int firstStmt, int lastStmt) LocateSumBody(RoslynService service)
     {
-        // Find a method with local variables
-        var searchResult = await Service.SearchSymbolsAsync("LoadSolutionAsync", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        // Resolve the fixture path off the loaded solution, then read the file to find
+        // the inclusive line range of Sum's three body statements. This avoids hard-coding
+        // line offsets that drift whenever the fixture file changes.
+        var solution = service.GetSolutionForTesting()!;
+        var fixtureDoc = solution.Projects
+            .SelectMany(p => p.Documents)
+            .First(d => d.FilePath != null && d.FilePath.EndsWith("RefactoringFixture.cs"));
+        var file = fixtureDoc.FilePath!;
+        var lines = File.ReadAllLines(file);
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var startLine = symbol["line"]?.Value<int>() ?? 0;
-
-            var result = await Service.AnalyzeDataFlowAsync(
-                file,
-                startLine: startLine + 1,
-                endLine: startLine + 5);
-
-            // May succeed or give meaningful error
-            var json = JObject.FromObject(result);
-        }
+        var first = Array.FindIndex(lines, l => l.Contains("var partial"));
+        var last = Array.FindIndex(lines, l => l.Contains("return total"));
+        first.Should().BeGreaterThan(-1);
+        last.Should().BeGreaterThan(first);
+        return (file, first, last);
     }
 
     [Fact]
-    public async Task AnalyzeControlFlow_OnMethodBody_ReturnsFlowInfo()
+    public async Task AnalyzeDataFlow_OnFixtureSum_ReturnsExpectedVariables()
     {
-        var searchResult = await Service.SearchSymbolsAsync("LoadSolutionAsync", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var (file, firstStmt, lastStmt) = LocateSumBody(Service);
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var startLine = symbol["line"]?.Value<int>() ?? 0;
+        var result = await Service.AnalyzeDataFlowAsync(file, startLine: firstStmt, endLine: lastStmt);
+        AssertSuccess(result);
 
-            var result = await Service.AnalyzeControlFlowAsync(
-                file,
-                startLine: startLine + 1,
-                endLine: startLine + 5);
+        var data = GetData(result);
+        data["succeeded"]?.Value<bool>().Should().BeTrue();
 
-            var json = JObject.FromObject(result);
-        }
+        var declared = (data["variablesDeclared"] as JArray)!.Select(v => v.Value<string>()).ToList();
+        declared.Should().Contain("partial");
+        declared.Should().Contain("total");
+
+        var read = (data["readInside"] as JArray)!.Select(v => v.Value<string>()).ToList();
+        read.Should().Contain("a");
+        read.Should().Contain("c");
+    }
+
+    [Fact]
+    public async Task AnalyzeControlFlow_OnFixtureSum_ReturnsExitPoint()
+    {
+        var (file, firstStmt, lastStmt) = LocateSumBody(Service);
+
+        var result = await Service.AnalyzeControlFlowAsync(file, startLine: firstStmt, endLine: lastStmt);
+        AssertSuccess(result);
+
+        var data = GetData(result);
+        data["startPointIsReachable"]?.Value<bool>().Should().BeTrue();
+        data["endPointIsReachable"]?.Value<bool>().Should().BeFalse(
+            "the region ends with a return so the end-point isn't reachable");
     }
 
     [Fact]
@@ -169,9 +179,8 @@ public class AnalysisTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task FindUnusedCode_FindsUnusedSymbols()
+    public async Task FindUnusedCode_ReturnsArrayWithExpectedShape()
     {
-        // Act - correct signature: projectName, includePrivate, includeInternal, symbolKindFilter, maxResults
         var result = await Service.FindUnusedCodeAsync(
             projectName: null,
             includePrivate: true,
@@ -179,10 +188,11 @@ public class AnalysisTests : RoslynServiceTestBase
             symbolKindFilter: null,
             maxResults: 10);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["unusedSymbols"].Should().NotBeNull();
+        var unusedSymbols = data["unusedSymbols"] as JArray;
+        unusedSymbols.Should().NotBeNull("response must always include an unusedSymbols array");
+        unusedSymbols!.Count.Should().BeLessOrEqualTo(10, "maxResults must be enforced");
     }
 
     [Fact]
@@ -252,25 +262,23 @@ public class AnalysisTests : RoslynServiceTestBase
     [Fact]
     public async Task AnalyzeChangeImpact_ShowsAffectedLocations()
     {
-        // Find a method to analyze
         var searchResult = await Service.SearchSymbolsAsync("CreateSuccessResponse", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.AnalyzeChangeImpactAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            changeType: "rename",
+            newValue: "CreateSuccess");
 
-            var result = await Service.AnalyzeChangeImpactAsync(
-                file, line, col,
-                changeType: "rename",
-                newValue: "CreateSuccess");
-
-            AssertSuccess(result);
-            var data = GetData(result);
-            data["impactedLocations"].Should().NotBeNull();
-        }
+        AssertSuccess(result);
+        var data = GetData(result);
+        var locations = data["impactedLocations"] as JArray;
+        locations.Should().NotBeNullOrEmpty(
+            "CreateSuccessResponse is called from many sites, so impactedLocations must be non-empty");
     }
 }

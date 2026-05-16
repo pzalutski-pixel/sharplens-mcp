@@ -188,13 +188,16 @@ public partial class RoslynService
             var text = refTree.GetText();
             var lineText = text.Lines[lineSpan.StartLinePosition.Line].ToString().Trim();
 
+            var refRoot = await refTree.GetRootAsync();
+            var refNode = refRoot.FindNode(refSpan);
+
             referenceList.Add(new
             {
                 filePath = FormatPath(refDocument.FilePath),
                 line = lineSpan.StartLinePosition.Line,
                 column = lineSpan.StartLinePosition.Character,
                 lineText,
-                kind = "read"
+                kind = ClassifyReferenceKind(loc, refNode)
             });
         }
 
@@ -433,7 +436,7 @@ public partial class RoslynService
             implementationList.Add(new
             {
                 name = impl.ToDisplayString(),
-                kind = impl.TypeKind.ToString(),
+                kind = GetTypeKindString(impl),
                 containingNamespace = impl.ContainingNamespace?.ToDisplayString(),
                 locations
             });
@@ -606,7 +609,7 @@ public partial class RoslynService
                     // For type symbols (Class, Interface, Struct, Enum), check TypeKind
                     if (symbol is INamedTypeSymbol namedType)
                     {
-                        matches = namedType.TypeKind.ToString().Equals(kind, StringComparison.OrdinalIgnoreCase);
+                        matches = GetTypeKindString(namedType).Equals(kind, StringComparison.OrdinalIgnoreCase);
                     }
                     else
                     {
@@ -647,17 +650,11 @@ public partial class RoslynService
                         column = lineSpan.StartLinePosition.Character
                     }
                 });
-
-                // Continue collecting until we have offset + maxResults (to handle pagination)
-                if (allResults.Count >= offset + maxResults + 100) // +100 buffer for accurate totalCount estimation
-                    break;
             }
-
-            if (allResults.Count >= offset + maxResults + 100)
-                break;
         }
 
-        // Apply pagination
+        // Apply pagination. totalCount is the true unbounded match count;
+        // hasMore is derived from offset + page size.
         var totalCount = allResults.Count;
         var paginatedResults = allResults.Skip(offset).Take(maxResults).ToList();
         var hasMore = offset + paginatedResults.Count < totalCount;
@@ -683,6 +680,64 @@ public partial class RoslynService
             totalCount: totalCount,
             returnedCount: paginatedResults.Count
         );
+    }
+
+    // Maps a reference location to one of: write, invocation, typeof, nameof, attribute, read.
+    private static string ClassifyReferenceKind(ReferenceLocation loc, SyntaxNode? node)
+    {
+        if (node == null) return "read";
+
+        if (IsWriteContext(node)) return "write";
+
+        for (var current = node; current != null; current = current.Parent)
+        {
+            switch (current)
+            {
+                case AttributeSyntax:
+                    return "attribute";
+                case TypeOfExpressionSyntax:
+                    return "typeof";
+                case InvocationExpressionSyntax inv:
+                    if (inv.Expression is IdentifierNameSyntax id && id.Identifier.Text == "nameof")
+                        return "nameof";
+                    // Only call it an invocation if this node is on the call's expression side,
+                    // not buried inside one of the arguments.
+                    return inv.Expression == node || inv.Expression.Span.Contains(node.Span)
+                        ? "invocation"
+                        : "read";
+            }
+        }
+
+        return "read";
+    }
+
+    // True when `node` is the target of an assignment, ++/-- operator, or out/ref argument.
+    private static bool IsWriteContext(SyntaxNode node)
+    {
+        // Walk up across MemberAccess / ElementAccess / parens so `obj.Field = x` still
+        // classifies `Field` as a write.
+        var current = node;
+        while (current.Parent is MemberAccessExpressionSyntax mae && mae.Name == current
+            || current.Parent is ElementAccessExpressionSyntax eae && eae.Expression == current
+            || current.Parent is ParenthesizedExpressionSyntax)
+        {
+            current = current.Parent;
+        }
+
+        return current.Parent switch
+        {
+            AssignmentExpressionSyntax assign when assign.Left == current => true,
+            PrefixUnaryExpressionSyntax pre when
+                pre.IsKind(SyntaxKind.PreIncrementExpression) ||
+                pre.IsKind(SyntaxKind.PreDecrementExpression) => true,
+            PostfixUnaryExpressionSyntax post when
+                post.IsKind(SyntaxKind.PostIncrementExpression) ||
+                post.IsKind(SyntaxKind.PostDecrementExpression) => true,
+            ArgumentSyntax arg when
+                arg.RefOrOutKeyword.IsKind(SyntaxKind.OutKeyword) ||
+                arg.RefOrOutKeyword.IsKind(SyntaxKind.RefKeyword) => true,
+            _ => false
+        };
     }
 
 }

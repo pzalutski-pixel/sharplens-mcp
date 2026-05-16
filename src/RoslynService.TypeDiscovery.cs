@@ -97,7 +97,7 @@ public partial class RoslynService
             data: new
             {
                 typeName = type.ToDisplayString(),
-                typeKind = type.TypeKind.ToString(),
+                typeKind = GetTypeKindString(type),
                 totalMembers = totalCount,
                 memberCounts = countByKind,
                 members = formattedMembers
@@ -629,7 +629,7 @@ public partial class RoslynService
             data: new
             {
                 typeName = type.ToDisplayString(),
-                typeKind = type.TypeKind.ToString(),
+                typeKind = GetTypeKindString(type),
                 isAbstract = type.IsAbstract,
                 isSealed = type.IsSealed,
                 baseTypes,

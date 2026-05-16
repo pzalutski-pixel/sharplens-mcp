@@ -12,52 +12,52 @@ public class NavigationTests : RoslynServiceTestBase
     [Fact]
     public async Task GetSymbolInfo_OnClassName_ReturnsTypeInfo()
     {
-        // Find the line with "public class RoslynService" dynamically
         var lines = File.ReadAllLines(RoslynServicePath);
         var classLine = Array.FindIndex(lines, l => l.Contains("class RoslynService"));
+        classLine.Should().BeGreaterThan(0, "the partial class declaration must exist in RoslynService.cs");
+
         var result = await Service.GetSymbolInfoAsync(RoslynServicePath, line: classLine, column: 20);
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["kind"]?.Value<string>().Should().NotBeNullOrEmpty();
+        data["kind"]?.Value<string>().Should().Be("NamedType");
+        data["name"]?.Value<string>().Should().Be("RoslynService");
+        data["typeKind"]?.Value<string>().Should().Be("Class");
     }
 
     [Fact]
-    public async Task GetSymbolInfo_InvalidPosition_ReturnsNoSymbol()
+    public async Task GetSymbolInfo_InvalidPosition_ReturnsError()
     {
-        // Position in whitespace
+        // Position (0, 0) — beginning of file, no symbol there.
         var result = await Service.GetSymbolInfoAsync(RoslynServicePath, line: 0, column: 0);
 
-        // May succeed with null symbol or return error
-        var json = JObject.FromObject(result);
-        if (json["success"]?.Value<bool>() == true)
-        {
-            var data = json["data"];
-            data?["kind"]?.Value<string>().Should().BeNullOrEmpty();
-        }
+        // Must report failure with SymbolNotFound — the prior pattern of "success with empty kind"
+        // was vacuous (the if-condition let it pass in either branch).
+        AssertError(result);
     }
 
     [Fact]
     public async Task GoToDefinition_OnMethod_ReturnsLocation()
     {
-        // Search for a method call first to find a good position
         var searchResult = await Service.SearchSymbolsAsync("CreateSuccessResponse", kind: null, maxResults: 10);
         AssertSuccess(searchResult);
 
-        var symbols = GetData(searchResult)["symbols"] as JArray;
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>();
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty("CreateSuccessResponse exists in the loaded solution");
 
-            // Now go to definition
-            var result = await Service.GoToDefinitionAsync(file!, line, col);
-            AssertSuccess(result);
-            var data = GetData(result);
-            data["filePath"]?.Value<string>().Should().NotBeNullOrEmpty();
-        }
+        var symbol = symbols![0];
+        var loc = symbol["location"];
+        loc.Should().NotBeNull();
+        var file = loc!["filePath"]!.Value<string>()!;
+        var line = loc["line"]!.Value<int>();
+        var col = loc["column"]!.Value<int>();
+
+        var result = await Service.GoToDefinitionAsync(file, line, col);
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["filePath"]?.Value<string>().Should().EndWith("RoslynService.cs",
+            "CreateSuccessResponse is defined in RoslynService.cs");
+        data["line"]?.Value<int>().Should().BeGreaterThan(0);
     }
 
     [Fact]
@@ -115,25 +115,24 @@ public class NavigationTests : RoslynServiceTestBase
     [Fact]
     public async Task FindReferences_OnPublicMethod_FindsUsages()
     {
-        // Find CreateSuccessResponse which is used many times
         var searchResult = await Service.SearchSymbolsAsync("CreateSuccessResponse", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty("CreateSuccessResponse exists in the loaded solution");
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.FindReferencesAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>());
+        AssertSuccess(result);
 
-            var result = await Service.FindReferencesAsync(file, line, col);
-            AssertSuccess(result);
-
-            var data = GetData(result);
-            var references = data["references"] as JArray;
-            references.Should().NotBeNull();
-            references!.Count.Should().BeGreaterThan(1, "CreateSuccessResponse should have many references");
-        }
+        var data = GetData(result);
+        var references = data["references"] as JArray;
+        references.Should().NotBeNullOrEmpty();
+        references!.Count.Should().BeGreaterThan(1,
+            "CreateSuccessResponse is called from multiple tool methods");
+        data["totalReferences"]?.Value<int>().Should().BeGreaterThan(1);
     }
 
     [Fact]
@@ -182,51 +181,53 @@ public class NavigationTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task GetDerivedTypes_FindsSubclasses()
+    public async Task GetDerivedTypes_FindsTransitiveSubclasses()
     {
-        // Test with a type we know has no subclasses in this project
-        var result = await Service.GetDerivedTypesAsync("RoslynService");
+        var result = await Service.GetDerivedTypesAsync("FixtureRectangle");
 
         AssertSuccess(result);
-        // May or may not have derived types, just verify structure
         var data = GetData(result);
-        data["baseTypeName"]?.Value<string>().Should().Contain("RoslynService");
+        data["baseType"]?.Value<string>().Should().EndWith("FixtureRectangle");
+
+        var derived = data["derivedTypes"] as JArray;
+        derived.Should().NotBeNullOrEmpty("FixtureSquare derives from FixtureRectangle");
+        derived!.Any(d => d["name"]?.Value<string>()?.EndsWith("FixtureSquare") == true)
+            .Should().BeTrue("FixtureSquare must appear in transitive derived types");
     }
 
     [Fact]
     public async Task GetBaseTypes_ReturnsInheritanceChain()
     {
-        // Act
-        var result = await Service.GetBaseTypesAsync("RoslynService");
+        // FixtureSquare : FixtureRectangle : object. Chain stops before object.
+        var result = await Service.GetBaseTypesAsync("FixtureSquare");
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         var baseTypes = data["baseTypes"] as JArray;
-        baseTypes.Should().NotBeNull();
-        // Should have at least Object in the chain
+        baseTypes.Should().NotBeNullOrEmpty();
+        baseTypes!.Any(b => b["name"]?.Value<string>()?.EndsWith("FixtureRectangle") == true)
+            .Should().BeTrue("FixtureSquare's immediate base must be FixtureRectangle");
     }
 
     [Fact]
     public async Task FindCallers_FindsUsages()
     {
-        // Find a method that is called internally
         var searchResult = await Service.SearchSymbolsAsync("EnsureSolutionLoaded", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.FindCallersAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>());
+        AssertSuccess(result);
 
-            var result = await Service.FindCallersAsync(file, line, col);
-            AssertSuccess(result);
-
-            var data = GetData(result);
-            data["callers"].Should().NotBeNull();
-        }
+        var data = GetData(result);
+        var callers = data["callers"] as JArray;
+        callers.Should().NotBeNullOrEmpty(
+            "EnsureSolutionLoaded is called from many tool methods, so callers must be non-empty");
     }
 
     [Fact]

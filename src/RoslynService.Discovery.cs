@@ -13,6 +13,7 @@ public partial class RoslynService
         EnsureSolutionLoaded();
 
         var results = new List<object>();
+        var totalFound = 0;
         var projects = projectName != null
             ? _solution!.Projects.Where(p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase))
             : _solution!.Projects;
@@ -24,56 +25,47 @@ public partial class RoslynService
 
             foreach (var type in GetAllNamedTypes(compilation))
             {
-                // Check the type itself
                 foreach (var attr in type.GetAttributes())
                 {
-                    if (MatchesAttribute(attr, attributeName))
+                    if (!MatchesAttribute(attr, attributeName)) continue;
+                    totalFound++;
+                    if (results.Count >= maxResults) continue;
+                    results.Add(new
                     {
-                        results.Add(new
-                        {
-                            symbolName = type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat),
-                            symbolKind = "Type",
-                            attributeName = attr.AttributeClass?.Name,
-                            arguments = attr.ConstructorArguments.Select(a => a.ToCSharpString()).ToList(),
-                            namedArguments = attr.NamedArguments.ToDictionary(a => a.Key, a => a.Value.ToCSharpString()),
-                            location = GetSymbolLocation(type)
-                        });
-                        if (results.Count >= maxResults) break;
-                    }
+                        symbolName = type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat),
+                        symbolKind = "Type",
+                        attributeName = attr.AttributeClass?.Name,
+                        arguments = attr.ConstructorArguments.Select(a => a.ToCSharpString()).ToList(),
+                        namedArguments = attr.NamedArguments.ToDictionary(a => a.Key, a => a.Value.ToCSharpString()),
+                        location = GetSymbolLocation(type)
+                    });
                 }
 
-                if (results.Count >= maxResults) break;
-
-                // Check members
                 foreach (var member in type.GetMembers())
                 {
                     foreach (var attr in member.GetAttributes())
                     {
-                        if (MatchesAttribute(attr, attributeName))
+                        if (!MatchesAttribute(attr, attributeName)) continue;
+                        totalFound++;
+                        if (results.Count >= maxResults) continue;
+                        results.Add(new
                         {
-                            results.Add(new
-                            {
-                                symbolName = $"{type.Name}.{member.Name}",
-                                symbolKind = member.Kind.ToString(),
-                                attributeName = attr.AttributeClass?.Name,
-                                arguments = attr.ConstructorArguments.Select(a => a.ToCSharpString()).ToList(),
-                                namedArguments = attr.NamedArguments.ToDictionary(a => a.Key, a => a.Value.ToCSharpString()),
-                                location = GetSymbolLocation(member)
-                            });
-                            if (results.Count >= maxResults) break;
-                        }
+                            symbolName = $"{type.Name}.{member.Name}",
+                            symbolKind = member.Kind.ToString(),
+                            attributeName = attr.AttributeClass?.Name,
+                            arguments = attr.ConstructorArguments.Select(a => a.ToCSharpString()).ToList(),
+                            namedArguments = attr.NamedArguments.ToDictionary(a => a.Key, a => a.Value.ToCSharpString()),
+                            location = GetSymbolLocation(member)
+                        });
                     }
-                    if (results.Count >= maxResults) break;
                 }
-                if (results.Count >= maxResults) break;
             }
-            if (results.Count >= maxResults) break;
         }
 
         return CreateSuccessResponse(
             data: new { attributeFilter = attributeName, usages = results },
             suggestedNextTools: new[] { "get_type_overview", "find_references" },
-            totalCount: results.Count,
+            totalCount: totalFound,
             returnedCount: results.Count
         );
     }
@@ -160,6 +152,7 @@ public partial class RoslynService
         EnsureSolutionLoaded();
 
         var usages = new List<object>();
+        var totalFound = 0;
         var reflectionApis = new[]
         {
             "GetType", "GetMethod", "GetProperty", "GetField", "GetEvent",
@@ -201,6 +194,9 @@ public partial class RoslynService
 
                     if (!isReflection) continue;
 
+                    totalFound++;
+                    if (usages.Count >= maxResults) continue;
+
                     var lineSpan = invocation.GetLocation().GetLineSpan();
                     usages.Add(new
                     {
@@ -213,17 +209,14 @@ public partial class RoslynService
                             column = lineSpan.StartLinePosition.Character
                         }
                     });
-                    if (usages.Count >= maxResults) break;
                 }
-                if (usages.Count >= maxResults) break;
             }
-            if (usages.Count >= maxResults) break;
         }
 
         return CreateSuccessResponse(
             data: new { usages },
             suggestedNextTools: new[] { "find_references", "get_symbol_info" },
-            totalCount: usages.Count,
+            totalCount: totalFound,
             returnedCount: usages.Count
         );
     }

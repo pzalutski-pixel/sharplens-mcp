@@ -16,7 +16,11 @@ namespace SharpLensMcp;
 
 public partial class RoslynService
 {
-    private MSBuildWorkspace? _workspace;
+    // Stored as base Workspace so tests can substitute an AdhocWorkspace for
+    // in-memory scenarios (broken code that CS0535 won't let us put on disk,
+    // hermetic per-test isolation, sub-second test runs). Production code path
+    // still uses MSBuildWorkspace; LoadSolutionAsync constructs it locally.
+    private Workspace? _workspace;
     private Solution? _solution;
     private readonly Dictionary<string, Document> _documentCache = new();
     internal readonly ConcurrentDictionary<ProjectId, Compilation> _compilationCache = new();
@@ -49,6 +53,16 @@ public partial class RoslynService
             + "$";
 
         return System.Text.RegularExpressions.Regex.IsMatch(input, regexPattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    }
+
+    // Records have IsRecord=true but TypeKind=Class/Struct. Return the user-meaningful kind.
+    internal static string GetTypeKindString(ITypeSymbol type)
+    {
+        if (type is INamedTypeSymbol named && named.IsRecord)
+        {
+            return named.TypeKind == TypeKind.Struct ? "RecordStruct" : "Record";
+        }
+        return type.TypeKind.ToString();
     }
 
 
@@ -145,37 +159,47 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
+        // Prefer base compilation so SymbolFinder (FindDerivedClasses, FindImplementations,
+        // FindReferences) recognizes the returned symbol. The augmented compilation from
+        // GetProjectCompilationAsync has different symbol identity that SymbolFinder won't
+        // resolve. Fall back to the augmented compilation only when the base doesn't have
+        // the type (e.g., it's purely source-generated).
         foreach (var project in _solution!.Projects)
         {
-            var compilation = await GetProjectCompilationAsync(project);
-            if (compilation == null) continue;
-
-            // Strategy 1: Fully-qualified metadata name
-            var type = compilation.GetTypeByMetadataName(typeName);
-            if (type != null) return type;
-
-            // Strategy 2: Common Godot namespace prefix
-            type = compilation.GetTypeByMetadataName($"Godot.{typeName}");
-            if (type != null) return type;
-
-            // Strategy 3: Search by simple name (case-insensitive)
-            var symbols = compilation.GetSymbolsWithName(
-                name => name.Equals(typeName, StringComparison.OrdinalIgnoreCase),
-                SymbolFilter.Type);
-
-            var found = symbols.OfType<INamedTypeSymbol>().FirstOrDefault();
+            var baseCompilation = await project.GetCompilationAsync();
+            var found = baseCompilation != null ? FindTypeIn(baseCompilation, typeName) : null;
             if (found != null) return found;
 
-            // Strategy 4: Partial match (contains)
-            symbols = compilation.GetSymbolsWithName(
-                name => name.Contains(typeName, StringComparison.OrdinalIgnoreCase),
-                SymbolFilter.Type);
-
-            found = symbols.OfType<INamedTypeSymbol>().FirstOrDefault();
+            var augmented = await GetProjectCompilationAsync(project);
+            found = augmented != null ? FindTypeIn(augmented, typeName) : null;
             if (found != null) return found;
         }
 
         return null;
+    }
+
+    private static INamedTypeSymbol? FindTypeIn(Compilation compilation, string typeName)
+    {
+        // Strategy 1: Fully-qualified metadata name
+        var type = compilation.GetTypeByMetadataName(typeName);
+        if (type != null) return type;
+
+        // Strategy 2: Common Godot namespace prefix
+        type = compilation.GetTypeByMetadataName($"Godot.{typeName}");
+        if (type != null) return type;
+
+        // Strategy 3: Search by simple name (case-insensitive)
+        var symbols = compilation.GetSymbolsWithName(
+            name => name.Equals(typeName, StringComparison.OrdinalIgnoreCase),
+            SymbolFilter.Type);
+        var found = symbols.OfType<INamedTypeSymbol>().FirstOrDefault();
+        if (found != null) return found;
+
+        // Strategy 4: Partial match (contains)
+        symbols = compilation.GetSymbolsWithName(
+            name => name.Contains(typeName, StringComparison.OrdinalIgnoreCase),
+            SymbolFilter.Type);
+        return symbols.OfType<INamedTypeSymbol>().FirstOrDefault();
     }
 
     /// <summary>
@@ -223,13 +247,16 @@ public partial class RoslynService
         _documentCache.Clear();
         _compilationCache.Clear();
 
-        _workspace = MSBuildWorkspace.Create();
-        _workspace.RegisterWorkspaceFailedHandler(args =>
+        // MSBuild-specific construction lives in a local variable; once configured
+        // we hand it to the base-typed _workspace field.
+        var msbuild = MSBuildWorkspace.Create();
+        msbuild.RegisterWorkspaceFailedHandler(args =>
         {
             Console.Error.WriteLine($"[Warning] Workspace: {args.Diagnostic.Message}");
         });
 
-        _solution = await _workspace.OpenSolutionAsync(solutionPath);
+        _solution = await msbuild.OpenSolutionAsync(solutionPath);
+        _workspace = msbuild;
         _solutionLoadedAt = DateTime.UtcNow;
 
         var projectCount = _solution.ProjectIds.Count;
@@ -634,6 +661,25 @@ public partial class RoslynService
         }
     }
 
+    /// <summary>Test-only accessor for the loaded solution. Do not use outside tests.</summary>
+    internal Solution? GetSolutionForTesting() => _solution;
+
+    /// <summary>
+    /// Test-only entry point: hand RoslynService an already-configured Workspace
+    /// (typically an AdhocWorkspace) so tests can exercise tools against in-memory
+    /// code — including code that wouldn't compile and therefore can't be a file
+    /// on disk. Production code path remains <see cref="LoadSolutionAsync"/>.
+    /// </summary>
+    internal void LoadFromWorkspaceForTesting(Workspace workspace)
+    {
+        _workspace?.Dispose();
+        _documentCache.Clear();
+        _compilationCache.Clear();
+        _workspace = workspace;
+        _solution = workspace.CurrentSolution;
+        _solutionLoadedAt = DateTime.UtcNow;
+    }
+
     /// <summary>
     /// Gets the compilation for a project with source generators run.
     /// This is the sanctioned way to get a compilation inside RoslynService —
@@ -643,9 +689,6 @@ public partial class RoslynService
     /// Thread safety: tool calls are serialized through stdio so there are no concurrent
     /// cache misses in practice. ConcurrentDictionary is used for cheap lock-free reads.
     /// </summary>
-    /// <summary>Test-only accessor for the loaded solution. Do not use outside tests.</summary>
-    internal Solution? GetSolutionForTesting() => _solution;
-
     internal async Task<Compilation?> GetProjectCompilationAsync(Project project)
     {
         if (_compilationCache.TryGetValue(project.Id, out var cached))
@@ -691,27 +734,44 @@ public partial class RoslynService
 
     private Task<Document> GetDocumentAsync(string filePath)
     {
-        // Check cache
-        if (_documentCache.TryGetValue(filePath, out var cached))
-            return Task.FromResult(cached);
+        var document = TryFindDocument(filePath);
+        if (document == null)
+            throw new FileNotFoundException($"Document not found in solution: {filePath}");
+        return Task.FromResult(document);
+    }
 
-        // Find document in solution
+    // Returns the solution Document matching `filePath`, accepting either an absolute path
+    // or a path relative to the solution directory. FormatPath emits solution-relative
+    // paths by default, so callers can pass those values straight back without manual
+    // absolutization. Returns null if no match — call sites decide how to report failure.
+    internal Document? TryFindDocument(string filePath)
+    {
+        if (_documentCache.TryGetValue(filePath, out var cached))
+            return cached;
+
+        var resolved = filePath;
+        if (!Path.IsPathRooted(filePath) && _solution?.FilePath != null)
+        {
+            var solutionDir = Path.GetDirectoryName(_solution.FilePath);
+            if (!string.IsNullOrEmpty(solutionDir))
+            {
+                resolved = Path.GetFullPath(Path.Combine(solutionDir, filePath));
+            }
+        }
+
         var document = _solution!.Projects
             .SelectMany(p => p.Documents)
             .FirstOrDefault(d => d.FilePath != null &&
-                string.Equals(Path.GetFullPath(d.FilePath), Path.GetFullPath(filePath), PathComparison));
+                string.Equals(Path.GetFullPath(d.FilePath), Path.GetFullPath(resolved), PathComparison));
 
-        if (document == null)
-            throw new FileNotFoundException($"Document not found in solution: {filePath}");
+        if (document == null) return null;
 
-        // Cache it
         var enableCache = Environment.GetEnvironmentVariable("ROSLYN_ENABLE_SEMANTIC_CACHE") != "false";
         if (enableCache)
         {
             _documentCache[filePath] = document;
         }
-
-        return Task.FromResult(document);
+        return document;
     }
 
     private int GetPosition(SyntaxTree syntaxTree, int line, int column)
@@ -864,7 +924,7 @@ public partial class RoslynService
         // Type-specific properties
         if (symbol is INamedTypeSymbol typeSymbol)
         {
-            result["typeKind"] = typeSymbol.TypeKind.ToString();
+            result["typeKind"] = GetTypeKindString(typeSymbol);
             result["isGenericType"] = typeSymbol.IsGenericType;
             result["baseType"] = typeSymbol.BaseType?.Name;
             result["interfaces"] = typeSymbol.Interfaces.Select(i => i.Name).ToList();
@@ -945,7 +1005,7 @@ public partial class RoslynService
                     if (symbol is INamedTypeSymbol namedType)
                     {
                         // For type symbols, check TypeKind
-                        kindMatches = kinds.Any(k => namedType.TypeKind.ToString().Equals(k, StringComparison.OrdinalIgnoreCase));
+                        kindMatches = kinds.Any(k => GetTypeKindString(namedType).Equals(k, StringComparison.OrdinalIgnoreCase));
                     }
                     else
                     {
@@ -1044,7 +1104,7 @@ public partial class RoslynService
                 if (location == null) continue;
 
                 var lineSpan = location.GetLineSpan();
-                var symbolKind = symbol is INamedTypeSymbol nt ? nt.TypeKind.ToString() : symbol.Kind.ToString();
+                var symbolKind = symbol is INamedTypeSymbol nt ? GetTypeKindString(nt) : symbol.Kind.ToString();
 
                 countByKind[symbolKind] = countByKind.GetValueOrDefault(symbolKind) + 1;
 
@@ -1116,7 +1176,7 @@ public partial class RoslynService
         return new
         {
             name = typeSymbol.ToDisplayString(),
-            kind = typeSymbol.TypeKind.ToString(),
+            kind = GetTypeKindString(typeSymbol),
             isAbstract = typeSymbol.IsAbstract,
             location = lineSpan.HasValue ? new
             {

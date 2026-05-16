@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Records misclassified as `Class`.** `typeKind` output and `kind:` filter now correctly report `record class` as `"Record"` and `record struct` as `"RecordStruct"`. Affected 11 sites across `get_symbol_info`, `get_type_overview`, `get_type_members`, `get_base_types`, `find_implementations`, `semantic_query`, and `search_symbols`. New `GetTypeKindString` helper in `RoslynService.cs`.
+- **`find_references.kind` was hardcoded to `"read"`.** Now distinguishes `read`, `write`, `invocation`, `typeof`, `nameof`, and `attribute` based on the syntax context. Write detection covers assignment LHS, `++`/`--`, and `out`/`ref` arguments.
+- **`change_signature` was a no-op that lied.** With `preview: false` it returned `applied: true` while editing nothing, and only worked on `MethodDeclarationSyntax`. Now fully implemented via `SolutionEditor`: rewrites the declaration plus every call site (`Foo(...)`, `new Foo(...)`, `: this(...)`, `: base(...)`, `new(...)`), updates named-argument labels on rename, and supports methods, constructors, and local functions.
+- **`rename_symbol` accepted invalid C# identifiers.** Names like `123invalid` now return `INVALID_PARAMETER` instead of attempting the rename.
+- **JSON-RPC notification handling was non-compliant.** Per spec, *any* request without an `id` member is a notification and must produce no response. Previously only `method.StartsWith("notifications/")` was treated as a notification — `{"jsonrpc":"2.0","method":"initialize"}` was incorrectly answered with `{"id":null,...}`. Notifications now route through the method switch (so any side-effecting handler runs) with the response discarded at the wire layer.
+- **`totalCount` lied in two discovery tools.** `find_attribute_usages` and `find_reflection_usage` previously set `totalCount` to the truncated list size, hiding when `maxResults` was hit. Both now track an unbounded `totalFound` counter (matching the `get_attributes` pattern).
+- **`search_symbols.totalCount` was capped at `maxResults + 100`.** Removed the `+100` buffer so paginated callers see the true match count.
+- **`AnalyzeDataFlow` / `AnalyzeControlFlow` threw "statements not within the same statement list"** when given a region spanning a `BlockSyntax`. Replaced `DescendantNodesAndSelf().OfType<StatementSyntax>()` with sibling-aware resolution that walks to the enclosing block.
+- **Tool callers that returned relative paths couldn't pass them back in.** `GetDocumentAsync` (and the parallel `TryFindDocument`) now resolve solution-relative paths against the solution directory, so paths from `FormatPath` round-trip without manual absolutization.
+- **`FindTypeByName` returned symbols `SymbolFinder` didn't recognize.** When a project used source generators, the helper returned a symbol from our augmented compilation, which `FindDerivedClassesAsync` and friends rejected. Now prefers the project's base compilation for symbol lookup and only falls back to the augmented one for purely source-generated types.
+
+### Changed
+- **Test suite hardened: 127 → 159 tests, zero dead, zero vacuous.** 25 tests across `NavigationTests`, `AnalysisTests`, `RefactoringTests`, `CodeActionTests`, `CustomToolTests` were reading `data["symbols"]` (the actual field is `data["results"]`) and gated on `if (symbols?.Count > 0)`, so their bodies never ran. 18 more had no assertions or explicit `// Just verify no crash` comments. All converted to fixture-driven semantic-grade assertions. New suites added: `ChangeSignatureTests` (8), `JsonRpcParametersTests` (14), `GetMissingMembersTests` (2).
+- **New test infrastructure.** `tests/SharpLensMcp.Tests/Fixtures/` directory with `RecordFixture`, `InterfaceHierarchyFixture`, `RefactoringFixture`, `ReferenceKindsFixture`, `ChangeSignatureFixture`. New `SemanticAssertions` helper. New `TESTING.md` documenting the tool-test contract and the two test styles (solution-loaded vs in-memory).
+- **`RoslynService._workspace` field type widened to base `Workspace?`** (was `MSBuildWorkspace?`), plus new internal `LoadFromWorkspaceForTesting(Workspace)` seam. Enables in-memory `AdhocWorkspace`-based tests for tools that operate on incomplete code (`get_missing_members`'s populated-list path now tested in `GetMissingMembersTests`), and opens the door for fast (~5ms) hermetic tests of any tool that doesn't need cross-file references. Production code path (`LoadSolutionAsync` → `MSBuildWorkspace`) unchanged.
+- **`McpServer.HandleToolCallAsync` dispatcher refactored.** 370-line switch with ~80 inline `arguments?["x"]?.GetValue<T>() ?? throw new Exception("x required")` blocks replaced with a typed `JsonRpcParameters` helper. Missing/wrong-type arguments now produce `-32602 Invalid params` per JSON-RPC spec instead of a bare `Exception`.
+- **`RoslynService.Refactoring.cs` split into 3 partial files** (2912 lines → 1178 + 1489 + 268). New `RoslynService.Inspection.cs` holds 11 read-only analysis tools (`find_callers`, `find_unused_code`, `get_outgoing_calls`, etc.) that were misfiled under "Refactoring". New `RoslynService.Validation.cs` holds `validate_code` and `check_type_compatibility`. Pure code movement, no behavior change.
+
 ## [1.5.2] - 2026-04-17
 
 ### Fixed

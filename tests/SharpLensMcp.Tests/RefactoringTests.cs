@@ -13,174 +13,151 @@ public class RefactoringTests : RoslynServiceTestBase
     public async Task RenameSymbol_WithPreview_ShowsChanges()
     {
         var searchResult = await Service.SearchSymbolsAsync("_workspace", kind: "Field", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty("_workspace is a field in RoslynService");
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.RenameSymbolAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            newName: "_roslynWorkspace",
+            preview: true);
 
-            var result = await Service.RenameSymbolAsync(
-                file, line, col,
-                newName: "_roslynWorkspace",
-                preview: true);
-
-            AssertSuccess(result);
-            var data = GetData(result);
-            data["newName"]?.Value<string>().Should().Be("_roslynWorkspace");
-            data["affectedFiles"].Should().NotBeNull();
-        }
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["newName"]?.Value<string>().Should().Be("_roslynWorkspace");
+        data["preview"]?.Value<bool>().Should().BeTrue();
+        var changes = data["changes"] as JArray;
+        changes.Should().NotBeNullOrEmpty("renaming _workspace touches at least RoslynService.cs");
     }
 
     [Fact]
     public async Task RenameSymbol_WithInvalidName_ReturnsError()
     {
         var searchResult = await Service.SearchSymbolsAsync("_workspace", kind: "Field", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.RenameSymbolAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            newName: "123invalid",
+            preview: true);
 
-            // Invalid C# identifier
-            var result = await Service.RenameSymbolAsync(
-                file, line, col,
-                newName: "123invalid",
-                preview: true);
-
-            // Should handle gracefully
-            var json = JObject.FromObject(result);
-        }
+        AssertError(result);
     }
 
     [Fact]
-    public async Task ExtractInterface_GeneratesInterfaceCode()
+    public async Task ExtractInterface_GeneratesInterfaceCodeWithMembers()
     {
-        var searchResult = await Service.SearchSymbolsAsync("RoslynService", kind: "Class", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var searchResult = await Service.SearchSymbolsAsync("FixtureRectangle", kind: "Class", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var rect = symbols!.First(s => s["name"]?.Value<string>() == "FixtureRectangle");
+        var loc = rect["location"]!;
+        var result = await Service.ExtractInterfaceAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            interfaceName: "IFixtureRectangle",
+            includeMemberNames: null);
 
-            var result = await Service.ExtractInterfaceAsync(
-                file, line, col,
-                interfaceName: "IRoslynService",
-                includeMemberNames: null);
-
-            AssertSuccess(result);
-            var data = GetData(result);
-            data["interfaceCode"]?.Value<string>().Should().Contain("interface IRoslynService");
-        }
+        AssertSuccess(result);
+        var data = GetData(result);
+        var code = data["interfaceCode"]?.Value<string>();
+        code.Should().Contain("interface IFixtureRectangle");
+        code.Should().Contain("Width");
+        code.Should().Contain("Height");
+        code.Should().NotContain("ToString",
+            "extract_interface must not include inherited Object members");
     }
 
     [Fact]
-    public async Task GenerateConstructor_CreatesConstructorCode()
+    public async Task GenerateConstructor_CreatesConstructorWithAllFields()
     {
-        var searchResult = await Service.SearchSymbolsAsync("RoslynService", kind: "Class", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var searchResult = await Service.SearchSymbolsAsync("RefactoringTarget", kind: "Class", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var target = symbols![0];
+        var loc = target["location"]!;
+        var result = await Service.GenerateConstructorAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>());
 
-            var result = await Service.GenerateConstructorAsync(file, line, col);
-
-            AssertSuccess(result);
-            var data = GetData(result);
-            data["constructorCode"]?.Value<string>().Should().Contain("public");
-        }
+        AssertSuccess(result);
+        var data = GetData(result);
+        var code = data["constructorCode"]?.Value<string>();
+        code.Should().NotBeNullOrEmpty();
+        code.Should().Contain("public RefactoringTarget");
     }
 
+    // ChangeSignature tests live in ChangeSignatureTests.cs (per plan section E).
+
     [Fact]
-    public async Task ChangeSignature_WithPreview_ShowsImpact()
+    public async Task ExtractMethod_OnFixtureSumBody_GeneratesExtractedMethod()
     {
-        var searchResult = await Service.SearchSymbolsAsync("LoadSolutionAsync", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var searchResult = await Service.SearchSymbolsAsync("Sum", kind: "Method", maxResults: 50);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        var sum = symbols!.First(s =>
+            s["containingType"]?.Value<string>()?.Contains("RefactoringTarget") == true);
+        var loc = sum["location"]!;
+        var file = loc["filePath"]!.Value<string>()!;
+        var methodLine = loc["line"]!.Value<int>();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        // Extract lines containing the two `var` statements.
+        var result = await Service.ExtractMethodAsync(
+            file,
+            startLine: methodLine + 2,
+            endLine: methodLine + 3,
+            methodName: "ComputePartial",
+            preview: true);
 
-            var result = await Service.ChangeSignatureAsync(
-                file, line, col,
-                changes: new List<SignatureChange>
-                {
-                    new SignatureChange { Action = "add", Name = "timeout", Type = "int", DefaultValue = "30" }
-                },
-                preview: true);
-
-            // Should process without error
-            var json = JObject.FromObject(result);
-        }
+        AssertSuccess(result);
+        var data = GetData(result);
+        data.ToString().Should().Contain("ComputePartial",
+            "extracted method preview must reference the new method name");
     }
 
     [Fact]
-    public async Task ExtractMethod_WithSelection_GeneratesMethod()
+    public async Task GetMissingMembers_HandlesPositionWithNoIncompleteImpl()
     {
-        var searchResult = await Service.SearchSymbolsAsync("LoadSolutionAsync", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        // Position inside RoslynService — a complete type with no missing members.
+        // Tool should succeed and return an empty (or absent) missingMembers list.
+        var result = await Service.GetMissingMembersAsync(RoslynServicePath, 50, 10);
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var startLine = symbol["line"]?.Value<int>() ?? 0;
-
-            var result = await Service.ExtractMethodAsync(
-                file,
-                startLine: startLine + 2,
-                endLine: startLine + 4,
-                methodName: "ExtractedMethod",
-                preview: true);
-
-            // May succeed or fail depending on what's selected
-            var json = JObject.FromObject(result);
-        }
+        AssertSuccess(result);
+        var data = GetData(result);
+        var missing = data["missingMembers"] as JArray;
+        // Either the field is omitted entirely or it's an empty array — both indicate "nothing missing".
+        (missing == null || missing.Count == 0).Should().BeTrue();
     }
 
     [Fact]
-    public async Task GetMissingMembers_OnImplementingClass_ReturnsMembers()
-    {
-        var result = await Service.GetMissingMembersAsync(RoslynServicePath, 10, 10);
-
-        // Should handle gracefully
-        var json = JObject.FromObject(result);
-    }
-
-    [Fact]
-    public async Task GetOutgoingCalls_ReturnsCalledMethods()
+    public async Task GetOutgoingCalls_OnHealthCheck_ListsCallees()
     {
         var searchResult = await Service.SearchSymbolsAsync("GetHealthCheckAsync", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.GetOutgoingCallsAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>() + 1,
+            loc["column"]!.Value<int>());
 
-            var result = await Service.GetOutgoingCallsAsync(file, line + 1, col);
-
-            AssertSuccess(result);
-            var data = GetData(result);
-            data["outgoingCalls"].Should().NotBeNull();
-        }
+        AssertSuccess(result);
+        var data = GetData(result);
+        var calls = data["calls"] as JArray;
+        calls.Should().NotBeNull("calls array must always be present, even if empty");
     }
 
     [Fact]
@@ -221,72 +198,97 @@ public class RefactoringTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task GetMethodOverloads_ReturnsAllOverloads()
+    public async Task GetMethodOverloads_OnCreateErrorResponse_ReturnsMultipleOverloads()
     {
         var searchResult = await Service.SearchSymbolsAsync("CreateErrorResponse", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
-
-            var result = await Service.GetMethodOverloadsAsync(file, line, col);
-
-            AssertSuccess(result);
-            var data = GetData(result);
-            data["overloads"].Should().NotBeNull();
-        }
-    }
-
-    [Fact]
-    public async Task GetContainingMember_ReturnsEnclosingSymbol()
-    {
-        var result = await Service.GetContainingMemberAsync(RoslynServicePath, 100, 10);
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.GetMethodOverloadsAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>());
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["memberName"].Should().NotBeNull();
-        data["memberKind"].Should().NotBeNull();
+        var overloads = data["overloads"] as JArray;
+        overloads.Should().NotBeNullOrEmpty();
     }
 
     [Fact]
-    public async Task GetAttributes_FindsAttributes()
+    public async Task GetContainingMember_AtMethodBody_ReturnsExpectedMember()
     {
-        var result = await Service.GetAttributesAsync("Obsolete");
+        // Line 50 of RoslynService.cs is inside MatchesGlobPattern.
+        var result = await Service.GetContainingMemberAsync(RoslynServicePath, 50, 10);
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["symbols"].Should().NotBeNull();
+        data["memberName"]?.Value<string>().Should().Be("MatchesGlobPattern");
+        data["memberKind"]?.Value<string>().Should().Be("Method");
     }
 
     [Fact]
-    public async Task FindImplementations_FindsInterfaceImplementers()
+    public async Task GetAttributes_FindsFactAttributeOnXunitTests()
     {
-        var result = await Service.FindImplementationsAsync(RoslynServicePath, 10, 10);
-        var json = JObject.FromObject(result);
+        // Xunit's [Fact] attribute is heavily used in the test project.
+        var result = await Service.GetAttributesAsync("Fact");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        var symbols = data["symbols"] as JArray;
+        symbols.Should().NotBeNullOrEmpty(
+            "the test project has many [Fact]-decorated methods");
+        symbols!.All(s => s["attribute"]?["name"]?.Value<string>() == "FactAttribute")
+            .Should().BeTrue("every returned symbol must be decorated with [Fact]");
     }
 
     [Fact]
-    public async Task GetTypeHierarchy_ReturnsInheritanceInfo()
+    public async Task FindImplementations_OnIShapeFixture_FindsAllImplementers()
     {
-        var searchResult = await Service.SearchSymbolsAsync("RoslynService", kind: "Class", maxResults: 10);
-        var symbols = GetData(searchResult)["symbols"] as JArray;
+        var searchResult = await Service.SearchSymbolsAsync("IShapeFixture", kind: "Interface", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
 
-        if (symbols?.Count > 0)
-        {
-            var symbol = symbols[0];
-            var file = symbol["filePath"]?.Value<string>()!;
-            var line = symbol["line"]?.Value<int>() ?? 0;
-            var col = symbol["column"]?.Value<int>() ?? 0;
+        var ishape = symbols!.First(s => s["name"]?.Value<string>() == "IShapeFixture");
+        var loc = ishape["location"]!;
+        var result = await Service.FindImplementationsAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>());
 
-            var result = await Service.GetTypeHierarchyAsync(file, line, col);
+        AssertSuccess(result);
+        var data = GetData(result);
+        var impls = data["implementations"] as JArray;
+        impls.Should().NotBeNullOrEmpty();
 
-            AssertSuccess(result);
-            var data = GetData(result);
-            data["baseTypes"].Should().NotBeNull();
-        }
+        var names = impls!.Select(i => i["name"]?.Value<string>()).ToList();
+        names.Should().Contain(n => n!.EndsWith("FixtureCircle"));
+        names.Should().Contain(n => n!.EndsWith("FixtureRectangle"));
+        names.Should().Contain(n => n!.EndsWith("FixtureSquare"),
+            "find_implementations must include transitive implementers (FixtureSquare : FixtureRectangle : IShapeFixture)");
+    }
+
+    [Fact]
+    public async Task GetTypeHierarchy_OnFixtureSquare_ListsRectangleAncestor()
+    {
+        var searchResult = await Service.SearchSymbolsAsync("FixtureSquare", kind: "Class", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
+
+        var sq = symbols!.First(s => s["name"]?.Value<string>() == "FixtureSquare");
+        var loc = sq["location"]!;
+        var result = await Service.GetTypeHierarchyAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>());
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        var baseTypes = data["baseTypes"] as JArray;
+        baseTypes.Should().NotBeNullOrEmpty();
+        baseTypes!.Any(b => b["name"]?.Value<string>()?.EndsWith("FixtureRectangle") == true)
+            .Should().BeTrue("FixtureSquare's hierarchy must include FixtureRectangle");
     }
 }

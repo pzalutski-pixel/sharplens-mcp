@@ -57,16 +57,7 @@ public partial class RoslynService
 
         var node = root.FindNode(span);
 
-        // Try to find a suitable node for data flow analysis
-        StatementSyntax? firstStatement = null;
-        StatementSyntax? lastStatement = null;
-
-        var statements = node.DescendantNodesAndSelf().OfType<StatementSyntax>().ToList();
-        if (statements.Count > 0)
-        {
-            firstStatement = statements.First();
-            lastStatement = statements.Last();
-        }
+        var (firstStatement, lastStatement) = ResolveAnalysisStatements(node);
 
         if (firstStatement == null || lastStatement == null)
         {
@@ -176,8 +167,9 @@ public partial class RoslynService
 
         var node = root.FindNode(span);
 
-        var statements = node.DescendantNodesAndSelf().OfType<StatementSyntax>().ToList();
-        if (statements.Count == 0)
+        var (firstStatement, lastStatement) = ResolveAnalysisStatements(node);
+
+        if (firstStatement == null || lastStatement == null)
         {
             return CreateErrorResponse(
                 ErrorCodes.AnalysisFailed,
@@ -185,9 +177,6 @@ public partial class RoslynService
                 context: new { startLine, endLine }
             );
         }
-
-        var firstStatement = statements.First();
-        var lastStatement = statements.Last();
 
         ControlFlowAnalysis? controlFlow = null;
         try
@@ -321,7 +310,7 @@ public partial class RoslynService
             {
                 typeName = type.ToDisplayString(),
                 simpleName = type.Name,
-                typeKind = type.TypeKind.ToString(),
+                typeKind = GetTypeKindString(type),
                 @namespace = type.ContainingNamespace?.ToDisplayString(),
                 isAbstract = type.IsAbstract,
                 isSealed = type.IsSealed,
@@ -612,4 +601,34 @@ public partial class RoslynService
         );
     }
 
+    // Roslyn's AnalyzeDataFlow/AnalyzeControlFlow(first, last) requires both statements to
+    // be direct siblings in the same statement list. The previous implementation walked
+    // node.DescendantNodesAndSelf().OfType<StatementSyntax>(), which on a BlockSyntax
+    // node returned [Block, child1, child2, ...] — Block and its child aren't siblings,
+    // so Roslyn threw "statements not within the same statement list". Resolve the
+    // first/last sibling pair correctly here.
+    private static (StatementSyntax? first, StatementSyntax? last) ResolveAnalysisStatements(SyntaxNode node)
+    {
+        // If the picked node is itself a block, analyze its direct children (or the block as a whole).
+        if (node is BlockSyntax block)
+        {
+            if (block.Statements.Count == 0) return (null, null);
+            return (block.Statements.First(), block.Statements.Last());
+        }
+
+        // If the picked node is a statement, that's our single-statement target.
+        if (node is StatementSyntax stmt)
+        {
+            return (stmt, stmt);
+        }
+
+        // Otherwise climb up looking for a block we can analyze.
+        var enclosingBlock = node.FirstAncestorOrSelf<BlockSyntax>();
+        if (enclosingBlock != null && enclosingBlock.Statements.Count > 0)
+        {
+            return (enclosingBlock.Statements.First(), enclosingBlock.Statements.Last());
+        }
+
+        return (null, null);
+    }
 }

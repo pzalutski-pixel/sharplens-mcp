@@ -103,13 +103,14 @@ public class McpServerTests
     }
 
     [Fact]
-    public async Task HandleRequest_MissingId_ResponseContainsIdField()
+    public async Task HandleRequest_RequestWithoutId_ReturnsNull()
     {
+        // Per JSON-RPC 2.0 §4.3, any request without `id` is a Notification —
+        // server must produce no response, even for non-`notifications/`-prefixed methods.
         var request = """{"jsonrpc":"2.0","method":"initialize"}""";
-        var json = JsonSerializer.Serialize(await _server.HandleRequestAsync(request), _jsonOptions);
+        var response = await _server.HandleRequestAsync(request);
 
-        // Response should contain "id" field (JSON-RPC requires it in responses)
-        json.Should().Contain("\"id\":");
+        response.Should().BeNull();
     }
 
     [Fact]

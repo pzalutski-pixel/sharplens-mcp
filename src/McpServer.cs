@@ -108,34 +108,42 @@ public class McpServer
                 return CreateErrorResponse((RequestId?)null, -32700, "Parse error");
             }
 
-            RequestId? id = null;
-            var idNode = request["id"];
-            if (idNode != null)
-            {
-                id = JsonSerializer.Deserialize<RequestId>(idNode, _jsonOptions);
-            }
+            // Per JSON-RPC 2.0 §4.3: a request is a Notification if and only if the
+            // `id` member is absent. Notifications produce NO response (including no
+            // error response). The previous heuristic of `method.StartsWith("notifications/")`
+            // was incorrect and produced `{"id":null,...}` for valid notifications like
+            // `{"jsonrpc":"2.0","method":"initialize"}`, which Zod-validated clients reject.
+            var hasId = request.ContainsKey("id") && request["id"] != null;
+            RequestId? id = hasId
+                ? JsonSerializer.Deserialize<RequestId>(request["id"]!, _jsonOptions)
+                : null;
             var method = request["method"]?.GetValue<string>();
             var paramsNode = request["params"];
 
             if (string.IsNullOrEmpty(method))
             {
+                if (!hasId) return null;
                 return CreateErrorResponse(id, -32600, "Invalid Request: missing method");
             }
 
-            // Notifications have no id and require no response
-            if (id == null && method.StartsWith("notifications/"))
-            {
-                await LogAsync("Debug", $"Received notification: {method}");
-                return null;
-            }
-
-            return method switch
+            // Dispatch through the method switch. For notifications (no id) we still
+            // dispatch so that any side-effecting handlers run, then discard the
+            // response at the wire layer per JSON-RPC 2.0 §4.3.
+            var response = method switch
             {
                 "initialize" => await HandleInitializeAsync(id),
                 "tools/list" => await HandleListToolsAsync(id),
                 "tools/call" => await HandleToolCallAsync(id, paramsNode?.AsObject()),
                 _ => CreateErrorResponse(id, -32601, $"Method not found: {method}")
             };
+
+            if (!hasId)
+            {
+                await LogAsync("Debug", $"Received notification: {method} (response discarded)");
+                return null;
+            }
+
+            return response;
         }
         catch (Exception ex)
         {
@@ -1429,358 +1437,360 @@ Use get_source_generators first to discover available generated files.",
                 return CreateErrorResponse(id, -32602, "Invalid params: missing tool name");
             }
 
+            var p = new JsonRpcParameters(arguments, name);
+
             var result = name switch
             {
                 "roslyn:health_check" => await _roslynService.GetHealthCheckAsync(),
 
                 "roslyn:load_solution" => await _roslynService.LoadSolutionAsync(
-                    arguments?["solutionPath"]?.GetValue<string>() ?? throw new Exception("solutionPath required")),
+                    p.Required<string>("solutionPath")),
 
                 "roslyn:sync_documents" => await _roslynService.SyncDocumentsAsync(
                     ParseStringArray(arguments?["filePaths"])),
 
                 "roslyn:get_symbol_info" => await _roslynService.GetSymbolInfoAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required")),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column")),
 
                 "roslyn:go_to_definition" => await _roslynService.GoToDefinitionAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required")),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column")),
 
                 "roslyn:find_references" => await _roslynService.FindReferencesAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["maxResults"]?.GetValue<int>()),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.OptionalStruct<int>("maxResults")),
 
                 "roslyn:find_implementations" => await _roslynService.FindImplementationsAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["maxResults"]?.GetValue<int>()),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.OptionalStruct<int>("maxResults")),
 
                 "roslyn:get_type_hierarchy" => await _roslynService.GetTypeHierarchyAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["maxDerivedTypes"]?.GetValue<int>()),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.OptionalStruct<int>("maxDerivedTypes")),
 
                 "roslyn:search_symbols" => await _roslynService.SearchSymbolsAsync(
-                    arguments?["query"]?.GetValue<string>() ?? throw new Exception("query required"),
-                    arguments?["kind"]?.GetValue<string>(),
-                    arguments?["maxResults"]?.GetValue<int>() ?? 50,
-                    arguments?["namespaceFilter"]?.GetValue<string>(),
-                    arguments?["offset"]?.GetValue<int>() ?? 0),
+                    p.Required<string>("query"),
+                    p.Optional<string>("kind"),
+                    p.Optional("maxResults", 50),
+                    p.Optional<string>("namespaceFilter"),
+                    p.Optional("offset", 0)),
 
                 "roslyn:semantic_query" => await _roslynService.SemanticQueryAsync(
-                    arguments?["kinds"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList(),
-                    arguments?["isAsync"]?.GetValue<bool?>(),
-                    arguments?["namespaceFilter"]?.GetValue<string>(),
-                    arguments?["accessibility"]?.GetValue<string>(),
-                    arguments?["isStatic"]?.GetValue<bool?>(),
-                    arguments?["type"]?.GetValue<string>(),
-                    arguments?["returnType"]?.GetValue<string>(),
-                    arguments?["attributes"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList(),
-                    arguments?["parameterIncludes"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList(),
-                    arguments?["parameterExcludes"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList(),
-                    arguments?["maxResults"]?.GetValue<int>()),
+                    p.OptionalStringArray("kinds"),
+                    p.OptionalStruct<bool>("isAsync"),
+                    p.Optional<string>("namespaceFilter"),
+                    p.Optional<string>("accessibility"),
+                    p.OptionalStruct<bool>("isStatic"),
+                    p.Optional<string>("type"),
+                    p.Optional<string>("returnType"),
+                    p.OptionalStringArray("attributes"),
+                    p.OptionalStringArray("parameterIncludes"),
+                    p.OptionalStringArray("parameterExcludes"),
+                    p.OptionalStruct<int>("maxResults")),
 
                 "roslyn:get_diagnostics" => await _roslynService.GetDiagnosticsAsync(
-                    arguments?["filePath"]?.GetValue<string>(),
-                    arguments?["projectPath"]?.GetValue<string>(),
-                    arguments?["severity"]?.GetValue<string>(),
-                    arguments?["includeHidden"]?.GetValue<bool>() ?? false),
+                    p.Optional<string>("filePath"),
+                    p.Optional<string>("projectPath"),
+                    p.Optional<string>("severity"),
+                    p.Optional("includeHidden", false)),
 
                 "roslyn:get_code_fixes" => await _roslynService.GetCodeFixesAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["diagnosticId"]?.GetValue<string>() ?? throw new Exception("diagnosticId required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required")),
+                    p.Required<string>("filePath"),
+                    p.Required<string>("diagnosticId"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column")),
 
                 "roslyn:apply_code_fix" => await _roslynService.ApplyCodeFixAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["diagnosticId"]?.GetValue<string>() ?? throw new Exception("diagnosticId required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["fixIndex"]?.GetValue<int?>(),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
+                    p.Required<string>("filePath"),
+                    p.Required<string>("diagnosticId"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.OptionalStruct<int>("fixIndex"),
+                    p.Optional("preview", true)),
 
                 "roslyn:get_project_structure" => await _roslynService.GetProjectStructureAsync(
-                    arguments?["includeReferences"]?.GetValue<bool>() ?? true,
-                    arguments?["includeDocuments"]?.GetValue<bool>() ?? false,
-                    arguments?["projectNamePattern"]?.GetValue<string>(),
-                    arguments?["maxProjects"]?.GetValue<int>(),
-                    arguments?["summaryOnly"]?.GetValue<bool>() ?? false),
+                    p.Optional("includeReferences", true),
+                    p.Optional("includeDocuments", false),
+                    p.Optional<string>("projectNamePattern"),
+                    p.OptionalStruct<int>("maxProjects"),
+                    p.Optional("summaryOnly", false)),
 
                 "roslyn:organize_usings" => await _roslynService.OrganizeUsingsAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required")),
+                    p.Required<string>("filePath")),
 
                 "roslyn:organize_usings_batch" => await _roslynService.OrganizeUsingsBatchAsync(
-                    arguments?["projectName"]?.GetValue<string>(),
-                    arguments?["filePattern"]?.GetValue<string>(),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
+                    p.Optional<string>("projectName"),
+                    p.Optional<string>("filePattern"),
+                    p.Optional("preview", true)),
 
                 "roslyn:format_document_batch" => await _roslynService.FormatDocumentBatchAsync(
-                    arguments?["projectName"]?.GetValue<string>(),
-                    arguments?["includeTests"]?.GetValue<bool>() ?? true,
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
+                    p.Optional<string>("projectName"),
+                    p.Optional("includeTests", true),
+                    p.Optional("preview", true)),
 
                 "roslyn:get_method_overloads" => await _roslynService.GetMethodOverloadsAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required")),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column")),
 
                 "roslyn:get_containing_member" => await _roslynService.GetContainingMemberAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required")),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column")),
 
                 "roslyn:find_callers" => await _roslynService.FindCallersAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["maxResults"]?.GetValue<int>()),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.OptionalStruct<int>("maxResults")),
 
                 "roslyn:find_unused_code" => await _roslynService.FindUnusedCodeAsync(
-                    arguments?["projectName"]?.GetValue<string>(),
-                    arguments?["includePrivate"]?.GetValue<bool>() ?? true,
-                    arguments?["includeInternal"]?.GetValue<bool>() ?? false,
-                    arguments?["symbolKindFilter"]?.GetValue<string>(),
-                    arguments?["maxResults"]?.GetValue<int>()),
+                    p.Optional<string>("projectName"),
+                    p.Optional("includePrivate", true),
+                    p.Optional("includeInternal", false),
+                    p.Optional<string>("symbolKindFilter"),
+                    p.OptionalStruct<int>("maxResults")),
 
                 "roslyn:rename_symbol" => await _roslynService.RenameSymbolAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["newName"]?.GetValue<string>() ?? throw new Exception("newName required"),
-                    arguments?["preview"]?.GetValue<bool>() ?? true,
-                    arguments?["maxFiles"]?.GetValue<int>(),
-                    arguments?["verbosity"]?.GetValue<string>()),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.Required<string>("newName"),
+                    p.Optional("preview", true),
+                    p.OptionalStruct<int>("maxFiles"),
+                    p.Optional<string>("verbosity")),
 
                 "roslyn:extract_interface" => await _roslynService.ExtractInterfaceAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["interfaceName"]?.GetValue<string>() ?? throw new Exception("interfaceName required"),
-                    arguments?["includeMemberNames"]?.AsArray()?.Select(n => n?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList()),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.Required<string>("interfaceName"),
+                    p.OptionalStringArray("includeMemberNames")),
 
                 "roslyn:dependency_graph" => await _roslynService.GetDependencyGraphAsync(
-                    arguments?["format"]?.GetValue<string>()),
+                    p.Optional<string>("format")),
 
                 // ============ NEW TOOLS: Name-Based Type Discovery ============
 
                 "roslyn:get_type_members" => await _roslynService.GetTypeMembersAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required"),
-                    arguments?["includeInherited"]?.GetValue<bool>() ?? false,
-                    arguments?["memberKind"]?.GetValue<string>(),
-                    arguments?["verbosity"]?.GetValue<string>() ?? "compact",
-                    arguments?["maxResults"]?.GetValue<int>() ?? 100),
+                    p.Required<string>("typeName"),
+                    p.Optional("includeInherited", false),
+                    p.Optional<string>("memberKind"),
+                    p.Optional("verbosity", "compact"),
+                    p.Optional("maxResults", 100)),
 
                 "roslyn:get_method_signature" => await _roslynService.GetMethodSignatureAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required"),
-                    arguments?["methodName"]?.GetValue<string>() ?? throw new Exception("methodName required"),
-                    arguments?["overloadIndex"]?.GetValue<int?>()),
+                    p.Required<string>("typeName"),
+                    p.Required<string>("methodName"),
+                    p.OptionalStruct<int>("overloadIndex")),
 
                 "roslyn:get_attributes" => await _roslynService.GetAttributesAsync(
-                    arguments?["attributeName"]?.GetValue<string>() ?? throw new Exception("attributeName required"),
-                    arguments?["scope"]?.GetValue<string>(),
-                    arguments?["parseGodotHints"]?.GetValue<bool>() ?? true,
-                    arguments?["maxResults"]?.GetValue<int>() ?? 100),
+                    p.Required<string>("attributeName"),
+                    p.Optional<string>("scope"),
+                    p.Optional("parseGodotHints", true),
+                    p.Optional("maxResults", 100)),
 
                 "roslyn:get_derived_types" => await _roslynService.GetDerivedTypesAsync(
-                    arguments?["baseTypeName"]?.GetValue<string>() ?? throw new Exception("baseTypeName required"),
-                    arguments?["includeTransitive"]?.GetValue<bool>() ?? true,
-                    arguments?["maxResults"]?.GetValue<int>() ?? 100),
+                    p.Required<string>("baseTypeName"),
+                    p.Optional("includeTransitive", true),
+                    p.Optional("maxResults", 100)),
 
                 "roslyn:get_base_types" => await _roslynService.GetBaseTypesAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required")),
+                    p.Required<string>("typeName")),
 
                 "roslyn:analyze_data_flow" => await _roslynService.AnalyzeDataFlowAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["startLine"]?.GetValue<int>() ?? throw new Exception("startLine required"),
-                    arguments?["endLine"]?.GetValue<int>() ?? throw new Exception("endLine required")),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("startLine"),
+                    p.Required<int>("endLine")),
 
                 "roslyn:analyze_control_flow" => await _roslynService.AnalyzeControlFlowAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["startLine"]?.GetValue<int>() ?? throw new Exception("startLine required"),
-                    arguments?["endLine"]?.GetValue<int>() ?? throw new Exception("endLine required")),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("startLine"),
+                    p.Required<int>("endLine")),
 
                 // ============ COMPOUND TOOLS ============
 
                 "roslyn:get_type_overview" => await _roslynService.GetTypeOverviewAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required")),
+                    p.Required<string>("typeName")),
 
                 "roslyn:analyze_method" => await _roslynService.AnalyzeMethodAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required"),
-                    arguments?["methodName"]?.GetValue<string>() ?? throw new Exception("methodName required"),
-                    arguments?["includeCallers"]?.GetValue<bool>() ?? true,
-                    arguments?["includeOutgoingCalls"]?.GetValue<bool>() ?? false,
-                    arguments?["maxCallers"]?.GetValue<int>() ?? 20,
-                    arguments?["maxOutgoingCalls"]?.GetValue<int>() ?? 50),
+                    p.Required<string>("typeName"),
+                    p.Required<string>("methodName"),
+                    p.Optional("includeCallers", true),
+                    p.Optional("includeOutgoingCalls", false),
+                    p.Optional("maxCallers", 20),
+                    p.Optional("maxOutgoingCalls", 50)),
 
                 "roslyn:get_file_overview" => await _roslynService.GetFileOverviewAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required")),
+                    p.Required<string>("filePath")),
 
                 // Phase 2: AI-Focused Tools
                 "roslyn:get_missing_members" => await _roslynService.GetMissingMembersAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required")),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column")),
 
                 "roslyn:get_outgoing_calls" => await _roslynService.GetOutgoingCallsAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["maxDepth"]?.GetValue<int>()),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.OptionalStruct<int>("maxDepth")),
 
                 "roslyn:validate_code" => await _roslynService.ValidateCodeAsync(
-                    arguments?["code"]?.GetValue<string>() ?? throw new Exception("code required"),
-                    arguments?["contextFilePath"]?.GetValue<string>(),
-                    arguments?["standalone"]?.GetValue<bool>() ?? false),
+                    p.Required<string>("code"),
+                    p.Optional<string>("contextFilePath"),
+                    p.Optional("standalone", false)),
 
                 "roslyn:check_type_compatibility" => await _roslynService.CheckTypeCompatibilityAsync(
-                    arguments?["sourceType"]?.GetValue<string>() ?? throw new Exception("sourceType required"),
-                    arguments?["targetType"]?.GetValue<string>() ?? throw new Exception("targetType required")),
+                    p.Required<string>("sourceType"),
+                    p.Required<string>("targetType")),
 
                 "roslyn:get_instantiation_options" => await _roslynService.GetInstantiationOptionsAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required")),
+                    p.Required<string>("typeName")),
 
                 "roslyn:analyze_change_impact" => await _roslynService.AnalyzeChangeImpactAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["changeType"]?.GetValue<string>() ?? throw new Exception("changeType required"),
-                    arguments?["newValue"]?.GetValue<string>()),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.Required<string>("changeType"),
+                    p.Optional<string>("newValue")),
 
                 "roslyn:get_method_source" => await _roslynService.GetMethodSourceAsync(
-                    arguments?["typeName"]?.GetValue<string>() ?? throw new Exception("typeName required"),
-                    arguments?["methodName"]?.GetValue<string>() ?? throw new Exception("methodName required"),
-                    arguments?["overloadIndex"]?.GetValue<int>()),
+                    p.Required<string>("typeName"),
+                    p.Required<string>("methodName"),
+                    p.OptionalStruct<int>("overloadIndex")),
 
                 "roslyn:get_method_source_batch" => await _roslynService.GetMethodSourceBatchAsync(
                     ParseMethodBatchRequests(arguments?["methods"]),
-                    arguments?["maxMethods"]?.GetValue<int>() ?? 20),
+                    p.Optional("maxMethods", 20)),
 
                 "roslyn:generate_constructor" => await _roslynService.GenerateConstructorAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["includeProperties"]?.GetValue<bool>() ?? false,
-                    arguments?["initializeToDefault"]?.GetValue<bool>() ?? false),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.Optional("includeProperties", false),
+                    p.Optional("initializeToDefault", false)),
 
                 "roslyn:change_signature" => await _roslynService.ChangeSignatureAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
                     ParseSignatureChanges(arguments?["changes"]),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
+                    p.Optional("preview", true)),
 
                 "roslyn:extract_method" => await _roslynService.ExtractMethodAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["startLine"]?.GetValue<int>() ?? throw new Exception("startLine required"),
-                    arguments?["endLine"]?.GetValue<int>() ?? throw new Exception("endLine required"),
-                    arguments?["methodName"]?.GetValue<string>() ?? throw new Exception("methodName required"),
-                    arguments?["accessibility"]?.GetValue<string>() ?? "private",
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("startLine"),
+                    p.Required<int>("endLine"),
+                    p.Required<string>("methodName"),
+                    p.Optional("accessibility", "private"),
+                    p.Optional("preview", true)),
 
                 "roslyn:get_code_actions_at_position" => await _roslynService.GetCodeActionsAtPositionAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["endLine"]?.GetValue<int?>(),
-                    arguments?["endColumn"]?.GetValue<int?>(),
-                    arguments?["includeCodeFixes"]?.GetValue<bool>() ?? true,
-                    arguments?["includeRefactorings"]?.GetValue<bool>() ?? true),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.OptionalStruct<int>("endLine"),
+                    p.OptionalStruct<int>("endColumn"),
+                    p.Optional("includeCodeFixes", true),
+                    p.Optional("includeRefactorings", true)),
 
                 "roslyn:apply_code_action_by_title" => await _roslynService.ApplyCodeActionByTitleAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["title"]?.GetValue<string>() ?? throw new Exception("title required"),
-                    arguments?["endLine"]?.GetValue<int?>(),
-                    arguments?["endColumn"]?.GetValue<int?>(),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.Required<string>("title"),
+                    p.OptionalStruct<int>("endLine"),
+                    p.OptionalStruct<int>("endColumn"),
+                    p.Optional("preview", true)),
 
                 "roslyn:implement_missing_members" => await _roslynService.ImplementMissingMembersAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.Optional("preview", true)),
 
                 "roslyn:encapsulate_field" => await _roslynService.EncapsulateFieldAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.Optional("preview", true)),
 
                 "roslyn:inline_variable" => await _roslynService.InlineVariableAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.Optional("preview", true)),
 
                 "roslyn:extract_variable" => await _roslynService.ExtractVariableAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["endLine"]?.GetValue<int?>(),
-                    arguments?["endColumn"]?.GetValue<int?>(),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.OptionalStruct<int>("endLine"),
+                    p.OptionalStruct<int>("endColumn"),
+                    p.Optional("preview", true)),
 
                 "roslyn:get_complexity_metrics" => await _roslynService.GetComplexityMetricsAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int?>(),
-                    arguments?["column"]?.GetValue<int?>(),
-                    arguments?["metrics"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList()),
+                    p.Required<string>("filePath"),
+                    p.OptionalStruct<int>("line"),
+                    p.OptionalStruct<int>("column"),
+                    p.OptionalStringArray("metrics")),
 
                 "roslyn:add_null_checks" => await _roslynService.AddNullChecksAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.Optional("preview", true)),
 
                 "roslyn:generate_equality_members" => await _roslynService.GenerateEqualityMembersAsync(
-                    arguments?["filePath"]?.GetValue<string>() ?? throw new Exception("filePath required"),
-                    arguments?["line"]?.GetValue<int>() ?? throw new Exception("line required"),
-                    arguments?["column"]?.GetValue<int>() ?? throw new Exception("column required"),
-                    arguments?["includeOperators"]?.GetValue<bool>() ?? true,
-                    arguments?["preview"]?.GetValue<bool>() ?? true),
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.Optional("includeOperators", true),
+                    p.Optional("preview", true)),
 
                 "roslyn:get_type_members_batch" => await _roslynService.GetTypeMembersBatchAsync(
-                    arguments?["typeNames"]?.AsArray()?.Select(e => e?.GetValue<string>() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList() ?? throw new Exception("typeNames required"),
-                    arguments?["includeInherited"]?.GetValue<bool>() ?? false,
-                    arguments?["memberKind"]?.GetValue<string>(),
-                    arguments?["verbosity"]?.GetValue<string>() ?? "compact",
-                    arguments?["maxResultsPerType"]?.GetValue<int>() ?? 50),
+                    p.RequiredStringArray("typeNames"),
+                    p.Optional("includeInherited", false),
+                    p.Optional<string>("memberKind"),
+                    p.Optional("verbosity", "compact"),
+                    p.Optional("maxResultsPerType", 50)),
 
                 "roslyn:find_attribute_usages" => await _roslynService.FindAttributeUsagesAsync(
-                    arguments?["attributeName"]?.GetValue<string>() ?? throw new Exception("attributeName required"),
-                    arguments?["projectName"]?.GetValue<string>(),
-                    arguments?["maxResults"]?.GetValue<int>() ?? 100),
+                    p.Required<string>("attributeName"),
+                    p.Optional<string>("projectName"),
+                    p.Optional("maxResults", 100)),
 
                 "roslyn:get_di_registrations" => await _roslynService.GetDiRegistrationsAsync(
-                    arguments?["projectName"]?.GetValue<string>()),
+                    p.Optional<string>("projectName")),
 
                 "roslyn:find_reflection_usage" => await _roslynService.FindReflectionUsageAsync(
-                    arguments?["projectName"]?.GetValue<string>(),
-                    arguments?["maxResults"]?.GetValue<int>() ?? 100),
+                    p.Optional<string>("projectName"),
+                    p.Optional("maxResults", 100)),
 
                 "roslyn:find_circular_dependencies" => await _roslynService.FindCircularDependenciesAsync(
-                    arguments?["level"]?.GetValue<string>()),
+                    p.Optional<string>("level")),
 
                 "roslyn:get_nuget_dependencies" => await _roslynService.GetNuGetDependenciesAsync(
-                    arguments?["projectName"]?.GetValue<string>()),
+                    p.Optional<string>("projectName")),
 
                 "roslyn:get_source_generators" => await _roslynService.GetSourceGeneratorsAsync(
-                    arguments?["projectName"]?.GetValue<string>()),
+                    p.Optional<string>("projectName")),
 
                 "roslyn:get_generated_code" => await _roslynService.GetGeneratedCodeAsync(
-                    arguments?["projectName"]?.GetValue<string>() ?? throw new Exception("projectName required"),
-                    arguments?["generatedFileName"]?.GetValue<string>() ?? throw new Exception("generatedFileName required")),
+                    p.Required<string>("projectName"),
+                    p.Required<string>("generatedFileName")),
 
-                _ => throw new Exception($"Unknown tool: {name}")
+                _ => throw new JsonRpcInvalidParamsException($"Unknown tool: {name}")
             };
 
             // Wrap result in MCP content format
@@ -1797,6 +1807,14 @@ Use get_source_generators first to discover available generated files.",
             };
 
             return CreateSuccessResponse(id, mpcResult);
+        }
+        catch (JsonRpcInvalidParamsException ex)
+        {
+            // Per JSON-RPC 2.0 §5.1: -32602 is "Invalid params" — the right code for
+            // missing/wrong-type tool arguments. Don't log at Error level because these
+            // are caller mistakes, not server failures.
+            await LogAsync("Debug", $"Invalid params: {ex.Message}");
+            return CreateErrorResponse(id, -32602, ex.Message);
         }
         catch (FileNotFoundException ex)
         {
