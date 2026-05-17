@@ -56,13 +56,36 @@ public class Target
 
         var data = json["data"]!;
         data["analyzersRan"]?.Value<bool>().Should().BeTrue();
-        data["analyzerCount"]?.Value<int>().Should().BeGreaterThan(0);
+        data["analyzerCount"]?.Value<int>().Should().Be(1,
+            "exactly one analyzer (AlwaysFiresAnalyzer) was attached");
 
         var diagnostics = data["diagnostics"] as JArray;
         diagnostics.Should().NotBeNullOrEmpty();
         // The analyzer fires once per method declaration. SampleCode has 2 methods.
-        diagnostics!.Count(d => d["id"]?.Value<string>() == AlwaysFiresAnalyzer.DiagnosticId)
-            .Should().Be(2, "AlwaysFiresAnalyzer must report once per method declaration");
+        var test0001 = diagnostics!
+            .Where(d => d["id"]?.Value<string>() == AlwaysFiresAnalyzer.DiagnosticId)
+            .ToList();
+        test0001.Should().HaveCount(2, "AlwaysFiresAnalyzer must report once per method declaration");
+
+        // Verify EACH analyzer diagnostic's shape round-trips correctly. Without this,
+        // a broken message template or stripped location would still pass the count check.
+        var byMethod = test0001
+            .Select(d => d["message"]?.Value<string>() ?? "")
+            .OrderBy(m => m)
+            .ToList();
+        byMethod[0].Should().Contain("Method 'Compute' triggers TEST0001",
+            "the analyzer's messageFormat must surface the method name via the '{0}' placeholder");
+        byMethod[1].Should().Contain("Method 'DoWork' triggers TEST0001");
+
+        foreach (var d in test0001)
+        {
+            d["severity"]?.Value<string>().Should().Be("Warning",
+                "AlwaysFiresAnalyzer declares defaultSeverity: Warning");
+            d["filePath"]?.Value<string>().Should().EndWith("Sample.cs",
+                "the diagnostic location must surface the source file");
+            d["line"]?.Type.Should().Be(JTokenType.Integer,
+                "every diagnostic must carry a numeric line position");
+        }
     }
 
     [Fact]
@@ -87,7 +110,7 @@ public class Target
         data["analyzerCount"]?.Value<int>().Should().Be(0);
 
         var diagnostics = data["diagnostics"] as JArray;
-        diagnostics.Should().NotBeNull();
+        diagnostics.Should().NotBeNull("response must always carry a diagnostics array");
         diagnostics!.Any(d => d["id"]?.Value<string>() == AlwaysFiresAnalyzer.DiagnosticId)
             .Should().BeFalse("with runAnalyzers:false, analyzer rules must not appear");
     }
