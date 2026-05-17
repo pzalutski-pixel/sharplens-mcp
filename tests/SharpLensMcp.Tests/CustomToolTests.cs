@@ -32,11 +32,15 @@ public class CustomToolTests : RoslynServiceTestBase
 
         var metrics = data["metrics"] as JObject;
         metrics.Should().NotBeNull();
-        metrics!["cyclomatic"]?.Value<int>().Should().BeGreaterThan(0);
-        metrics["loc"]?.Value<int>().Should().BeGreaterThan(0);
-        metrics["nesting"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
-        metrics["parameters"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
-        metrics["cognitive"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
+        // LoadSolutionAsync has exactly one parameter (solutionPath) per RoslynService.cs:253.
+        metrics!["parameters"]?.Value<int>().Should().Be(1);
+        // Body contains an if-guard and a registration callback — cyclomatic is at least 2.
+        metrics["cyclomatic"]?.Value<int>().Should().BeGreaterOrEqualTo(2);
+        // Method body spans roughly 45 lines (253-298); loc must be well above the noise floor.
+        metrics["loc"]?.Value<int>().Should().BeGreaterThan(10);
+        // The remaining metrics must at least be present as integers.
+        metrics["nesting"]?.Type.Should().Be(JTokenType.Integer);
+        metrics["cognitive"]?.Type.Should().Be(JTokenType.Integer);
     }
 
     [Fact]
@@ -52,12 +56,14 @@ public class CustomToolTests : RoslynServiceTestBase
         var methods = data["methods"] as JArray;
         methods!.Count.Should().BeGreaterThan(10, "RoslynService has many methods");
 
-        if (methods.Count > 0)
-        {
-            var first = methods[0];
-            first["name"].Should().NotBeNull();
-            first["metrics"].Should().NotBeNull();
-        }
+        var first = methods[0];
+        first["name"]?.Value<string>().Should().NotBeNullOrEmpty(
+            "every per-method entry must report its method name");
+        var firstMetrics = first["metrics"] as JObject;
+        firstMetrics.Should().NotBeNull(
+            "every per-method entry must carry its own metrics block");
+        firstMetrics!["cyclomatic"]?.Type.Should().Be(JTokenType.Integer,
+            "cyclomatic is always reported as an integer");
     }
 
     [Fact]
@@ -126,9 +132,15 @@ public class CustomToolTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // LoadSolutionAsync takes `string solutionPath` — a null-check preview must
-        // mention ArgumentNullException (the standard guard pattern).
-        data.ToString().Should().Contain("ArgumentNullException");
+        // LoadSolutionAsync takes one reference-type parameter, `string solutionPath`.
+        data["methodName"]?.Value<string>().Should().Be("LoadSolutionAsync");
+        var paramsWithChecks = data["parametersWithNullChecks"] as JArray;
+        paramsWithChecks.Should().NotBeNullOrEmpty(
+            "solutionPath is a reference-type param and must appear in the guard list");
+        paramsWithChecks!.Select(p => p.Value<string>()).Should().Contain("solutionPath");
+        data["generatedCode"]?.Value<string>().Should()
+            .Contain("ArgumentNullException.ThrowIfNull(solutionPath)",
+                "the standard guard line for solutionPath must appear verbatim in generated code");
     }
 
     [Fact]
@@ -148,11 +160,14 @@ public class CustomToolTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // GetHealthCheckAsync has no nullable reference params, so the preview
-        // should report zero generated guards.
-        var guardsAdded = data["guardsAdded"]?.Value<int>() ?? data["changesCount"]?.Value<int>() ?? 0;
-        guardsAdded.Should().Be(0,
-            "a method with no nullable reference parameters needs no guards");
+        // GetHealthCheckAsync has no nullable reference params. The impl returns a
+        // success with `message = "No nullable parameters found..."` and the method
+        // name, but no `parametersWithNullChecks` array — see CodeGeneration.cs:418-424.
+        data["methodName"]?.Value<string>().Should().Be("GetHealthCheckAsync");
+        data["message"]?.Value<string>().Should().Contain("No nullable parameters",
+            "a parameter-less method must trigger the 'nothing to guard' branch");
+        data["parametersWithNullChecks"].Should().BeNull(
+            "the no-guards branch must not emit a parametersWithNullChecks array");
     }
 
     #endregion
@@ -263,7 +278,7 @@ public class CustomToolTests : RoslynServiceTestBase
     {
         var result = await Service.GetTypeMembersBatchAsync(new List<string>());
 
-        AssertError(result, "INVALID");
+        AssertError(result, ErrorCodes.InvalidParameter);
     }
 
     [Fact]

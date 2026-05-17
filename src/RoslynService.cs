@@ -268,8 +268,14 @@ public partial class RoslynService
         _compilationCache.Clear();
 
         // MSBuild-specific construction lives in a local variable; once configured
-        // we hand it to the base-typed _workspace field.
-        var msbuild = MSBuildWorkspace.Create();
+        // we hand it to the base-typed _workspace field. The workspace's HostServices
+        // are MEF-composed from Roslyn's Workspaces + Features assemblies so the
+        // language services that built-in refactoring providers depend on (e.g.
+        // IExtractMethodService<TStatementSyntax>) are wired up — without this, the
+        // C# refactoring providers loaded for get_code_actions_at_position fire but
+        // their language-service lookups return null and they emit no actions.
+        var hostServices = Microsoft.CodeAnalysis.Host.Mef.MefHostServices.Create(GetRoslynMefAssemblies());
+        var msbuild = MSBuildWorkspace.Create(hostServices);
         msbuild.RegisterWorkspaceFailedHandler(args =>
         {
             Console.Error.WriteLine($"[Warning] Workspace: {args.Diagnostic.Message}");

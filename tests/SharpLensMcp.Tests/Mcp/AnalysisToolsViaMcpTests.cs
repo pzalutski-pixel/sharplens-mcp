@@ -29,12 +29,10 @@ public class AnalysisToolsViaMcpTests : McpTestBase
         // runAnalyzers:false locks both fields to deterministic values.
         data["analyzersRan"]?.Value<bool>().Should().BeFalse();
         data["analyzerCount"]?.Value<int>().Should().Be(0);
-        data["errorCount"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
-        data["warningCount"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
 
         var diagnostics = data["diagnostics"] as JArray;
         diagnostics.Should().NotBeNull();
-        // Reported error/warning counts must match what's in the array (caps aside).
+        // The reported counts must match the entries in the diagnostics array.
         var errors = diagnostics!.Count(d => d["severity"]?.Value<string>() == "Error");
         var warnings = diagnostics!.Count(d => d["severity"]?.Value<string>() == "Warning");
         data["errorCount"]?.Value<int>().Should().Be(errors);
@@ -80,9 +78,8 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
-    public async Task GetDiagnostics_ProjectPathFilter_OnlyThatProject()
+    public async Task GetDiagnostics_ProjectPathFilter_RestrictsToThatProject()
     {
-        // Resolve the SharpLensMcp project's full path from the loaded solution.
         var projectPath = Path.Combine(Fixture.SolutionDir, "src", "SharpLensMcp.csproj");
         var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
         {
@@ -92,9 +89,17 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             includeHidden = false,
             runAnalyzers = false
         });
-        // Field-shape contract: response must include the same fields as the no-filter call.
-        data["analyzersRan"]?.Type.Should().Be(JTokenType.Boolean);
-        data["errorCount"]?.Type.Should().Be(JTokenType.Integer);
+        var diagnostics = data["diagnostics"] as JArray;
+        diagnostics.Should().NotBeNull();
+        // Every diagnostic must come from a file inside the SharpLensMcp/src/ directory.
+        // No tests/* files should appear when the filter is set to the main project.
+        foreach (var d in diagnostics!)
+        {
+            var path = d["filePath"]?.Value<string>() ?? "";
+            path.Should().NotContain("tests/",
+                "projectPath filter must exclude files from other projects");
+            path.Should().NotContain("tests\\");
+        }
     }
 
     [Fact]
@@ -350,18 +355,26 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetMissingMembers_OnRoslynService_NoneMissing()
     {
-        // RoslynService is a complete partial class. Cursor at line 50 (inside
-        // MatchesGlobPattern) walks up to find the enclosing type.
+        // RoslynService is a complete partial class. Resolve the MatchesGlobPattern
+        // method body dynamically (its line shifts when the file is edited) so the
+        // test pins to its real position, not a hard-coded constant.
+        var lines = File.ReadAllLines(Fixture.RoslynServicePath);
+        var methodLine = Array.FindIndex(lines, l => l.Contains("MatchesGlobPattern"));
+        methodLine.Should().BeGreaterThan(-1);
+
         var data = await CallAndGetDataAsync("roslyn:get_missing_members", new
         {
             filePath = Fixture.RoslynServicePath,
-            line = 50,
+            line = methodLine + 4,   // inside the method body
             column = 10
         });
         data["typeName"]?.Value<string>().Should().EndWith("RoslynService");
         data["isAbstract"]?.Value<bool>().Should().BeFalse();
+        // Inspection.cs returns missingMembers as an empty array (not null) for
+        // complete types — assert exactly that, no OR-pattern weakening.
         var missing = data["missingMembers"] as JArray;
-        (missing == null || missing.Count == 0).Should().BeTrue(
+        missing.Should().NotBeNull("missingMembers is always emitted as an array");
+        missing!.Count.Should().Be(0,
             "RoslynService implements all interface/abstract members it inherits from");
     }
 }

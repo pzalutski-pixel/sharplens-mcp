@@ -80,14 +80,13 @@ public class NavigationTests : RoslynServiceTestBase
     [Fact]
     public async Task SearchSymbols_WithKindFilter_FiltersResults()
     {
-        // Act - search for methods only
         var result = await Service.SearchSymbolsAsync("Get*", kind: "Method", maxResults: 50);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         var results = data["results"] as JArray;
-        results.Should().NotBeNull();
+        results.Should().NotBeNullOrEmpty(
+            "the solution has many Get*-named methods; an empty result would silently bypass the foreach below");
 
         foreach (var symbol in results!)
         {
@@ -148,14 +147,13 @@ public class NavigationTests : RoslynServiceTestBase
     [Fact]
     public async Task GetTypeMembers_WithKindFilter_FiltersResults()
     {
-        // Act
         var result = await Service.GetTypeMembersAsync("RoslynService", memberKind: "Method");
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         var members = data["members"] as JArray;
-        members.Should().NotBeNull();
+        members.Should().NotBeNullOrEmpty(
+            "RoslynService has many methods; an empty members array would silently pass the foreach below");
 
         foreach (var member in members!)
         {
@@ -166,15 +164,16 @@ public class NavigationTests : RoslynServiceTestBase
     [Fact]
     public async Task GetMethodSignature_ReturnsDetails()
     {
-        // Act
         var result = await Service.GetMethodSignatureAsync("RoslynService", "LoadSolutionAsync");
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         data["methodName"]?.Value<string>().Should().Be("LoadSolutionAsync");
-        data["returnType"]?.Value<string>().Should().Contain("Task");
-        data["parameters"].Should().NotBeNull();
+        data["returnType"]?.Value<string>().Should().Contain("Task<object>");
+        var parameters = data["parameters"] as JArray;
+        parameters.Should().NotBeNullOrEmpty();
+        parameters!.Count.Should().Be(1);
+        parameters[0]["name"]?.Value<string>().Should().Be("solutionPath");
     }
 
     [Fact]
@@ -236,7 +235,6 @@ public class NavigationTests : RoslynServiceTestBase
     [Fact]
     public async Task SemanticQuery_FindsAsyncMethods()
     {
-        // Act - correct signature: kinds, isAsync, namespaceFilter, accessibility, isStatic, type, returnType, attributes, parameterIncludes, parameterExcludes, maxResults
         var result = await Service.SemanticQueryAsync(
             kinds: null,
             isAsync: true,
@@ -250,18 +248,22 @@ public class NavigationTests : RoslynServiceTestBase
             parameterExcludes: null,
             maxResults: 50);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         var results = data["results"] as JArray;
-        results.Should().NotBeNull();
+        results.Should().NotBeNullOrEmpty();
         results!.Count.Should().BeGreaterThan(5, "Should find async symbols");
+        // Filter invariant: every returned symbol must satisfy the isAsync filter.
+        foreach (var symbol in results)
+        {
+            symbol["isAsync"]?.Value<bool>().Should().BeTrue(
+                "isAsync:true must drop non-async symbols");
+        }
     }
 
     [Fact]
     public async Task SemanticQuery_FiltersByAccessibility()
     {
-        // Act
         var result = await Service.SemanticQueryAsync(
             kinds: new List<string> { "Method" },
             isAsync: null,
@@ -275,11 +277,11 @@ public class NavigationTests : RoslynServiceTestBase
             parameterExcludes: null,
             maxResults: 50);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         var results = data["results"] as JArray;
-        results.Should().NotBeNull();
+        results.Should().NotBeNullOrEmpty(
+            "the solution has many public methods; an empty result would silently pass the foreach");
 
         foreach (var symbol in results!)
         {

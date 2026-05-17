@@ -223,48 +223,27 @@ public class RefactoringToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
-    public async Task GetCodeActionsAtPosition_OnSumMethodBody_OffersExtractMethodAction()
+    public async Task GetCodeActionsAtPosition_InUsingsBlock_OffersSortUsingsRefactoring()
     {
-        // Position inside RefactoringTarget.Sum body — Roslyn reliably offers
-        // "Extract method" / "Introduce local" / "Inline temporary variable"
-        // class of refactorings for selections inside a method body.
-        var (file, methodLine, _) = await LocateSymbolAsync(
-            "Sum", kind: "Method",
-            r => r["containingType"]?.Value<string>()?.Contains("RefactoringTarget") == true);
-
+        // Line 10 of RoslynService.cs is inside the `using` directives block. With the
+        // full C# refactoring provider set composed via MEF (see Analysis.cs:BuildMefContainer),
+        // Roslyn deterministically surfaces the "Sort Usings" refactoring at this position.
         var data = await CallAndGetDataAsync("roslyn:get_code_actions_at_position", new
         {
-            filePath = file,
-            line = methodLine + 2,   // `var partial = a + b;`
-            column = 12
+            filePath = Fixture.RoslynServicePath,
+            line = 10,
+            column = 10
         });
         var actions = data["actions"] as JArray;
-        actions.Should().NotBeNull();
-        // The Roslyn refactoring catalog at a `var x = expr;` line always offers at
-        // least one action (typically "Use explicit type" or "Introduce local"). If
-        // no refactorings are offered, the impl explicitly returns success with
-        // message "No code actions available at this position" (CodeActions.cs:73).
-        // Either branch is acceptable — the contract is that the response has the
-        // documented shape with either entries or the message field.
-        if (actions!.Count > 0)
-        {
-            foreach (var a in actions)
-            {
-                a["title"]?.Value<string>().Should().NotBeNullOrEmpty();
-                a["kind"]?.Value<string>().Should().BeOneOf("fix", "refactoring");
-            }
-            data["fixCount"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
-            data["refactoringCount"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
-        }
-        else
-        {
-            data["message"]?.Value<string>().Should().Contain("No code actions",
-                "empty result must carry the documented message field");
-        }
+        actions.Should().NotBeNullOrEmpty();
+        actions!.Any(a => a["title"]?.Value<string>() == "Sort Usings"
+                       && a["kind"]?.Value<string>() == "refactoring")
+            .Should().BeTrue("the using directives block always offers Sort Usings as a refactoring");
+        data["refactoringCount"]?.Value<int>().Should().BeGreaterThan(0);
     }
 
     [Fact]
-    public async Task ApplyCodeActionByTitle_NonExistentTitle_ReturnsSymbolNotFound()
+    public async Task ApplyCodeActionByTitle_NonExistentTitle_ReturnsSymbolNotFoundWithAvailableTitles()
     {
         var error = await CallAndGetErrorAsync(
             "roslyn:apply_code_action_by_title",
@@ -276,11 +255,13 @@ public class RefactoringToolsViaMcpTests : McpTestBase
             },
             codeContains: ErrorCodes.SymbolNotFound);
         error["code"]?.Value<string>().Should().Be(ErrorCodes.SymbolNotFound);
-        // At line 10/col 10 of RoslynService.cs (in `using` directives territory), Roslyn
-        // offers no refactorings — CodeActions.cs:192 surfaces the no-actions hint:
-        // "No actions available at this position. Try get_code_actions_at_position first."
-        error["hint"]?.Value<string>().Should().Contain("No actions available",
-            "no refactorings are offered at this position; the impl uses the no-actions branch");
+        // Line 10/col 10 surfaces "Sort Usings". The non-matching title triggers the
+        // CodeActions.cs:192-193 branch where availableTitles.Count > 0 — the hint
+        // becomes "Available actions: ..." and must include "Sort Usings".
+        error["hint"]?.Value<string>().Should().Contain("Available actions:",
+            "available actions are listed in the hint when at least one title exists at the position");
+        error["hint"]?.Value<string>().Should().Contain("Sort Usings",
+            "the locked-down 'Sort Usings' refactoring must appear in the available-actions list");
     }
 
     [Fact]
@@ -289,13 +270,19 @@ public class RefactoringToolsViaMcpTests : McpTestBase
         // The RoslynService partial class implements every interface/abstract member
         // it declares. The wrapper at CodeActions.cs:370-375 returns SymbolNotFound
         // with the "No 'implement members' action found at this position" message
-        // when no implement-action is offered.
+        // when no implement-action is offered. Resolve the class-declaration line
+        // dynamically so the test doesn't fragmentize on file edits.
+        var lines = File.ReadAllLines(Fixture.RoslynServicePath);
+        var classLine = Array.FindIndex(lines, l => l.Contains("class RoslynService"));
+        classLine.Should().BeGreaterThan(-1);
+        var classCol = lines[classLine].IndexOf("RoslynService", StringComparison.Ordinal);
+
         var error = await CallAndGetErrorAsync(
             "roslyn:implement_missing_members",
             new
             {
                 filePath = Fixture.RoslynServicePath,
-                line = 17, column = 25,   // `public partial class RoslynService`
+                line = classLine, column = classCol,
                 preview = true
             },
             codeContains: ErrorCodes.SymbolNotFound);

@@ -16,7 +16,7 @@ Rules every test in this project must follow. Codifies the lessons from our test
 
 6. **Tests that modify disk must restore.** Tools like `change_signature` and `rename_symbol` apply edits to source files. Tests for those tools snapshot the file content in `InitializeAsync` and restore it in `DisposeAsync` so xUnit's per-test isolation actually holds.
 
-## Anti-patterns to grep for in review
+## Anti-patterns to look for during review
 
 These are smoke signals that a test isn't a test:
 

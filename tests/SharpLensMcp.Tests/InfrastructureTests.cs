@@ -29,7 +29,9 @@ public class InfrastructureTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["projectCount"]?.Value<int>().Should().BeGreaterOrEqualTo(1);
+        // The SharpLensMcp solution contains exactly three csproj projects:
+        // SharpLensMcp, SharpLensMcp.Tests, SharpLensMcp.Tests.TestAnalyzers.
+        data["projectCount"]?.Value<int>().Should().Be(3);
     }
 
     [Fact]
@@ -42,7 +44,7 @@ public class InfrastructureTests : RoslynServiceTestBase
         var result = await Service.LoadSolutionAsync(invalidPath);
 
         // Assert
-        AssertError(result, "not_found");
+        AssertError(result, ErrorCodes.FileNotFound);
     }
 
     [Fact]
@@ -67,32 +69,52 @@ public class InfrastructureTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task GetProjectStructure_WithSummaryOnly_ReturnsMinimalInfo()
+    public async Task GetProjectStructure_WithSummaryOnly_OmitsDocumentsAndReferenceArrays()
     {
-        // Act
         var result = await Service.GetProjectStructureAsync(
             includeReferences: false,
             includeDocuments: false,
             summaryOnly: true);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         var projects = data["projects"] as JArray;
-        projects.Should().NotBeNull();
+        projects.Should().NotBeNullOrEmpty();
+        projects!.Count.Should().Be(3, "the solution has three csproj projects");
+
+        // Summary entries carry name + documentCount + projectReferenceCount + language only,
+        // per Analysis.cs:867-873. They must NOT carry the full `documents` or `references` arrays.
+        foreach (var project in projects)
+        {
+            project["name"]?.Value<string>().Should().NotBeNullOrEmpty();
+            project["language"]?.Value<string>().Should().Be("C#");
+            project["documentCount"]?.Type.Should().Be(JTokenType.Integer);
+            project["projectReferenceCount"]?.Type.Should().Be(JTokenType.Integer);
+            project["documents"].Should().BeNull("summaryOnly must omit the documents array");
+            project["references"].Should().BeNull("summaryOnly must omit the references array");
+        }
     }
 
     [Fact]
-    public async Task DependencyGraph_ReturnsJsonFormat()
+    public async Task DependencyGraph_JsonFormat_ListsTestProjectDependingOnSharpLensMcp()
     {
-        // Act
         var result = await Service.GetDependencyGraphAsync(format: "json");
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["dependencies"].Should().NotBeNull();
-        data["hasCycles"].Should().NotBeNull();
+        // The default-format response carries a dependencies dictionary, not a graph string.
+        var deps = data["dependencies"] as JObject;
+        deps.Should().NotBeNull("json format returns a Dictionary<string, List<string>>");
+        deps!["SharpLensMcp.Tests"].Should().NotBeNull(
+            "the test project must appear as a key in the dependency graph");
+        var testDeps = deps["SharpLensMcp.Tests"] as JArray;
+        testDeps.Should().NotBeNullOrEmpty();
+        testDeps!.Select(t => t.Value<string>())
+            .Should().Contain("SharpLensMcp",
+                "SharpLensMcp.Tests project-references SharpLensMcp");
+
+        data["hasCycles"]?.Value<bool>().Should().BeFalse(
+            "the SharpLensMcp solution has no circular project references");
     }
 
     [Fact]
@@ -135,18 +157,25 @@ public class InfrastructureTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task SyncDocuments_WithNoFiles_SyncsAllDocuments()
+    public async Task SyncDocuments_WithNoFiles_UpdatesAllExistingAddsNoneRemovesNone()
     {
-        // Act - sync all documents (no specific files)
         var result = await Service.SyncDocumentsAsync(null);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["totalSynced"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
-        data["updated"].Should().NotBeNull();
-        data["added"].Should().NotBeNull();
-        data["removed"].Should().NotBeNull();
+        // Sync-all walks every document already in the solution; none of them are
+        // missing from disk and none are unknown, so:
+        //  - added must be 0 (nothing new appears via the existing-document path)
+        //  - removed must be 0 (every file still exists on disk)
+        //  - updated must be > 0 (every existing doc is rewritten with on-disk text per RoslynService.cs:359-366)
+        //  - totalSynced must equal updated + added + removed
+        var updated = data["updated"]!.Value<int>();
+        var added = data["added"]!.Value<int>();
+        var removed = data["removed"]!.Value<int>();
+        added.Should().Be(0, "sync-all over an in-sync solution adds no new documents");
+        removed.Should().Be(0, "sync-all over a solution with all files present removes nothing");
+        updated.Should().BeGreaterThan(0, "every existing doc gets rewritten with disk text");
+        data["totalSynced"]?.Value<int>().Should().Be(updated + added + removed);
     }
 
     [Fact]

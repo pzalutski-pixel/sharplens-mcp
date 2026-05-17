@@ -93,13 +93,15 @@ public class McpServerTests
     }
 
     [Fact]
-    public async Task HandleRequest_InvalidJson_ReturnsParseError()
+    public async Task HandleRequest_InvalidJson_Returns32700ParseError()
     {
         var request = "not valid json";
         var response = ParseResponse(await _server.HandleRequestAsync(request));
 
         var error = response["error"]!.AsObject();
-        error["code"]!.GetValue<int>().Should().Be(-32603);
+        // Per JSON-RPC 2.0 §5.1, malformed JSON must surface as -32700 Parse error.
+        error["code"]!.GetValue<int>().Should().Be(-32700);
+        error["message"]!.GetValue<string>().Should().Contain("Parse error");
     }
 
     [Fact]

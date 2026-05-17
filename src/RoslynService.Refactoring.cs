@@ -1024,19 +1024,20 @@ public partial class RoslynService
             );
         }
 
-        // Perform data flow analysis
+        // Perform data flow analysis. Roslyn's AnalyzeDataFlow(first, last) requires
+        // the two statements to be direct siblings in the same statement list; on
+        // selections that don't satisfy that (e.g. partial spans inside nested blocks),
+        // it throws ArgumentException. Fall back to a single-statement analysis so the
+        // tool still produces a useful preview rather than failing the whole call.
         var firstStatement = statements.First();
         var lastStatement = statements.Last();
-        var analysisSpan = Microsoft.CodeAnalysis.Text.TextSpan.FromBounds(firstStatement.SpanStart, lastStatement.Span.End);
-
-        DataFlowAnalysis? dataFlow = null;
+        DataFlowAnalysis? dataFlow;
         try
         {
             dataFlow = semanticModel.AnalyzeDataFlow(firstStatement, lastStatement);
         }
-        catch
+        catch (ArgumentException)
         {
-            // Fall back to analyzing individual statement
             dataFlow = semanticModel.AnalyzeDataFlow(firstStatement);
         }
 

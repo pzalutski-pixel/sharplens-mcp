@@ -108,13 +108,26 @@ public class McpServer
         var hasId = false;
         RequestId? id = null;
 
+        JsonObject? request;
         try
         {
-            var request = JsonSerializer.Deserialize<JsonObject>(requestJson);
-            if (request == null)
-            {
-                return CreateErrorResponse((RequestId?)null, -32700, "Parse error");
-            }
+            request = JsonSerializer.Deserialize<JsonObject>(requestJson);
+        }
+        catch (JsonException ex)
+        {
+            // Per JSON-RPC 2.0 §5.1, malformed JSON must surface as -32700 Parse error,
+            // not -32603 Internal error. Caught here before the main try-block so we
+            // don't bury the spec-correct code under a generic exception handler.
+            await LogAsync("Error", $"Parse error: {ex.Message}");
+            return CreateErrorResponse((RequestId?)null, -32700, $"Parse error: {ex.Message}");
+        }
+        if (request == null)
+        {
+            return CreateErrorResponse((RequestId?)null, -32700, "Parse error");
+        }
+
+        try
+        {
 
             // Per JSON-RPC 2.0 §4.3: a request is a Notification if and only if the
             // `id` member is absent. Notifications produce NO response (including no

@@ -26,10 +26,12 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
             "the solution has SharpLensMcp + SharpLensMcp.Tests + SharpLensMcp.Tests.TestAnalyzers");
         solution["documents"]?.Value<int>().Should().BeGreaterThan(50);
         // Errors/warnings counts come from MSBuildWorkspace compilation, which doesn't
-        // see the same world as `dotnet build` (metadata-resolution noise). Don't pin
-        // a specific value — the clean-build invariant is tested via get_diagnostics.
-        solution["errors"]?.Value<int>().Should().BeGreaterOrEqualTo(0,
-            "the field must be a non-negative int even if MSBuildWorkspace reports phantoms");
+        // see the same world as `dotnet build` (metadata-resolution noise). The
+        // health_check view of these counts is inherently noisy; the strict
+        // clean-build invariant lives in get_diagnostics tests, not here. Just
+        // assert the fields exist with the expected types.
+        solution["errors"]?.Type.Should().Be(JTokenType.Integer);
+        solution["warnings"]?.Type.Should().Be(JTokenType.Integer);
         solution["loadedAt"]?.Value<string>().Should().NotBeNullOrEmpty();
 
         data["workspace"]!["indexed"]?.Value<bool>().Should().BeTrue();
@@ -249,7 +251,10 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
                 g["typeName"]?.Value<string>().Should().NotBeNullOrEmpty();
                 g["assemblyName"]?.Value<string>().Should().NotBeNullOrEmpty();
             }
-            (p["generatedFiles"] as JArray).Should().NotBeNull();
+            // generatedFiles must be an array (possibly empty: not every generator
+            // run in this context has produced files yet).
+            (p["generatedFiles"] as JArray).Should().NotBeNull(
+                "Discovery.cs:418 always emits a generatedFiles array per project entry");
         }
     }
 

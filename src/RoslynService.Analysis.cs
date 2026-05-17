@@ -648,103 +648,87 @@ public partial class RoslynService
         return codeActions;
     }
 
+    // MEF discovery is expensive (scans every assembly's exports). Cache after first use.
+    private static readonly object _mefLock = new();
+    private static List<CodeFixProvider>? _cachedCodeFixProviders;
+    private static List<CodeRefactoringProvider>? _cachedCodeRefactoringProviders;
+
+    // Build the assembly list used for both MEF discovery and the workspace's
+    // MefHostServices. Includes Roslyn's Workspaces + Features assemblies so that:
+    //   (1) CodeFixProvider/CodeRefactoringProvider exports are discoverable, AND
+    //   (2) the workspace's language services (IExtractMethodService<>, etc.) that
+    //       those providers depend on at runtime are also wired up.
+    // Both halves are required — a MEF-discovered provider whose dependencies live
+    // outside the workspace's HostServices will silently produce no actions.
+    internal static IEnumerable<System.Reflection.Assembly> GetRoslynMefAssemblies()
+    {
+        var assemblies = new List<System.Reflection.Assembly>
+        {
+            typeof(Workspace).Assembly,                                          // Microsoft.CodeAnalysis.Workspaces
+            typeof(Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree).Assembly,     // Microsoft.CodeAnalysis.CSharp
+            typeof(Microsoft.CodeAnalysis.CSharp.Formatting.CSharpFormattingOptions).Assembly, // Microsoft.CodeAnalysis.CSharp.Workspaces
+        };
+        TryAddAssembly(assemblies, "Microsoft.CodeAnalysis.Features");
+        TryAddAssembly(assemblies, "Microsoft.CodeAnalysis.CSharp.Features");
+        return assemblies.Distinct();
+    }
+
+    // Build a MEF container with the same assembly set used for the workspace's
+    // HostServices. Roslyn's refactoring/fix providers are MEF-exported with
+    // [ImportingConstructor] constructors that take service injections — reflection
+    // with a parameterless-ctor filter misses them all. System.Composition resolves
+    // the imports and instantiates them correctly.
+    private static System.Composition.Hosting.CompositionHost BuildMefContainer()
+    {
+        var configuration = new System.Composition.Hosting.ContainerConfiguration()
+            .WithAssemblies(GetRoslynMefAssemblies());
+        return configuration.CreateContainer();
+    }
+
+    private static void TryAddAssembly(List<System.Reflection.Assembly> list, string name)
+    {
+        try { list.Add(System.Reflection.Assembly.Load(name)); }
+        catch { /* package not deployed — skip */ }
+    }
+
     private List<CodeFixProvider> GetBuiltInCodeFixProviders()
     {
-        // Get built-in C# code fix providers from Roslyn
-        var codeFixProviderType = typeof(CodeFixProvider);
-        var assembly = typeof(Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree).Assembly;
-
-        var providers = assembly.GetTypes()
-            .Where(t => !t.IsAbstract && codeFixProviderType.IsAssignableFrom(t))
-            .Where(t => t.GetConstructors().Any(c => c.GetParameters().Length == 0)) // Has parameterless constructor
-            .Select(t =>
+        if (_cachedCodeFixProviders != null) return _cachedCodeFixProviders;
+        lock (_mefLock)
+        {
+            if (_cachedCodeFixProviders != null) return _cachedCodeFixProviders;
+            try
             {
-                try
-                {
-                    return Activator.CreateInstance(t) as CodeFixProvider;
-                }
-                catch
-                {
-                    return null;
-                }
-            })
-            .Where(p => p != null)
-            .Cast<CodeFixProvider>()
-            .ToList();
-
-        return providers;
+                using var container = BuildMefContainer();
+                _cachedCodeFixProviders = container.GetExports<CodeFixProvider>().ToList();
+            }
+            catch
+            {
+                // MEF composition failed — fall back to empty list. Tools will surface
+                // no fixes rather than crashing the request.
+                _cachedCodeFixProviders = new List<CodeFixProvider>();
+            }
+            return _cachedCodeFixProviders;
+        }
     }
 
     private List<CodeRefactoringProvider> GetBuiltInCodeRefactoringProviders()
     {
-        // Get built-in C# code refactoring providers from Roslyn
-        var codeRefactoringProviderType = typeof(CodeRefactoringProvider);
-
-        // Check multiple assemblies for refactoring providers
-        var assemblies = new[]
+        if (_cachedCodeRefactoringProviders != null) return _cachedCodeRefactoringProviders;
+        lock (_mefLock)
         {
-            typeof(Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree).Assembly,
-            typeof(Microsoft.CodeAnalysis.CSharp.CSharpSyntaxNode).Assembly
-        };
-
-        var providers = new List<CodeRefactoringProvider>();
-
-        foreach (var assembly in assemblies)
-        {
-            var assemblyProviders = assembly.GetTypes()
-                .Where(t => !t.IsAbstract && codeRefactoringProviderType.IsAssignableFrom(t))
-                .Where(t => t.GetConstructors().Any(c => c.GetParameters().Length == 0))
-                .Select(t =>
-                {
-                    try
-                    {
-                        return Activator.CreateInstance(t) as CodeRefactoringProvider;
-                    }
-                    catch
-                    {
-                        return null;
-                    }
-                })
-                .Where(p => p != null)
-                .Cast<CodeRefactoringProvider>();
-
-            providers.AddRange(assemblyProviders);
-        }
-
-        // Also try to load from Features assembly if available
-        try
-        {
-            var featuresAssembly = AppDomain.CurrentDomain.GetAssemblies()
-                .FirstOrDefault(a => a.GetName().Name == "Microsoft.CodeAnalysis.CSharp.Features");
-
-            if (featuresAssembly != null)
+            if (_cachedCodeRefactoringProviders != null) return _cachedCodeRefactoringProviders;
+            try
             {
-                var featuresProviders = featuresAssembly.GetTypes()
-                    .Where(t => !t.IsAbstract && codeRefactoringProviderType.IsAssignableFrom(t))
-                    .Where(t => t.GetConstructors().Any(c => c.GetParameters().Length == 0))
-                    .Select(t =>
-                    {
-                        try
-                        {
-                            return Activator.CreateInstance(t) as CodeRefactoringProvider;
-                        }
-                        catch
-                        {
-                            return null;
-                        }
-                    })
-                    .Where(p => p != null)
-                    .Cast<CodeRefactoringProvider>();
-
-                providers.AddRange(featuresProviders);
+                using var container = BuildMefContainer();
+                _cachedCodeRefactoringProviders = container.GetExports<CodeRefactoringProvider>().ToList();
             }
+            catch
+            {
+                _cachedCodeRefactoringProviders = new List<CodeRefactoringProvider>();
+            }
+            return _cachedCodeRefactoringProviders;
         }
-        catch
-        {
-            // Features assembly not available, continue with what we have
-        }
-
-        return providers.Distinct().ToList();
     }
 
     private async Task<List<(CodeAction action, string kind)>> GetAllCodeActionsAtPositionAsync(

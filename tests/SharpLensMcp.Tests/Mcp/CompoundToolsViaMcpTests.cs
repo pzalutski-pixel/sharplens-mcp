@@ -21,13 +21,13 @@ public class CompoundToolsViaMcpTests : McpTestBase
         data["typeName"]?.Value<string>().Should().Contain("RoslynService");
         data["typeKind"]?.Value<string>().Should().Be("Class");
 
-        // memberSummary aggregates counts per member kind. RoslynService has many
-        // methods (50+) and several fields; pin a lower bound that would only fail
-        // if the partial-class structure was gutted.
+        // memberSummary aggregates counts per member kind. Compound.cs:292 emits
+        // `methods` (not `methodCount`); pin the exact field name.
         var memberSummary = data["memberSummary"]!;
-        memberSummary.Should().NotBeNull();
-        (memberSummary["methodCount"] ?? memberSummary["methods"])?.Value<int>()
-            .Should().BeGreaterOrEqualTo(20, "RoslynService has well over 20 methods across the partials");
+        memberSummary["methods"]?.Value<int>().Should().BeGreaterOrEqualTo(20,
+            "RoslynService has well over 20 ordinary methods across the partials");
+        memberSummary["fields"]?.Value<int>().Should().BeGreaterOrEqualTo(1,
+            "RoslynService has fields like _workspace, _solution, etc.");
     }
 
     [Fact]

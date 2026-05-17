@@ -11,112 +11,135 @@ namespace SharpLensMcp.Tests;
 /// </summary>
 public class CodeActionTests : RoslynServiceTestBase
 {
-    [Fact]
-    public async Task GetCodeActionsAtPosition_OnMethodName_ReturnsRefactorings()
+    private async Task<(string file, int startLine, int endLine)> LocateSumExtractableSelectionAsync()
     {
-        var searchResult = await Service.SearchSymbolsAsync("LoadSolutionAsync", kind: "Method", maxResults: 10);
+        // RefactoringTarget.Sum body has two `var` statements ("var partial = a + b;"
+        // and "var total = partial + c;"). Roslyn's extract-method provider reliably
+        // offers an Extract-method refactoring over this span — it's the most
+        // deterministic positive position in our fixture set.
+        var searchResult = await Service.SearchSymbolsAsync("Sum", kind: "Method", maxResults: 50);
         var symbols = GetData(searchResult)["results"] as JArray;
-        symbols.Should().NotBeNullOrEmpty();
-
-        var symbol = symbols![0];
-        var loc = symbol["location"]!;
-        var result = await Service.GetCodeActionsAtPositionAsync(
-            loc["filePath"]!.Value<string>()!,
-            loc["line"]!.Value<int>(),
-            loc["column"]!.Value<int>());
-        AssertSuccess(result);
-
-        var data = GetData(result);
-        var actions = data["actions"] as JArray;
-        actions.Should().NotBeNull("response must include actions array");
-        // Note: Roslyn may legitimately return zero refactorings depending on context;
-        // the contract is the array exists, not that it's populated.
+        var sum = symbols!.First(s =>
+            s["containingType"]?.Value<string>()?.Contains("RefactoringTarget") == true);
+        var loc = sum["location"]!;
+        var file = loc["filePath"]!.Value<string>()!;
+        var methodLine = loc["line"]!.Value<int>();
+        return (file, methodLine + 2, methodLine + 3);
     }
 
     [Fact]
-    public async Task GetCodeActionsAtPosition_WithRangeSelection_Succeeds()
+    public async Task GetCodeActionsAtPosition_OverTwoStatementsInSumBody_OffersExtractMethod()
     {
-        var searchResult = await Service.SearchSymbolsAsync("EnsureSolutionLoaded", kind: "Method", maxResults: 10);
-        var symbols = GetData(searchResult)["results"] as JArray;
-        symbols.Should().NotBeNullOrEmpty();
-
-        var symbol = symbols![0];
-        var loc = symbol["location"]!;
-        var line = loc["line"]!.Value<int>();
-        var col = loc["column"]!.Value<int>();
+        var (file, startLine, endLine) = await LocateSumExtractableSelectionAsync();
 
         var result = await Service.GetCodeActionsAtPositionAsync(
-            loc["filePath"]!.Value<string>()!,
-            line, col,
-            endLine: line + 2,
-            endColumn: 0,
+            file,
+            line: startLine,
+            column: 0,
+            endLine: endLine,
+            endColumn: 50,
             includeRefactorings: true);
 
         AssertSuccess(result);
         var data = GetData(result);
-        (data["actions"] as JArray).Should().NotBeNull();
+        var actions = data["actions"] as JArray;
+        actions.Should().NotBeNullOrEmpty(
+            "a multi-statement selection inside a method body must offer at least an extract-method refactoring");
+        actions!.Any(a => a["title"]?.Value<string>()?.Contains("Extract", StringComparison.OrdinalIgnoreCase) == true)
+            .Should().BeTrue("the actions list must include an Extract-method title");
+        data["refactoringCount"]?.Value<int>().Should().BeGreaterThan(0,
+            "the extract-method offering must be classified as a refactoring");
     }
 
     [Fact]
-    public async Task GetCodeActionsAtPosition_IncludeOnlyFixes_FiltersResults()
+    public async Task GetCodeActionsAtPosition_IncludeOnlyFixes_StripsRefactoringActionsFromSumSelection()
     {
-        var result = await Service.GetCodeActionsAtPositionAsync(
-            RoslynServicePath, line: 50, column: 10,
+        var (file, startLine, endLine) = await LocateSumExtractableSelectionAsync();
+
+        // Baseline: unfiltered must include at least one refactoring or there's nothing to filter.
+        var unfiltered = await Service.GetCodeActionsAtPositionAsync(
+            file, startLine, 0, endLine, 50);
+        var baselineActions = GetData(unfiltered)["actions"] as JArray;
+        baselineActions.Should().NotBeNullOrEmpty();
+        baselineActions!.Any(a => a["kind"]?.Value<string>() == "refactoring")
+            .Should().BeTrue(
+                "baseline must include refactorings or this test cannot detect a filtering regression");
+
+        // Filtered: same span with includeRefactorings:false. Every surviving action
+        // must be kind="fix"; the strict count drop proves filtering actually fired.
+        var filtered = await Service.GetCodeActionsAtPositionAsync(
+            file, startLine, 0, endLine, 50,
             includeCodeFixes: true,
             includeRefactorings: false);
-
-        AssertSuccess(result);
-        var data = GetData(result);
+        AssertSuccess(filtered);
+        var data = GetData(filtered);
         var actions = data["actions"] as JArray;
-        actions.Should().NotBeNull("actions array must be present");
-
+        actions.Should().NotBeNull("the actions array must be present on success");
         foreach (var action in actions!)
         {
-            var kind = action["kind"]?.Value<string>();
-            if (!string.IsNullOrEmpty(kind))
-            {
-                kind.Should().Be("fix",
-                    "includeRefactorings:false must filter out non-fix actions");
-            }
+            action["kind"]?.Value<string>().Should().Be("fix",
+                "includeRefactorings:false must filter out every action whose kind is not 'fix'");
         }
+        actions!.Count.Should().BeLessThan(baselineActions!.Count,
+            "filtering refactorings out must produce strictly fewer actions than the unfiltered baseline");
     }
 
     [Fact]
-    public async Task ApplyCodeActionByTitle_WithNonExistentTitle_ReturnsError()
+    public async Task ApplyCodeActionByTitle_WithNonExistentTitle_ReturnsSymbolNotFound()
     {
         var result = await Service.ApplyCodeActionByTitleAsync(
             RoslynServicePath, line: 10, column: 10,
             title: "This action does not exist 12345");
 
-        AssertError(result);
+        // CodeActions.cs:189 returns SymbolNotFound when no action title matches.
+        AssertError(result, ErrorCodes.SymbolNotFound);
     }
 
     [Fact]
-    public async Task ApplyCodeActionByTitle_WithFirstOfferedAction_PreviewsSomething()
+    public async Task ApplyCodeActionByTitle_OnExtractMethodOfferAtSumSelection_PreviewsChangeWithoutWriting()
     {
+        // Discover the extract-method title Roslyn offers for the Sum selection — Roslyn
+        // versions vary ("Extract method", "Extract Method", "Extract local function"),
+        // so we read it back and apply that exact title rather than guessing.
+        var (file, startLine, endLine) = await LocateSumExtractableSelectionAsync();
+
         var actionsResult = await Service.GetCodeActionsAtPositionAsync(
-            RoslynServicePath, line: 50, column: 10);
-        AssertSuccess(actionsResult);
-
+            file, startLine, 0, endLine, 50);
         var actions = GetData(actionsResult)["actions"] as JArray;
-        actions.Should().NotBeNull();
-        if (actions!.Count == 0)
+        actions.Should().NotBeNullOrEmpty();
+        var extractTitle = actions!
+            .Select(a => a["title"]?.Value<string>())
+            .First(t => t != null && t.Contains("Extract", StringComparison.OrdinalIgnoreCase));
+
+        // `file` is solution-relative; resolve to absolute for the defensive snapshot.
+        var absoluteFile = Path.Combine(Path.GetDirectoryName(SolutionPath)!, file);
+        var snapshot = File.ReadAllText(absoluteFile);
+        try
         {
-            // Roslyn may return zero actions on some lines; nothing to apply.
-            return;
+            var result = await Service.ApplyCodeActionByTitleAsync(
+                file, startLine, 0,
+                title: extractTitle!,
+                endLine: endLine, endColumn: 50,
+                preview: true);
+
+            AssertSuccess(result);
+            var data = GetData(result);
+            data["actionTitle"]?.Value<string>().Should().Be(extractTitle);
+            data["preview"]?.Value<bool>().Should().BeTrue();
+            data["applied"]?.Value<bool>().Should().BeFalse(
+                "preview=true must report applied=false per CodeActions.cs:310");
+            var changed = data["changedFiles"] as JArray;
+            changed.Should().NotBeNullOrEmpty(
+                "extract-method preview must report at least one changed file");
+            var newText = changed![0]["newText"]?.Value<string>();
+            newText.Should().NotBeNullOrEmpty("preview=true must include the new file text");
         }
-
-        var title = actions[0]["title"]?.Value<string>();
-        title.Should().NotBeNullOrEmpty();
-
-        var result = await Service.ApplyCodeActionByTitleAsync(
-            RoslynServicePath, line: 50, column: 10,
-            title: title!,
-            preview: true);
-
-        AssertSuccess(result);
-        var data = GetData(result);
-        data["title"]?.Value<string>().Should().Be(title);
+        finally
+        {
+            // Defensive: preview=true must NOT mutate disk. If a regression flipped that
+            // contract, this restore prevents corrupting the fixture for downstream tests.
+            File.WriteAllText(absoluteFile, snapshot);
+        }
     }
 
     [Fact]

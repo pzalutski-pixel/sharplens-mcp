@@ -134,12 +134,13 @@ public class DispatcherContractTests : McpTestBase
             includeHidden = false,
             runAnalyzers = true
         });
-        // analyzersRan may legitimately be false if no project has analyzers,
-        // but the field must be present and the int analyzerCount must be >= 0.
-        // The contract is that the boolean param was passed through and the tool
-        // exposed its observation back.
-        data["analyzersRan"].Should().NotBeNull();
-        data["analyzerCount"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
+        // Contract: runAnalyzers=true means analyzersRan and analyzerCount must agree.
+        //  - If analyzersRan is true, at least one analyzer was invoked (count > 0).
+        //  - If analyzersRan is false, no analyzers were available (count == 0).
+        var ran = data["analyzersRan"]!.Value<bool>();
+        var count = data["analyzerCount"]!.Value<int>();
+        if (ran) count.Should().BeGreaterThan(0, "analyzersRan=true requires count > 0");
+        else count.Should().Be(0, "analyzersRan=false requires count == 0");
     }
 
     [Fact]

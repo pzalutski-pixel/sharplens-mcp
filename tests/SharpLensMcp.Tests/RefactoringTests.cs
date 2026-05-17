@@ -122,22 +122,48 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data.ToString().Should().Contain("ComputePartial",
-            "extracted method preview must reference the new method name");
+        data["methodName"]?.Value<string>().Should().Be("ComputePartial");
+        // RefactoringTarget.Sum returns int and the selected slice produces a single
+        // `total` local that flows out — so the extracted method returns int via `total`.
+        data["returnType"]?.Value<string>().Should().Be("int");
+        data["returnVariable"]?.Value<string>().Should().Be("total");
+        data["signature"]?.Value<string>().Should()
+            .Contain("private int ComputePartial",
+                "the generated signature must declare the new private method named ComputePartial returning int");
+        data["extractedCode"]?.Value<string>().Should()
+            .Contain("private int ComputePartial",
+                "the extracted method body must open with the generated signature");
+        data["replacementCode"]?.Value<string>().Should()
+            .Be("var total = ComputePartial(a, b, c);",
+                "the call-site replacement must capture the returned `total` and forward Sum's parameters in order");
     }
 
     [Fact]
     public async Task GetMissingMembers_HandlesPositionWithNoIncompleteImpl()
     {
-        // Position inside RoslynService — a complete type with no missing members.
-        // Tool should succeed and return an empty (or absent) missingMembers list.
-        var result = await Service.GetMissingMembersAsync(RoslynServicePath, 50, 10);
+        // Position inside MatchesGlobPattern — a complete static helper in
+        // RoslynService.cs that doesn't implement any interface.
+        var lines = File.ReadAllLines(RoslynServicePath);
+        var matchLine = Array.FindIndex(lines, l => l.Contains("MatchesGlobPattern(string input"));
+        matchLine.Should().BeGreaterThan(0, "MatchesGlobPattern must exist in RoslynService.cs");
+
+        var result = await Service.GetMissingMembersAsync(RoslynServicePath, matchLine + 5, 10);
 
         AssertSuccess(result);
         var data = GetData(result);
         var missing = data["missingMembers"] as JArray;
-        // Either the field is omitted entirely or it's an empty array — both indicate "nothing missing".
-        (missing == null || missing.Count == 0).Should().BeTrue();
+        // The tool may omit the field or emit an empty array; both signal "nothing missing".
+        // Split the cases so a future schema change that drops one branch doesn't silently pass.
+        if (missing == null)
+        {
+            data["missingMembers"].Should().BeNull(
+                "the absence of the field is acceptable when the implementation has nothing to report");
+        }
+        else
+        {
+            missing.Count.Should().Be(0,
+                "a complete type must report zero missing members rather than a populated array");
+        }
     }
 
     [Fact]
@@ -149,18 +175,26 @@ public class RefactoringTests : RoslynServiceTestBase
 
         var symbol = symbols![0];
         var loc = symbol["location"]!;
-        var result = await Service.GetOutgoingCallsAsync(
-            loc["filePath"]!.Value<string>()!,
-            loc["line"]!.Value<int>() + 1,
-            loc["column"]!.Value<int>());
+        var file = loc["filePath"]!.Value<string>()!;
+        var methodLine = loc["line"]!.Value<int>();
+
+        // Position inside the method body by locating a known invocation line — the
+        // GetProjectCompilationAsync call inside the foreach. Read from the absolute
+        // RoslynServicePath because `file` is the solution-relative path returned by
+        // the tool and won't resolve against the test bin directory.
+        var lines = File.ReadAllLines(RoslynServicePath);
+        var callLine = Array.FindIndex(lines, methodLine, l => l.Contains("GetProjectCompilationAsync(project)"));
+        callLine.Should().BeGreaterThan(methodLine,
+            "the GetProjectCompilationAsync invocation must live inside GetHealthCheckAsync's body");
+
+        var result = await Service.GetOutgoingCallsAsync(file, callLine + 1, 20);
 
         AssertSuccess(result);
         var data = GetData(result);
         var calls = data["calls"] as JArray;
         calls.Should().NotBeNullOrEmpty();
-        // GetHealthCheckAsync calls GetProjectCompilationAsync per RoslynService.cs:491.
         calls!.Any(c => c["shortName"]?.Value<string>()?.EndsWith(".GetProjectCompilationAsync") == true)
-            .Should().BeTrue();
+            .Should().BeTrue("outgoing calls must include the GetProjectCompilationAsync invocation");
     }
 
     [Fact]
@@ -233,8 +267,13 @@ public class RefactoringTests : RoslynServiceTestBase
     [Fact]
     public async Task GetContainingMember_AtMethodBody_ReturnsExpectedMember()
     {
-        // Line 50 of RoslynService.cs is inside MatchesGlobPattern.
-        var result = await Service.GetContainingMemberAsync(RoslynServicePath, 50, 10);
+        // Dynamically locate the body of MatchesGlobPattern — its `var regexPattern = "^"`
+        // assignment line — so the test survives renames or insertions above it.
+        var lines = File.ReadAllLines(RoslynServicePath);
+        var bodyLine = Array.FindIndex(lines, l => l.Contains("var regexPattern = \"^\""));
+        bodyLine.Should().BeGreaterThan(0, "the regexPattern assignment inside MatchesGlobPattern must exist");
+
+        var result = await Service.GetContainingMemberAsync(RoslynServicePath, bodyLine + 1, 10);
 
         AssertSuccess(result);
         var data = GetData(result);

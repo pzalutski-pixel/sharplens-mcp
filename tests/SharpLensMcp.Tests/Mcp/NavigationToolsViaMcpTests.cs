@@ -73,13 +73,13 @@ public class NavigationToolsViaMcpTests : McpTestBase
         refs.Should().NotBeNullOrEmpty();
         data["totalReferences"]?.Value<int>().Should().BeGreaterOrEqualTo(2);
 
-        // Every reference must conform to the documented shape.
+        // Every reference must conform to the documented shape — filePath is a .cs
+        // file and kind is one of the documented classifier values.
+        var validKinds = new[] { "read", "write", "invocation", "cast", "typeof", "nameof", "attribute" };
         foreach (var r in refs!)
         {
             r["filePath"]?.Value<string>().Should().EndWith(".cs");
-            r["line"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
-            r["column"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
-            r["kind"]?.Value<string>().Should().NotBeNullOrEmpty();
+            r["kind"]?.Value<string>().Should().BeOneOf(validKinds);
         }
     }
 
@@ -528,12 +528,14 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetContainingMember_AtMatchesGlobPatternBody_ReturnsThatMethodName()
     {
-        // Find MatchesGlobPattern's body dynamically — the line number shifts with edits.
+        // Resolve a position that's deterministically inside MatchesGlobPattern's
+        // body: find the line containing the literal `var regexPattern = "^"` that
+        // sits in the method body, then put the cursor on that line. This avoids
+        // the +N magic offset which breaks when the method's signature wraps.
         var lines = File.ReadAllLines(Fixture.RoslynServicePath);
-        var methodLine = Array.FindIndex(lines, l => l.Contains("MatchesGlobPattern"));
-        methodLine.Should().BeGreaterThan(-1);
-        // Cursor in the body, a few lines below the signature.
-        var bodyLine = methodLine + 4;
+        var bodyLine = Array.FindIndex(lines, l => l.Contains("var regexPattern = \"^\""));
+        bodyLine.Should().BeGreaterThan(-1,
+            "MatchesGlobPattern's body contains the regexPattern initialization");
 
         var data = await CallAndGetDataAsync("roslyn:get_containing_member", new
         {
