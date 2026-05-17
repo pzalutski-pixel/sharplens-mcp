@@ -263,7 +263,7 @@ Much faster than load_solution - only updates documents, doesn't re-parse projec
             (object)new
             {
                 name = "roslyn:find_references",
-                description = "Find all references to a symbol across the entire solution. Returns file paths, line numbers, and code context for each reference. IMPORTANT: Uses ZERO-BASED coordinates (editor line 10 = pass line 9).",
+                description = "Find all references to a symbol across the entire solution. Returns file paths, line numbers, code context, and a `kind` for each reference: write (assignment LHS, ++/--, ref/out arg), invocation (call target), cast (cast target type), typeof, nameof, attribute, or read. IMPORTANT: Uses ZERO-BASED coordinates (editor line 10 = pass line 9).",
                 inputSchema = new
                 {
                     type = "object",
@@ -272,7 +272,8 @@ Much faster than load_solution - only updates documents, doesn't re-parse projec
                         filePath = new { type = "string", description = "Absolute path to source file containing the symbol" },
                         line = new { type = "integer", description = "Zero-based line number (editor line - 1)" },
                         column = new { type = "integer", description = "Zero-based column number (editor column - 1)" },
-                        maxResults = new { type = "integer", description = "Maximum number of references to return (default: 100). Results are truncated with a hint if limit is exceeded." }
+                        maxResults = new { type = "integer", description = "Maximum number of references to return (default: 100). Results are truncated with a hint if limit is exceeded." },
+                        kind = new { type = "string", description = "Optional kind filter (case-insensitive). One of: write, invocation, cast, typeof, nameof, attribute, read. When set, the response includes totalReferences (unfiltered) and totalReferencesAfterFilter so callers see both numbers." }
                     },
                     required = new[] { "filePath", "line", "column" }
                 }
@@ -363,7 +364,7 @@ FILTERS: All specified filters are combined with AND logic. Omit a filter to ski
             (object)new
             {
                 name = "roslyn:get_diagnostics",
-                description = "Get compiler errors, warnings, and info messages for a file or entire project. Returns: list of diagnostics with id, message, severity, and location. Use before committing to catch issues.",
+                description = "Get compiler errors, warnings, info messages, AND configured analyzer findings (StyleCop, Roslynator, NetAnalyzers, custom analyzers; editorconfig-resolved severities) for a file or project. Use before committing - this matches what CI will fail on. Response includes analyzersRan and analyzerCount so callers know whether analyzers contributed.",
                 inputSchema = new
                 {
                     type = "object",
@@ -372,7 +373,8 @@ FILTERS: All specified filters are combined with AND logic. Omit a filter to ski
                         filePath = new { type = "string", description = "Optional: path to specific file, omit for all files" },
                         projectPath = new { type = "string", description = "Optional: path to specific project" },
                         severity = new { type = "string", description = "Optional: filter by severity (Error, Warning, Info)" },
-                        includeHidden = new { type = "boolean", description = "Include hidden diagnostics (default: false)" }
+                        includeHidden = new { type = "boolean", description = "Include hidden diagnostics (default: false)" },
+                        runAnalyzers = new { type = "boolean", description = "Run configured DiagnosticAnalyzers in addition to the compiler (default: true). Set false for a fast compiler-only pass when speed matters; otherwise leave true so output matches CI build behavior." }
                     }
                 }
             },
@@ -1419,6 +1421,91 @@ Use get_source_generators first to discover available generated files.",
                     },
                     required = new[] { "projectName", "generatedFileName" }
                 }
+            },
+            (object)new
+            {
+                name = "roslyn:get_project_health",
+                description = "Composite audit dashboard for one project: aggregates diagnostics (with analyzers), unused code, god-object candidates, and untested public surface. Returns counts + top-N hotspots per dimension. One call replaces 4+ separate tool calls for a project audit overview.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        projectName = new { type = "string", description = "Project to audit. Required." },
+                        includeAnalyzers = new { type = "boolean", description = "Run configured DiagnosticAnalyzers in addition to compiler diagnostics (default: true)." },
+                        topN = new { type = "integer", description = "Hotspots per dimension (default: 5)." }
+                    },
+                    required = new[] { "projectName" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:find_god_objects",
+                description = "Detect over-coupled types ('god objects'). For each type computes efferent coupling (distinct types it depends on), afferent coupling (distinct types that depend on it), and member count; reports types meeting both threshold filters, scored as efferent*0.4 + members*0.4 + afferent*0.2. AUDIT-TIME tool — O(types*references); don't call in tight agent loops.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        projectName = new { type = "string", description = "Limit scan to one project (default: scan all projects)" },
+                        minEfferentCoupling = new { type = "integer", description = "Minimum outbound type dependencies to qualify (default: 20)" },
+                        minMembers = new { type = "integer", description = "Minimum member count to qualify (default: 20)" },
+                        maxResults = new { type = "integer", description = "Cap on candidates returned (default: 20). totalCount reflects unbounded match count." }
+                    }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:find_untested_code",
+                description = "Find public/internal surface in a project that no test method (xUnit [Fact]/[Theory], NUnit [Test]/[TestCase], MSTest [TestMethod]) transitively reaches. Sorted by cyclomatic complexity so the riskiest untested code is reported first. Audit-time tool; runs solution-wide BFS.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        projectName = new { type = "string", description = "Project to audit (default: first project in solution)" },
+                        includeProperties = new { type = "boolean", description = "Include properties (default: true)" },
+                        includeInternal = new { type = "boolean", description = "Include internal members (default: false; only public)" },
+                        maxResults = new { type = "integer", description = "Cap on reported items (default: 50). totalCount reflects the true unbounded count." }
+                    }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:get_call_graph",
+                description = "Multi-hop transitive call graph (callers, callees, or both) from a method. Replaces N round-trips of find_callers/get_outgoing_calls when tracing impact or understanding a subsystem. Returns nodes + edges (not a nested tree, to handle diamond shapes), with cycle detection and a mandatory maxDepth bound. IMPORTANT: Uses ZERO-BASED coordinates.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        filePath = new { type = "string", description = "File containing the root method" },
+                        line = new { type = "integer", description = "Zero-based line of the method declaration or invocation" },
+                        column = new { type = "integer", description = "Zero-based column" },
+                        direction = new { type = "string", description = "'callees' (default), 'callers', or 'both'" },
+                        maxDepth = new { type = "integer", description = "Max BFS depth, 1-10 (default: 3). Required bound; depths above 10 explode on connected graphs." },
+                        maxNodes = new { type = "integer", description = "Max total nodes (default: 100). Sets truncatedByNodes when hit." }
+                    },
+                    required = new[] { "filePath", "line", "column" }
+                }
+            },
+            (object)new
+            {
+                name = "roslyn:get_external_type_info",
+                description = "Inspect types from external assemblies (NuGet packages, BCL, closed-source) the solution references. Returns members, signatures, and XML docs for types whose source isn't in the solution. Eliminates the need for agents to guess at dependency APIs.",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        typeName = new { type = "string", description = "Fully-qualified type name. Use backtick-arity for generics, e.g. 'System.Collections.Generic.List`1'." },
+                        assemblyName = new { type = "string", description = "Optional: restrict resolution to a specific assembly when the type name is ambiguous." },
+                        includeInherited = new { type = "boolean", description = "Include members from base types (default: true). Stops before System.Object." },
+                        includeXmlDocs = new { type = "boolean", description = "Include XML doc summaries when available (default: true)." },
+                        maxMembers = new { type = "integer", description = "Cap on member entries (default: 200). totalCount reflects the unbounded member count." }
+                    },
+                    required = new[] { "typeName" }
+                }
             }
         };
 
@@ -1463,7 +1550,8 @@ Use get_source_generators first to discover available generated files.",
                     p.Required<string>("filePath"),
                     p.Required<int>("line"),
                     p.Required<int>("column"),
-                    p.OptionalStruct<int>("maxResults")),
+                    p.OptionalStruct<int>("maxResults"),
+                    p.Optional<string>("kind")),
 
                 "roslyn:find_implementations" => await _roslynService.FindImplementationsAsync(
                     p.Required<string>("filePath"),
@@ -1501,7 +1589,8 @@ Use get_source_generators first to discover available generated files.",
                     p.Optional<string>("filePath"),
                     p.Optional<string>("projectPath"),
                     p.Optional<string>("severity"),
-                    p.Optional("includeHidden", false)),
+                    p.Optional("includeHidden", false),
+                    p.Optional("runAnalyzers", true)),
 
                 "roslyn:get_code_fixes" => await _roslynService.GetCodeFixesAsync(
                     p.Required<string>("filePath"),
@@ -1789,6 +1878,38 @@ Use get_source_generators first to discover available generated files.",
                 "roslyn:get_generated_code" => await _roslynService.GetGeneratedCodeAsync(
                     p.Required<string>("projectName"),
                     p.Required<string>("generatedFileName")),
+
+                "roslyn:get_external_type_info" => await _roslynService.GetExternalTypeInfoAsync(
+                    p.Required<string>("typeName"),
+                    p.Optional<string>("assemblyName"),
+                    p.Optional("includeInherited", true),
+                    p.Optional("includeXmlDocs", true),
+                    p.Optional("maxMembers", 200)),
+
+                "roslyn:get_call_graph" => await _roslynService.GetCallGraphAsync(
+                    p.Required<string>("filePath"),
+                    p.Required<int>("line"),
+                    p.Required<int>("column"),
+                    p.Optional("direction", "callees"),
+                    p.Optional("maxDepth", 3),
+                    p.Optional("maxNodes", 100)),
+
+                "roslyn:find_untested_code" => await _roslynService.FindUntestedCodeAsync(
+                    p.Optional<string>("projectName"),
+                    p.Optional("includeProperties", true),
+                    p.Optional("includeInternal", false),
+                    p.Optional("maxResults", 50)),
+
+                "roslyn:find_god_objects" => await _roslynService.FindGodObjectsAsync(
+                    p.Optional<string>("projectName"),
+                    p.Optional("minEfferentCoupling", 20),
+                    p.Optional("minMembers", 20),
+                    p.Optional("maxResults", 20)),
+
+                "roslyn:get_project_health" => await _roslynService.GetProjectHealthAsync(
+                    p.Required<string>("projectName"),
+                    p.Optional("includeAnalyzers", true),
+                    p.Optional("topN", 5)),
 
                 _ => throw new JsonRpcInvalidParamsException($"Unknown tool: {name}")
             };

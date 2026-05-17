@@ -143,15 +143,13 @@ public partial class RoslynService
         {
             var result = await GetTypeMembersAsync(typeName, includeInherited, memberKind, verbosity, maxResultsPerType);
 
-            // Check if result was successful
-            var resultDict = result as dynamic;
-            if (resultDict?.success == true)
+            if (IsSuccessResponse(result))
             {
                 results.Add(new
                 {
                     typeName,
                     success = true,
-                    data = resultDict.data
+                    data = GetResponseData(result)
                 });
             }
             else
@@ -160,7 +158,7 @@ public partial class RoslynService
                 {
                     typeName,
                     success = false,
-                    error = resultDict?.error
+                    error = GetResponseError(result)
                 });
             }
         }
@@ -601,11 +599,15 @@ public partial class RoslynService
             );
         }
 
-        // Walk up the inheritance chain
+        // Walk up the inheritance chain. Track the first base name in a typed local
+        // so the suggestedNextTools formatter doesn't have to reach back through the
+        // anonymous-typed list with dynamic dispatch.
         var baseTypes = new List<object>();
+        string? firstBaseName = null;
         var currentBase = type.BaseType;
         while (currentBase != null && currentBase.SpecialType != SpecialType.System_Object)
         {
+            firstBaseName ??= currentBase.Name;
             baseTypes.Add(new
             {
                 name = currentBase.Name,
@@ -640,7 +642,7 @@ public partial class RoslynService
             {
                 $"get_type_members to see members of {type.Name}",
                 $"get_derived_types to find classes inheriting from {type.Name}",
-                baseTypes.Count > 0 ? $"get_type_members for {((dynamic)baseTypes[0]).name} to see inherited members" : null
+                firstBaseName != null ? $"get_type_members for {firstBaseName} to see inherited members" : null
             }.Where(s => s != null).ToArray()!
         );
     }

@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/sharplens-mcp.svg)](https://www.npmjs.com/package/sharplens-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Model Context Protocol (MCP) server providing **62 AI-optimized tools** for .NET/C# semantic code analysis, navigation, refactoring, and code generation using Microsoft Roslyn.
+A Model Context Protocol (MCP) server providing **67 AI-optimized tools** for .NET/C# semantic code analysis, navigation, refactoring, and code generation using Microsoft Roslyn.
 
 Built for AI coding agents - provides compiler-accurate code understanding that AI cannot infer from reading source files alone.
 
@@ -142,7 +142,7 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 
 ## Features
 
-- **62 Semantic Analysis Tools** - Navigation, refactoring, code generation, diagnostics, discovery
+- **67 Semantic Analysis Tools** - Navigation, refactoring, code generation, diagnostics, discovery, audit/quality
 - **AI-Optimized Descriptions** - Clear USAGE/OUTPUT/WORKFLOW patterns
 - **Structured Responses** - Consistent `success/error/data` format with `suggestedNextTools`
 - **Zero-Based Coordinates** - Clear warnings to prevent off-by-one errors
@@ -151,14 +151,15 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 
 ## Tool Categories
 
-### Navigation & Discovery (17 tools)
+### Navigation & Discovery (19 tools)
 | Tool | Description |
 |------|-------------|
 | `get_symbol_info` | Semantic info at position |
 | `go_to_definition` | Jump to symbol definition |
-| `find_references` | All references across solution |
+| `find_references` | All references; each classified read/write/invocation/cast/typeof/nameof/attribute; optional `kind` filter |
 | `find_implementations` | Interface/abstract implementations |
 | `find_callers` | Impact analysis - who calls this? |
+| `get_call_graph` | Multi-hop callers/callees graph with depth bound + cycle detection |
 | `get_type_hierarchy` | Inheritance chain |
 | `search_symbols` | Glob pattern search (`*Handler`, `Get*`) |
 | `semantic_query` | Multi-filter search (async, public, etc.) |
@@ -171,11 +172,12 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 | `get_containing_member` | Enclosing symbol at position |
 | `get_method_overloads` | All overloads of a method |
 | `find_attribute_usages` | Find types/members by attribute |
+| `get_external_type_info` | Inspect NuGet/BCL/external assembly types — members + XML docs |
 
 ### Analysis (11 tools)
 | Tool | Description |
 |------|-------------|
-| `get_diagnostics` | Compiler errors/warnings |
+| `get_diagnostics` | Compiler errors/warnings + configured analyzer findings (StyleCop, Roslynator, NetAnalyzers); matches CI |
 | `analyze_data_flow` | Variable assignments and usage |
 | `analyze_control_flow` | Branching/reachability |
 | `analyze_change_impact` | What breaks if changed? |
@@ -211,7 +213,7 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 | `add_null_checks` | Generate ArgumentNullException guards |
 | `generate_equality_members` | Equals/GetHashCode/operators |
 
-### Compound Tools (6 tools)
+### Compound Tools (7 tools)
 | Tool | Description |
 |------|-------------|
 | `get_type_overview` | Full type info in one call |
@@ -220,6 +222,13 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 | `get_method_source` | Source code by name |
 | `get_method_source_batch` | Multiple method sources in one call |
 | `get_instantiation_options` | How to create a type |
+| `get_project_health` | Composite audit dashboard: diagnostics + unused + coupling + coverage per project |
+
+### Audit & Quality (2 tools)
+| Tool | Description |
+|------|-------------|
+| `find_god_objects` | Detect over-coupled types via efferent + afferent coupling + member-count thresholds |
+| `find_untested_code` | Find public surface not reached by any [Fact]/[Theory]/[Test]/[TestMethod] |
 
 ### Discovery (2 tools)
 | Tool | Description |
@@ -262,7 +271,7 @@ For MCP clients other than Claude Code, add to your configuration:
 ## Usage
 
 1. **Load a solution**: Call `roslyn:load_solution` with path to `.sln` or `.slnx` file (or set `DOTNET_SOLUTION_PATH`)
-2. **Analyze code**: Use any of the 57 tools for navigation, analysis, refactoring
+2. **Analyze code**: Use any of the 67 tools for navigation, analysis, refactoring, audit
 3. **Refactor safely**: Preview changes before applying with `preview: true`
 
 ## Architecture
@@ -273,7 +282,7 @@ MCP Client (AI Agent)
         v
    SharpLensMcp
    - Protocol handling
-   - 57 AI-optimized tools
+   - 67 AI-optimized tools
         |
         v
 Microsoft.CodeAnalysis (Roslyn)
@@ -318,8 +327,10 @@ dotnet publish -c Release -o ./publish
 
 | File | Purpose |
 |------|---------|
-| `src/RoslynService.cs` | Tool implementations (57 methods) |
-| `src/McpServer.cs` | MCP protocol, tool definitions, routing |
+| `src/RoslynService.cs` + `src/RoslynService.*.cs` partials | Tool implementations split by concern: Navigation, Analysis, Refactoring, Inspection, Validation, TypeDiscovery, Discovery, ExternalApi, Quality, CodeActions, CodeGeneration, Compound |
+| `src/McpServer.cs` | MCP protocol, tool definitions, dispatcher (uses typed `JsonRpcParameters` helper) |
+| `src/JsonRpcParameters.cs` + `JsonRpcInvalidParamsException.cs` | Typed JSON-RPC argument accessors and the `-32602 Invalid params` exception they raise |
+| `src/QualityAuditData.cs`, `ConstructorMember.cs`, `SignatureChange.cs` | Typed records used by the audit composite, constructor generator, and signature-change parser |
 
 ## License
 

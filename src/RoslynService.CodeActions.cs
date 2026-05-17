@@ -340,8 +340,7 @@ public partial class RoslynService
             includeRefactorings: true);
 
         // Check if we got actions
-        var resultDict = actionsResult as dynamic;
-        if (resultDict?.success != true)
+        if (!IsSuccessResponse(actionsResult))
         {
             return actionsResult;
         }
@@ -362,8 +361,7 @@ public partial class RoslynService
                 filePath, line, column, title,
                 preview: preview);
 
-            var dict = result as dynamic;
-            if (dict?.success == true)
+            if (IsSuccessResponse(result))
             {
                 return result;
             }
@@ -400,8 +398,7 @@ public partial class RoslynService
                 filePath, line, column, title,
                 preview: preview);
 
-            var dict = result as dynamic;
-            if (dict?.success == true)
+            if (IsSuccessResponse(result))
             {
                 return result;
             }
@@ -437,8 +434,7 @@ public partial class RoslynService
                 filePath, line, column, title,
                 preview: preview);
 
-            var dict = result as dynamic;
-            if (dict?.success == true)
+            if (IsSuccessResponse(result))
             {
                 return result;
             }
@@ -449,8 +445,7 @@ public partial class RoslynService
             filePath, line, column, "Inline",
             preview: preview);
 
-        var inlineDict = inlineResult as dynamic;
-        if (inlineDict?.success == true)
+        if (IsSuccessResponse(inlineResult))
         {
             return inlineResult;
         }
@@ -489,8 +484,7 @@ public partial class RoslynService
                 endLine, endColumn,
                 preview: preview);
 
-            var dict = result as dynamic;
-            if (dict?.success == true)
+            if (IsSuccessResponse(result))
             {
                 return result;
             }
@@ -502,8 +496,7 @@ public partial class RoslynService
             endLine, endColumn,
             preview: preview);
 
-        var extractDict = extractResult as dynamic;
-        if (extractDict?.success == true)
+        if (IsSuccessResponse(extractResult))
         {
             return extractResult;
         }

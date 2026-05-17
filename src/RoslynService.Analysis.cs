@@ -4,111 +4,58 @@ using Microsoft.CodeAnalysis.CodeFixes;
 using Microsoft.CodeAnalysis.CodeRefactorings;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
+using System.Collections.Immutable;
 
 namespace SharpLensMcp;
 
 public partial class RoslynService
 {
-    public async Task<object> GetDiagnosticsAsync(string? filePath, string? projectPath, string? severity, bool includeHidden)
+    public async Task<object> GetDiagnosticsAsync(
+        string? filePath,
+        string? projectPath,
+        string? severity,
+        bool includeHidden,
+        bool runAnalyzers = true)
     {
         EnsureSolutionLoaded();
 
-        var allDiagnostics = new List<Diagnostic>();
-
-        if (!string.IsNullOrEmpty(filePath))
+        DiagnosticsData data;
+        try
         {
-            // Get diagnostics for specific file
-            Document document;
-            try
-            {
-                document = await GetDocumentAsync(filePath);
-            }
-            catch (FileNotFoundException)
-            {
-                return CreateErrorResponse(
-                    ErrorCodes.FileNotInSolution,
-                    $"File not found in solution: {filePath}",
-                    hint: "Check the file path or reload the solution",
-                    context: new { filePath }
-                );
-            }
-            var semanticModel = await document.GetSemanticModelAsync();
-            if (semanticModel != null)
-            {
-                allDiagnostics.AddRange(semanticModel.GetDiagnostics());
-            }
+            data = await GetDiagnosticsDataAsync(filePath, projectPath, severity, includeHidden, runAnalyzers);
         }
-        else if (!string.IsNullOrEmpty(projectPath))
+        catch (FileNotFoundException)
         {
-            // Get diagnostics for specific project
-            var project = _solution!.Projects.FirstOrDefault(p => p.FilePath == projectPath);
-            if (project != null)
-            {
-                var compilation = await GetProjectCompilationAsync(project);
-                if (compilation != null)
-                {
-                    allDiagnostics.AddRange(compilation.GetDiagnostics());
-                }
-            }
-        }
-        else
-        {
-            // Get diagnostics for entire solution
-            foreach (var project in _solution!.Projects)
-            {
-                var compilation = await GetProjectCompilationAsync(project);
-                if (compilation != null)
-                {
-                    allDiagnostics.AddRange(compilation.GetDiagnostics());
-                }
-            }
+            return CreateErrorResponse(
+                ErrorCodes.FileNotInSolution,
+                $"File not found in solution: {filePath}",
+                hint: "Check the file path or reload the solution",
+                context: new { filePath }
+            );
         }
 
-        // Filter by severity
-        if (!string.IsNullOrEmpty(severity))
+        var diagnosticView = data.Diagnostics.Select(d => new
         {
-            var severityEnum = Enum.Parse<DiagnosticSeverity>(severity, ignoreCase: true);
-            allDiagnostics = allDiagnostics.Where(d => d.Severity == severityEnum).ToList();
-        }
-
-        // Filter hidden
-        if (!includeHidden)
-        {
-            allDiagnostics = allDiagnostics.Where(d => d.Severity != DiagnosticSeverity.Hidden).ToList();
-        }
-
-        // Limit results
-        allDiagnostics = allDiagnostics.Take(_maxDiagnostics).ToList();
-
-        var diagnosticList = allDiagnostics.Select(d =>
-        {
-            var lineSpan = d.Location.GetLineSpan();
-            return new
-            {
-                id = d.Id,
-                severity = d.Severity.ToString(),
-                message = d.GetMessage(),
-                filePath = FormatPath(lineSpan.Path),
-                line = lineSpan.StartLinePosition.Line,
-                column = lineSpan.StartLinePosition.Character,
-                endLine = lineSpan.EndLinePosition.Line,
-                endColumn = lineSpan.EndLinePosition.Character
-            };
+            id = d.Id,
+            severity = d.Severity,
+            message = d.Message,
+            filePath = d.FilePath,
+            line = d.Line
         }).ToList();
-
-        var errorCount = diagnosticList.Count(d => d.severity == "Error");
-        var warningCount = diagnosticList.Count(d => d.severity == "Warning");
 
         return CreateSuccessResponse(
             data: new
             {
-                errorCount,
-                warningCount,
-                diagnostics = diagnosticList
+                errorCount = data.ErrorCount,
+                warningCount = data.WarningCount,
+                analyzersRan = data.AnalyzersRan,
+                analyzerCount = data.AnalyzerCount,
+                diagnostics = diagnosticView
             },
-            suggestedNextTools: errorCount > 0 || warningCount > 0
+            suggestedNextTools: data.ErrorCount > 0 || data.WarningCount > 0
                 ? new[]
                 {
                     "get_code_fixes for a diagnostic to see available fixes",
@@ -118,9 +65,149 @@ public partial class RoslynService
                 {
                     "No diagnostics found - solution is healthy"
                 },
-            totalCount: diagnosticList.Count,
-            returnedCount: diagnosticList.Count
+            totalCount: data.TotalCount,
+            returnedCount: data.Diagnostics.Count
         );
+    }
+
+    // (GetDiagnosticsDataAsync implementation below.)
+
+    // Typed-data variant. GetProjectHealthAsync calls this directly so it doesn't
+    // have to reflect over the anonymous-typed public response. Throws
+    // FileNotFoundException for unknown filePath; otherwise returns DiagnosticsData.
+    internal async Task<DiagnosticsData> GetDiagnosticsDataAsync(
+        string? filePath,
+        string? projectPath,
+        string? severity,
+        bool includeHidden,
+        bool runAnalyzers)
+    {
+        var allDiagnostics = new List<Diagnostic>();
+        var analyzersRanOnAtLeastOneProject = false;
+        var analyzersInvoked = 0;
+        var projectsToAnalyze = new List<Project>();
+
+        if (!string.IsNullOrEmpty(filePath))
+        {
+            var document = await GetDocumentAsync(filePath);
+            var semanticModel = await document.GetSemanticModelAsync();
+            if (semanticModel != null)
+            {
+                allDiagnostics.AddRange(semanticModel.GetDiagnostics());
+            }
+            projectsToAnalyze.Add(document.Project);
+        }
+        else if (!string.IsNullOrEmpty(projectPath))
+        {
+            var project = _solution!.Projects.FirstOrDefault(p => p.FilePath == projectPath);
+            if (project != null)
+            {
+                var compilation = await GetProjectCompilationAsync(project);
+                if (compilation != null)
+                {
+                    allDiagnostics.AddRange(compilation.GetDiagnostics());
+                }
+                projectsToAnalyze.Add(project);
+            }
+        }
+        else
+        {
+            foreach (var project in _solution!.Projects)
+            {
+                var compilation = await GetProjectCompilationAsync(project);
+                if (compilation != null)
+                {
+                    allDiagnostics.AddRange(compilation.GetDiagnostics());
+                }
+                projectsToAnalyze.Add(project);
+            }
+        }
+
+        if (runAnalyzers)
+        {
+            foreach (var project in projectsToAnalyze)
+            {
+                var analyzers = project.AnalyzerReferences
+                    .SelectMany(ar => ar.GetAnalyzers(LanguageNames.CSharp))
+                    .ToImmutableArray();
+                if (analyzers.IsEmpty) continue;
+
+                var compilation = await GetProjectCompilationAsync(project);
+                if (compilation == null) continue;
+
+                var withAnalyzers = compilation.WithAnalyzers(
+                    analyzers,
+                    new AnalyzerOptions(
+                        project.AnalyzerOptions.AdditionalFiles,
+                        project.AnalyzerOptions.AnalyzerConfigOptionsProvider));
+
+                try
+                {
+                    var analyzerDiagnostics = await withAnalyzers.GetAllDiagnosticsAsync();
+                    if (!string.IsNullOrEmpty(filePath))
+                    {
+                        var doc = TryFindDocument(filePath);
+                        if (doc?.FilePath != null)
+                        {
+                            analyzerDiagnostics = analyzerDiagnostics
+                                .Where(d => string.Equals(
+                                    Path.GetFullPath(d.Location.GetLineSpan().Path ?? ""),
+                                    Path.GetFullPath(doc.FilePath),
+                                    PathComparison))
+                                .ToImmutableArray();
+                        }
+                    }
+                    allDiagnostics.AddRange(analyzerDiagnostics);
+                    analyzersRanOnAtLeastOneProject = true;
+                    analyzersInvoked += analyzers.Length;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[Warning] Analyzer execution failed for '{project.Name}': {ex.Message}");
+                }
+            }
+        }
+
+        allDiagnostics = allDiagnostics
+            .GroupBy(d => (d.Id, d.Location.SourceSpan, d.GetMessage()))
+            .Select(g => g.First())
+            .ToList();
+
+        if (!string.IsNullOrEmpty(severity))
+        {
+            var severityEnum = Enum.Parse<DiagnosticSeverity>(severity, ignoreCase: true);
+            allDiagnostics = allDiagnostics.Where(d => d.Severity == severityEnum).ToList();
+        }
+
+        if (!includeHidden)
+        {
+            allDiagnostics = allDiagnostics.Where(d => d.Severity != DiagnosticSeverity.Hidden).ToList();
+        }
+
+        var totalBeforeCap = allDiagnostics.Count;
+        var capped = allDiagnostics.Take(_maxDiagnostics).ToList();
+
+        var entries = capped.Select(d =>
+        {
+            var lineSpan = d.Location.GetLineSpan();
+            return new DiagnosticEntry(
+                d.Id,
+                d.Severity.ToString(),
+                d.GetMessage(),
+                FormatPath(lineSpan.Path),
+                lineSpan.StartLinePosition.Line);
+        }).ToList();
+
+        var errorCount = entries.Count(e => e.Severity == "Error");
+        var warningCount = entries.Count(e => e.Severity == "Warning");
+
+        return new DiagnosticsData(
+            ErrorCount: errorCount,
+            WarningCount: warningCount,
+            AnalyzerCount: analyzersInvoked,
+            AnalyzersRan: analyzersRanOnAtLeastOneProject,
+            TotalCount: totalBeforeCap,
+            Diagnostics: entries);
     }
 
     public async Task<object> GetCodeFixesAsync(string filePath, string diagnosticId, int line, int column)

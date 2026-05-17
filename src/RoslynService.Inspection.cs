@@ -396,26 +396,67 @@ public partial class RoslynService
         int? maxResults = null)
     {
         EnsureSolutionLoaded();
+        var data = await FindUnusedCodeDataAsyncCore(projectName, includePrivate, includeInternal, symbolKindFilter, maxResults ?? 50);
 
-        var unusedSymbols = new List<object>();
-        var maxResultsToReturn = maxResults ?? 50; // Default to 50 to prevent huge outputs
+        var countByKind = data.Symbols
+            .GroupBy(s => s.Kind)
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        return CreateSuccessResponse(
+            data: new
+            {
+                projectName = projectName ?? "All projects",
+                countByKind,
+                unusedSymbols = data.Symbols.Select(s => new
+                {
+                    name = s.Name,
+                    fullyQualifiedName = s.FullName,
+                    kind = s.Kind,
+                    accessibility = s.Accessibility,
+                    containingType = s.ContainingType,
+                    filePath = s.FilePath,
+                    line = s.Line,
+                    column = s.Column
+                }).ToList()
+            },
+            suggestedNextTools: data.Symbols.Count > 0
+                ? new[] { "find_references to verify symbol is truly unused", "rename_symbol or delete unused code" }
+                : new[] { "No unused code found - codebase is clean" },
+            totalCount: data.TotalCount,
+            returnedCount: data.Symbols.Count
+        );
+    }
+
+    // Internal typed-data variant used by GetProjectHealthAsync.
+    internal Task<UnusedCodeData> FindUnusedCodeDataAsync(
+        string? projectName,
+        bool includePrivate,
+        bool includeInternal,
+        string? symbolKindFilter,
+        int maxResults) => FindUnusedCodeDataAsyncCore(projectName, includePrivate, includeInternal, symbolKindFilter, maxResults);
+
+    private async Task<UnusedCodeData> FindUnusedCodeDataAsyncCore(
+        string? projectName,
+        bool includePrivate,
+        bool includeInternal,
+        string? symbolKindFilter,
+        int maxResults)
+    {
+        var unusedSymbols = new List<UnusedSymbolEntry>();
+        var maxResultsToReturn = maxResults;
 
         var projectsToAnalyze = string.IsNullOrEmpty(projectName)
             ? _solution!.Projects
             : _solution!.Projects.Where(p => p.Name == projectName);
 
-        // Track counts by kind for summary
-        var countByKind = new Dictionary<string, int>();
-
         foreach (var project in projectsToAnalyze)
         {
             if (unusedSymbols.Count >= maxResultsToReturn)
-                break; // Stop analyzing if we hit the limit
+                break;
 
             var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
 
-            // Check if we should analyze types
             var shouldAnalyzeTypes = string.IsNullOrEmpty(symbolKindFilter) ||
                                      symbolKindFilter.Equals("Class", StringComparison.OrdinalIgnoreCase) ||
                                      symbolKindFilter.Equals("Interface", StringComparison.OrdinalIgnoreCase) ||
@@ -482,27 +523,21 @@ public partial class RoslynService
                         }
                     }
 
-                    // If no references to type AND no references to any members, it's unused
-                    if (referenceCount <= 1 && !hasReferencedMembers) // 1 = just the declaration
+                    if (referenceCount <= 1 && !hasReferencedMembers)
                     {
                         var location = typeSymbol.Locations.FirstOrDefault(loc => loc.IsInSource);
                         if (location != null)
                         {
                             var lineSpan = location.GetLineSpan();
-                            var kind = GetTypeKindString(typeSymbol);
-
-                            countByKind[kind] = countByKind.GetValueOrDefault(kind) + 1;
-
-                            unusedSymbols.Add(new
-                            {
-                                name = typeSymbol.Name,
-                                fullyQualifiedName = typeSymbol.ToDisplayString(),
-                                kind,
-                                accessibility = typeSymbol.DeclaredAccessibility.ToString(),
-                                filePath = FormatPath(lineSpan.Path),
-                                line = lineSpan.StartLinePosition.Line,
-                                column = lineSpan.StartLinePosition.Character
-                            });
+                            unusedSymbols.Add(new UnusedSymbolEntry(
+                                Name: typeSymbol.Name,
+                                FullName: typeSymbol.ToDisplayString(),
+                                Kind: GetTypeKindString(typeSymbol),
+                                Accessibility: typeSymbol.DeclaredAccessibility.ToString(),
+                                ContainingType: null,
+                                FilePath: FormatPath(lineSpan.Path),
+                                Line: lineSpan.StartLinePosition.Line,
+                                Column: lineSpan.StartLinePosition.Character));
                         }
                     }
                 }
@@ -555,40 +590,22 @@ public partial class RoslynService
                         if (location != null)
                         {
                             var lineSpan = location.GetLineSpan();
-                            var kind = member.Kind.ToString();
-
-                            countByKind[kind] = countByKind.GetValueOrDefault(kind) + 1;
-
-                            unusedSymbols.Add(new
-                            {
-                                name = member.Name,
-                                fullyQualifiedName = member.ToDisplayString(),
-                                kind,
-                                accessibility = member.DeclaredAccessibility.ToString(),
-                                containingType = member.ContainingType?.ToDisplayString(),
-                                filePath = FormatPath(lineSpan.Path),
-                                line = lineSpan.StartLinePosition.Line,
-                                column = lineSpan.StartLinePosition.Character
-                            });
+                            unusedSymbols.Add(new UnusedSymbolEntry(
+                                Name: member.Name,
+                                FullName: member.ToDisplayString(),
+                                Kind: member.Kind.ToString(),
+                                Accessibility: member.DeclaredAccessibility.ToString(),
+                                ContainingType: member.ContainingType?.ToDisplayString(),
+                                FilePath: FormatPath(lineSpan.Path),
+                                Line: lineSpan.StartLinePosition.Line,
+                                Column: lineSpan.StartLinePosition.Character));
                         }
                     }
                 }
             }
         }
 
-        return CreateSuccessResponse(
-            data: new
-            {
-                projectName = projectName ?? "All projects",
-                countByKind,
-                unusedSymbols = unusedSymbols.ToList()
-            },
-            suggestedNextTools: unusedSymbols.Count > 0
-                ? new[] { "find_references to verify symbol is truly unused", "rename_symbol or delete unused code" }
-                : new[] { "No unused code found - codebase is clean" },
-            totalCount: unusedSymbols.Count,
-            returnedCount: unusedSymbols.Count
-        );
+        return new UnusedCodeData(TotalCount: unusedSymbols.Count, Symbols: unusedSymbols);
     }
 
     public Task<object> GetDependencyGraphAsync(string? format)
@@ -1444,16 +1461,14 @@ public partial class RoslynService
 
             var result = await GetMethodSourceAsync(typeName, methodName, overloadIndex);
 
-            // Check if result was successful
-            var resultDict = result as dynamic;
-            if (resultDict?.success == true)
+            if (IsSuccessResponse(result))
             {
                 results.Add(new
                 {
                     typeName,
                     methodName,
                     success = true,
-                    data = resultDict.data
+                    data = GetResponseData(result)
                 });
             }
             else
@@ -1463,7 +1478,7 @@ public partial class RoslynService
                     typeName,
                     methodName,
                     success = false,
-                    error = resultDict?.error
+                    error = GetResponseError(result)
                 });
             }
         }
@@ -1485,5 +1500,273 @@ public partial class RoslynService
             totalCount: methods.Count,
             returnedCount: results.Count
         );
+    }
+
+    // Transitive call-graph: BFS up to maxDepth, capped at maxNodes, with cycle detection.
+    // Replaces the N-round-trip pattern of agents calling find_callers / get_outgoing_calls
+    // iteratively to trace an impact chain. Returns nodes + edges (streamable) rather than
+    // a nested tree (avoids exponential blowup on diamond-shaped graphs).
+    public async Task<object> GetCallGraphAsync(
+        string filePath,
+        int line,
+        int column,
+        string direction = "callees",
+        int maxDepth = 3,
+        int maxNodes = 100)
+    {
+        EnsureSolutionLoaded();
+
+        if (maxDepth <= 0 || maxDepth > 10)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                $"maxDepth must be between 1 and 10 (got {maxDepth})",
+                hint: "Depths above 10 explode for highly-connected codebases. Drill iteratively with smaller depths.",
+                context: new { maxDepth });
+        }
+
+        var dir = direction?.ToLowerInvariant() ?? "callees";
+        if (dir != "callees" && dir != "callers" && dir != "both")
+        {
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                $"direction must be 'callees', 'callers', or 'both' (got '{direction}')",
+                context: new { direction });
+        }
+
+        Document document;
+        try
+        {
+            document = await GetDocumentAsync(filePath);
+        }
+        catch (FileNotFoundException)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.FileNotInSolution,
+                $"File not found in solution: {filePath}",
+                hint: "Check the file path or reload the solution",
+                context: new { filePath });
+        }
+
+        var semanticModel = await document.GetSemanticModelAsync();
+        var syntaxTree = await document.GetSyntaxTreeAsync();
+        if (semanticModel == null || syntaxTree == null)
+        {
+            return CreateErrorResponse(ErrorCodes.AnalysisFailed, "Could not get semantic model/syntax tree", context: new { filePath });
+        }
+
+        var position = GetPosition(syntaxTree, line, column);
+        var token = syntaxTree.GetRoot().FindToken(position);
+        var node = token.Parent;
+        if (node == null)
+        {
+            return CreateErrorResponse(ErrorCodes.SymbolNotFound, "No symbol found at position", context: new { filePath, line, column });
+        }
+
+        var symbolInfo = semanticModel.GetSymbolInfo(node);
+        var rootSymbol = (symbolInfo.Symbol ?? semanticModel.GetDeclaredSymbol(node)) as IMethodSymbol;
+        if (rootSymbol == null)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.NotAMethod,
+                "Not a method symbol",
+                hint: "Position the cursor on a method declaration or call site.",
+                context: new { filePath, line, column });
+        }
+
+        // Node table keyed by symbol; assign sequential ids for the wire format.
+        var nodeIds = new Dictionary<IMethodSymbol, int>(SymbolEqualityComparer.Default);
+        var nodes = new List<object>();
+        var edges = new List<object>();
+        // Typed adjacency for cycle-detection BFS — avoids dynamic dispatch through
+        // anonymous-typed edge records (which was both slow and fragile).
+        var adjacency = new Dictionary<int, List<int>>();
+        var cyclesDetected = new HashSet<string>(StringComparer.Ordinal);
+        var truncatedByDepth = false;
+        var truncatedByNodes = false;
+
+        int RegisterNode(IMethodSymbol sym, int depth)
+        {
+            if (nodeIds.TryGetValue(sym, out var existing)) return existing;
+            var id = nodes.Count;
+            nodeIds[sym] = id;
+            nodes.Add(new
+            {
+                id,
+                fullName = sym.ToDisplayString(),
+                kind = sym.MethodKind.ToString(),
+                location = GetSymbolLocation(sym),
+                depth
+            });
+            return id;
+        }
+
+        int rootId = RegisterNode(rootSymbol, 0);
+
+        var queue = new Queue<(IMethodSymbol sym, int depth)>();
+        queue.Enqueue((rootSymbol, 0));
+        var visited = new HashSet<IMethodSymbol>(SymbolEqualityComparer.Default) { rootSymbol };
+
+        while (queue.Count > 0)
+        {
+            if (nodes.Count >= maxNodes)
+            {
+                truncatedByNodes = true;
+                break;
+            }
+
+            var (current, depth) = queue.Dequeue();
+            if (depth >= maxDepth)
+            {
+                truncatedByDepth = true;
+                continue;
+            }
+
+            var currentId = nodeIds[current];
+
+            // Callees: walk the method body for invocations.
+            if (dir == "callees" || dir == "both")
+            {
+                var calleeSymbols = await CollectCalleesAsync(current);
+                foreach (var callee in calleeSymbols)
+                {
+                    if (visited.Contains(callee))
+                    {
+                        // Cycle: an edge that points back into something we've already processed.
+                        if (nodeIds.TryGetValue(callee, out var existingId))
+                        {
+                            AddEdge(edges, adjacency, currentId, existingId);
+                            if (SymbolEqualityComparer.Default.Equals(callee, current) ||
+                                IsAncestor(existingId, currentId, adjacency))
+                            {
+                                cyclesDetected.Add($"{current.ToDisplayString()} -> {callee.ToDisplayString()}");
+                            }
+                        }
+                        continue;
+                    }
+                    visited.Add(callee);
+                    if (nodes.Count >= maxNodes) { truncatedByNodes = true; break; }
+                    var calleeId = RegisterNode(callee, depth + 1);
+                    AddEdge(edges, adjacency, currentId, calleeId);
+                    queue.Enqueue((callee, depth + 1));
+                }
+            }
+
+            // Callers: SymbolFinder gives us call sites; map each to the calling method.
+            if (dir == "callers" || dir == "both")
+            {
+                var callers = await SymbolFinder.FindCallersAsync(current, _solution!);
+                foreach (var callerInfo in callers)
+                {
+                    if (callerInfo.CallingSymbol is not IMethodSymbol callerMethod) continue;
+                    if (visited.Contains(callerMethod))
+                    {
+                        if (nodeIds.TryGetValue(callerMethod, out var existingId))
+                        {
+                            AddEdge(edges, adjacency, existingId, currentId);
+                            if (SymbolEqualityComparer.Default.Equals(callerMethod, current))
+                            {
+                                cyclesDetected.Add($"{callerMethod.ToDisplayString()} -> {current.ToDisplayString()}");
+                            }
+                        }
+                        continue;
+                    }
+                    visited.Add(callerMethod);
+                    if (nodes.Count >= maxNodes) { truncatedByNodes = true; break; }
+                    var callerId = RegisterNode(callerMethod, depth + 1);
+                    AddEdge(edges, adjacency, callerId, currentId);
+                    queue.Enqueue((callerMethod, depth + 1));
+                }
+            }
+        }
+
+        return CreateSuccessResponse(
+            data: new
+            {
+                root = new
+                {
+                    id = rootId,
+                    fullName = rootSymbol.ToDisplayString(),
+                    kind = rootSymbol.MethodKind.ToString(),
+                    location = GetSymbolLocation(rootSymbol)
+                },
+                direction = dir,
+                maxDepth,
+                nodes,
+                edges,
+                truncatedByDepth,
+                truncatedByNodes,
+                cyclesDetected = cyclesDetected.ToList()
+            },
+            suggestedNextTools: new[]
+            {
+                "get_outgoing_calls or find_callers for single-hop detail at a specific node",
+                "analyze_change_impact for the impact of changing this method"
+            },
+            totalCount: nodes.Count,
+            returnedCount: nodes.Count);
+    }
+
+    // Walks the method's body collecting distinct method symbols it invokes.
+    // Excludes operator/conversion/property-accessor calls to keep the graph readable;
+    // callers can drill into properties via get_outgoing_calls if they need that.
+    private async Task<List<IMethodSymbol>> CollectCalleesAsync(IMethodSymbol method)
+    {
+        var result = new List<IMethodSymbol>();
+        foreach (var declRef in method.DeclaringSyntaxReferences)
+        {
+            var syntax = await declRef.GetSyntaxAsync();
+            var document = _solution!.GetDocument(declRef.SyntaxTree);
+            if (document == null) continue;
+            var semanticModel = await document.GetSemanticModelAsync();
+            if (semanticModel == null) continue;
+
+            var invocations = syntax.DescendantNodes().OfType<InvocationExpressionSyntax>();
+            foreach (var inv in invocations)
+            {
+                var calledSymbol = semanticModel.GetSymbolInfo(inv).Symbol as IMethodSymbol;
+                if (calledSymbol == null) continue;
+                if (calledSymbol.MethodKind != MethodKind.Ordinary
+                    && calledSymbol.MethodKind != MethodKind.LocalFunction) continue;
+                if (!result.Any(m => SymbolEqualityComparer.Default.Equals(m, calledSymbol)))
+                    result.Add(calledSymbol);
+            }
+        }
+        return result;
+    }
+
+    // Records the edge in both the wire-format list (for output) and the typed adjacency
+    // map (for in-flight cycle detection). Kept in sync at every edge addition.
+    private static void AddEdge(List<object> edges, Dictionary<int, List<int>> adjacency, int from, int to)
+    {
+        edges.Add(new { from, to, kind = "calls" });
+        if (!adjacency.TryGetValue(from, out var neighbors))
+        {
+            neighbors = new List<int>();
+            adjacency[from] = neighbors;
+        }
+        neighbors.Add(to);
+    }
+
+    // Detects whether `candidateId` is reachable from `targetId` via existing edges
+    // (in-flight graph). Used to record true cycles (A->B->A) rather than back-edges
+    // to siblings. Typed adjacency: O(V+E) BFS, no boxing.
+    private static bool IsAncestor(int candidateId, int targetId, Dictionary<int, List<int>> adjacency)
+    {
+        if (candidateId == targetId) return true;
+        var seen = new HashSet<int> { targetId };
+        var queue = new Queue<int>();
+        queue.Enqueue(targetId);
+        while (queue.Count > 0)
+        {
+            var cur = queue.Dequeue();
+            if (!adjacency.TryGetValue(cur, out var neighbors)) continue;
+            foreach (var to in neighbors)
+            {
+                if (to == candidateId) return true;
+                if (seen.Add(to)) queue.Enqueue(to);
+            }
+        }
+        return false;
     }
 }

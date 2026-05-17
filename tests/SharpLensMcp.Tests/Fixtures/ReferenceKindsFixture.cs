@@ -22,8 +22,14 @@ public class TrackedTarget
     {
         TrackedField = () => 7;       // write
         var value = TrackedField();    // invocation (and read of field)
-        var t = typeof(TrackedTarget); // typeof — not a reference to TrackedField
+        var t = typeof(TrackedTarget); // typeof reference to TrackedTarget type
         var read = TrackedField;       // read
+
+        // Cast reference to TrackedTarget (drives "cast" classification).
+        object boxed = this;
+        var unboxed = (TrackedTarget)boxed;
+        _ = unboxed;
+
         _ = value;
         _ = t;
         _ = read;

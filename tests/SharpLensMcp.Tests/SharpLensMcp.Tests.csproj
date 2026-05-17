@@ -25,6 +25,13 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\SharpLensMcp.csproj" />
+    <!-- Reference the test-analyzer project as a regular project ref (not as
+         an analyzer attached to the build). The test attaches it to AdhocWorkspaces
+         dynamically via AnalyzerImageReference. -->
+    <ProjectReference Include="..\SharpLensMcp.Tests.TestAnalyzers\SharpLensMcp.Tests.TestAnalyzers.csproj">
+      <ReferenceOutputAssembly>true</ReferenceOutputAssembly>
+      <OutputItemType>Content</OutputItemType>
+    </ProjectReference>
   </ItemGroup>
 
 </Project>

@@ -105,6 +105,26 @@ public partial class RoslynService
         };
     }
 
+    // Single typed boundary for reading back a tool-response object created by
+    // CreateSuccessResponse / CreateErrorResponse. Tool responses are anonymous
+    // typed (one shape for success: {success, data, meta}; one for error:
+    // {success, error}) — the anonymous types can't be named, so callers
+    // previously did `result as dynamic` to read .success. That spread late-bound
+    // member access through 13 sites. These helpers centralize the reflection in
+    // one place so internal callers can use typed access.
+    private static bool IsSuccessResponse(object? response)
+    {
+        if (response == null) return false;
+        var prop = response.GetType().GetProperty("success");
+        return prop?.GetValue(response) is bool b && b;
+    }
+
+    private static object? GetResponseData(object? response)
+        => response?.GetType().GetProperty("data")?.GetValue(response);
+
+    private static object? GetResponseError(object? response)
+        => response?.GetType().GetProperty("error")?.GetValue(response);
+
     /// <summary>
     /// Formats a file path as relative or absolute based on configuration.
     /// Default is relative paths to save tokens. Set SHARPLENS_ABSOLUTE_PATHS=true for absolute.

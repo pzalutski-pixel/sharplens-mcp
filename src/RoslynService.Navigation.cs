@@ -94,11 +94,12 @@ public partial class RoslynService
         );
     }
 
-    public async Task<object> FindReferencesAsync(string filePath, int line, int column, int? maxResults = null)
+    public async Task<object> FindReferencesAsync(string filePath, int line, int column, int? maxResults = null, string? kindFilter = null)
     {
         EnsureSolutionLoaded();
 
         var maxResultsToReturn = maxResults ?? 100;
+        var filterKind = string.IsNullOrWhiteSpace(kindFilter) ? null : kindFilter!.ToLowerInvariant();
 
         Document document;
         try
@@ -170,13 +171,11 @@ public partial class RoslynService
             .ToList();
 
         var totalReferences = allLocations.Count;
+        var totalAfterFilter = 0;
         var referenceList = new List<object>();
 
         foreach (var loc in allLocations)
         {
-            if (referenceList.Count >= maxResultsToReturn)
-                break;
-
             var refDocument = _solution!.GetDocument(loc.Document.Id);
             if (refDocument == null) continue;
 
@@ -190,6 +189,15 @@ public partial class RoslynService
 
             var refRoot = await refTree.GetRootAsync();
             var refNode = refRoot.FindNode(refSpan);
+            var kind = ClassifyReferenceKind(loc, refNode);
+
+            // Apply kind filter (case-insensitive); count distinct filtered-but-not-paginated total.
+            if (filterKind != null && !string.Equals(kind, filterKind, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            totalAfterFilter++;
+            if (referenceList.Count >= maxResultsToReturn)
+                continue;
 
             referenceList.Add(new
             {
@@ -197,25 +205,39 @@ public partial class RoslynService
                 line = lineSpan.StartLinePosition.Line,
                 column = lineSpan.StartLinePosition.Character,
                 lineText,
-                kind = ClassifyReferenceKind(loc, refNode)
+                kind
             });
         }
 
-        return CreateSuccessResponse(
-            data: new
+        // When no filter is set, totalAfterFilter equals totalReferences; we omit it from the
+        // response to avoid noise. When set, the caller gets both numbers.
+        object data = filterKind != null
+            ? new
+            {
+                symbolName = symbol.Name,
+                symbolKind = symbol.Kind.ToString(),
+                kindFilter = filterKind,
+                totalReferences,
+                totalReferencesAfterFilter = totalAfterFilter,
+                references = referenceList
+            }
+            : new
             {
                 symbolName = symbol.Name,
                 symbolKind = symbol.Kind.ToString(),
                 totalReferences,
                 references = referenceList
-            },
+            };
+
+        return CreateSuccessResponse(
+            data: data,
             suggestedNextTools: new[]
             {
                 $"get_symbol_info to get details about {symbol.Name}",
                 $"find_callers to see methods that call {symbol.Name}",
                 symbol is INamedTypeSymbol ? $"get_type_members for {symbol.Name}" : null
             }.Where(s => s != null).ToArray()!,
-            totalCount: totalReferences,
+            totalCount: filterKind != null ? totalAfterFilter : totalReferences,
             returnedCount: referenceList.Count
         );
     }
@@ -682,7 +704,7 @@ public partial class RoslynService
         );
     }
 
-    // Maps a reference location to one of: write, invocation, typeof, nameof, attribute, read.
+    // Maps a reference location to one of: write, invocation, cast, typeof, nameof, attribute, read.
     private static string ClassifyReferenceKind(ReferenceLocation loc, SyntaxNode? node)
     {
         if (node == null) return "read";
@@ -697,6 +719,13 @@ public partial class RoslynService
                     return "attribute";
                 case TypeOfExpressionSyntax:
                     return "typeof";
+                case CastExpressionSyntax cast:
+                    // The reference is to the target type of an explicit cast: `(SomeType)x`.
+                    // Only classify as "cast" when our node IS the type being cast to;
+                    // if our node is the inner expression `x`, fall through to other kinds.
+                    return cast.Type == node || cast.Type.Span.Contains(node.Span)
+                        ? "cast"
+                        : "read";
                 case InvocationExpressionSyntax inv:
                     if (inv.Expression is IdentifierNameSyntax id && id.Identifier.Text == "nameof")
                         return "nameof";

@@ -450,41 +450,34 @@ public partial class RoslynService
             );
         }
 
-        // Collect fields
         var fields = typeSymbol.GetMembers()
             .OfType<IFieldSymbol>()
             .Where(f => !f.IsStatic && !f.IsConst && !f.IsImplicitlyDeclared)
-            .Select(f => new
-            {
-                name = f.Name,
-                type = f.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat),
-                isReadOnly = f.IsReadOnly,
-                isNullable = f.NullableAnnotation == NullableAnnotation.Annotated,
-                paramName = ToCamelCase(f.Name.TrimStart('_'))
-            })
+            .Select(f => new ConstructorMember(
+                Name: f.Name,
+                Type: f.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat),
+                IsReadOnly: f.IsReadOnly,
+                IsNullable: f.NullableAnnotation == NullableAnnotation.Annotated,
+                ParamName: ToCamelCase(f.Name.TrimStart('_'))))
             .ToList();
 
-        // Collect properties if requested
-        var properties = new List<dynamic>();
+        var properties = new List<ConstructorMember>();
         if (includeProperties)
         {
             properties = typeSymbol.GetMembers()
                 .OfType<IPropertySymbol>()
                 .Where(p => !p.IsStatic && !p.IsReadOnly && p.SetMethod != null &&
                            p.SetMethod.DeclaredAccessibility != Accessibility.Private)
-                .Select(p => new
-                {
-                    name = p.Name,
-                    type = p.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat),
-                    isReadOnly = false,
-                    isNullable = p.NullableAnnotation == NullableAnnotation.Annotated,
-                    paramName = ToCamelCase(p.Name)
-                })
-                .Cast<dynamic>()
+                .Select(p => new ConstructorMember(
+                    Name: p.Name,
+                    Type: p.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat),
+                    IsReadOnly: false,
+                    IsNullable: p.NullableAnnotation == NullableAnnotation.Annotated,
+                    ParamName: ToCamelCase(p.Name)))
                 .ToList();
         }
 
-        var allMembers = fields.Cast<dynamic>().Concat(properties).ToList();
+        var allMembers = fields.Concat(properties).ToList();
 
         if (allMembers.Count == 0)
         {
@@ -503,9 +496,8 @@ public partial class RoslynService
         var typeName = typeSymbol.Name;
         var accessibility = typeSymbol.DeclaredAccessibility == Accessibility.Public ? "public" : "internal";
 
-        // Parameters
         var parameters = allMembers
-            .Select(m => $"{m.type} {m.paramName}")
+            .Select(m => $"{m.Type} {m.ParamName}")
             .ToList();
 
         sb.AppendLine($"{accessibility} {typeName}({string.Join(", ", parameters)})");
@@ -513,16 +505,13 @@ public partial class RoslynService
 
         foreach (var member in allMembers)
         {
-            string memberName = member.name;
-            string paramName = member.paramName;
-
-            if (initializeToDefault && (bool)member.isNullable)
+            if (initializeToDefault && member.IsNullable)
             {
-                sb.AppendLine($"    {memberName} = {paramName} ?? default;");
+                sb.AppendLine($"    {member.Name} = {member.ParamName} ?? default;");
             }
             else
             {
-                sb.AppendLine($"    {memberName} = {paramName};");
+                sb.AppendLine($"    {member.Name} = {member.ParamName};");
             }
         }
 
@@ -534,9 +523,9 @@ public partial class RoslynService
                 typeName = typeSymbol.ToDisplayString(),
                 constructorCode = sb.ToString(),
                 parameterCount = allMembers.Count,
-                fields = fields.Select(f => f.name).ToList(),
-                properties = properties.Select(p => (string)p.name).ToList(),
-                parameters = allMembers.Select(m => new { name = (string)m.paramName, type = (string)m.type }).ToList()
+                fields = fields.Select(f => f.Name).ToList(),
+                properties = properties.Select(p => p.Name).ToList(),
+                parameters = allMembers.Select(m => new { name = m.ParamName, type = m.Type }).ToList()
             },
             suggestedNextTools: new[]
             {
@@ -1152,7 +1141,12 @@ public partial class RoslynService
         return CreateSuccessResponse(
             data: new
             {
-                preview,
+                // This tool is generation-only: it returns extractedCode + replacementCode for
+                // the caller to apply via Edit/Write. The `preview` request parameter is accepted
+                // for API symmetry with other refactoring tools, but the response always reflects
+                // generation-only semantics — nothing is written to disk and the workspace is
+                // unchanged regardless of the value passed.
+                appliesEditsAutomatically = false,
                 methodName,
                 signature = $"{accessibility} {returnType} {methodName}({paramString})",
                 parameters,
@@ -1169,9 +1163,12 @@ public partial class RoslynService
                     endLine
                 }
             },
-            suggestedNextTools: preview
-                ? new[] { "Call again with preview: false to apply", "validate_code to check the extracted method" }
-                : new[] { "get_diagnostics to check for errors", "Use Edit tool to insert the method" }
+            suggestedNextTools: new[]
+            {
+                "Use Edit/Write to (1) add the extracted method to the containing type, (2) replace the selected statements with replacementCode",
+                "validate_code on extractedCode to confirm it compiles",
+                "sync_documents after editing, then get_diagnostics to check for errors"
+            }
         );
     }
 

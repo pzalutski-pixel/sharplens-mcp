@@ -25,6 +25,43 @@ public class AnalysisTests : RoslynServiceTestBase
     }
 
     [Fact]
+    public async Task GetDiagnostics_WithRunAnalyzersTrue_ReportsAnalyzersRan()
+    {
+        // Default runAnalyzers=true: the response must surface whether analyzers actually ran
+        // so callers know if the diagnostics they got match what CI would produce.
+        var result = await Service.GetDiagnosticsAsync(
+            filePath: null,
+            projectPath: null,
+            severity: null,
+            includeHidden: false,
+            runAnalyzers: true);
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["analyzersRan"].Should().NotBeNull("response must surface whether analyzers ran");
+        data["analyzerCount"].Should().NotBeNull("response must report how many analyzers were invoked");
+        // analyzersRan can be false if no project references any analyzer package — that's
+        // legitimate. analyzerCount is then 0. The contract is that BOTH fields exist.
+    }
+
+    [Fact]
+    public async Task GetDiagnostics_WithRunAnalyzersFalse_FlagsAnalyzersDidNotRun()
+    {
+        var result = await Service.GetDiagnosticsAsync(
+            filePath: null,
+            projectPath: null,
+            severity: null,
+            includeHidden: false,
+            runAnalyzers: false);
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["analyzersRan"]?.Value<bool>().Should().BeFalse(
+            "runAnalyzers:false must skip analyzer execution");
+        data["analyzerCount"]?.Value<int>().Should().Be(0);
+    }
+
+    [Fact]
     public async Task GetDiagnostics_ForSpecificFile_OnlyContainsThatFile()
     {
         var result = await Service.GetDiagnosticsAsync(
