@@ -520,6 +520,10 @@ public partial class RoslynService
         return CreateSuccessResponse(
             data: new
             {
+                // generate_constructor is generation-only by design — it returns the
+                // constructor source for the caller to insert via Edit/Write. Flagged
+                // here so consumers don't assume the workspace was mutated.
+                appliesEditsAutomatically = false,
                 typeName = typeSymbol.ToDisplayString(),
                 constructorCode = sb.ToString(),
                 parameterCount = allMembers.Count,
@@ -529,8 +533,9 @@ public partial class RoslynService
             },
             suggestedNextTools: new[]
             {
-                "validate_code to check the constructor compiles",
-                "Use Edit tool to insert the constructor into the class"
+                "Use Edit/Write to insert the generated constructorCode into the class",
+                "validate_code on constructorCode to confirm it compiles",
+                "sync_documents after editing, then get_diagnostics to check for errors"
             }
         );
     }
@@ -1138,36 +1143,106 @@ public partial class RoslynService
             replacementCode = $"var ({varNames}) = {methodName}({callArgs});";
         }
 
+        var signature = $"{accessibility} {returnType} {methodName}({paramString})";
+
+        if (preview)
+        {
+            return CreateSuccessResponse(
+                data: new
+                {
+                    preview = true,
+                    methodName,
+                    signature,
+                    parameters,
+                    returnType,
+                    returnVariable,
+                    returnReason,
+                    statementsExtracted = statements.Count,
+                    extractedCode = sb.ToString(),
+                    replacementCode,
+                    location = new { filePath, startLine, endLine }
+                },
+                suggestedNextTools: new[]
+                {
+                    "Call again with preview: false to apply the extraction",
+                    "validate_code on extractedCode to confirm it compiles"
+                }
+            );
+        }
+
+        // ---- preview == false: actually apply ----
+        // Parse the generated method body into a MethodDeclarationSyntax. Roslyn's
+        // ParseMemberDeclaration handles the full text including signature + body.
+        var newMember = SyntaxFactory.ParseMemberDeclaration(sb.ToString());
+        if (newMember is not MethodDeclarationSyntax newMethod)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AnalysisFailed,
+                "Generated extracted method did not parse as a MethodDeclarationSyntax",
+                context: new { generatedCode = sb.ToString() });
+        }
+
+        // Parse the replacement call into a StatementSyntax.
+        var replacementStmt = SyntaxFactory.ParseStatement(replacementCode);
+
+        // Rebuild the containing block: drop the selected statements, insert the
+        // replacement at the first-statement's index.
+        var oldBlock = firstStatement.Parent as BlockSyntax;
+        if (oldBlock == null)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AnalysisFailed,
+                "Selected statements are not inside a block",
+                context: new { startLine, endLine });
+        }
+        var statementSet = new HashSet<StatementSyntax>(statements);
+        var firstIdx = oldBlock.Statements.IndexOf(firstStatement);
+        var newStatements = oldBlock.Statements
+            .Where(s => !statementSet.Contains(s))
+            .ToList();
+        newStatements.Insert(firstIdx, replacementStmt);
+        var newBlock = oldBlock.WithStatements(SyntaxFactory.List(newStatements));
+
+        // Apply both edits — replace the block, insert the new method after the
+        // containing method — via SolutionEditor (same pattern as ChangeSignatureAsync).
+        var editor = new Microsoft.CodeAnalysis.Editing.SolutionEditor(_solution!);
+        var docEditor = await editor.GetDocumentEditorAsync(document.Id);
+        docEditor.ReplaceNode(oldBlock, newBlock);
+        // InsertAfter places newMethod as a sibling immediately after containingMethod
+        // within their common parent (the TypeDeclarationSyntax).
+        docEditor.InsertAfter(containingMethod, newMethod);
+
+        var newSolution = editor.GetChangedSolution();
+        if (!_workspace!.TryApplyChanges(newSolution))
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AnalysisFailed,
+                "Workspace rejected the extract_method edit",
+                hint: "Check for unsaved files or workspace state issues",
+                context: new { filePath, methodName });
+        }
+
+        _solution = _workspace.CurrentSolution;
+        _documentCache.Clear();
+        _compilationCache.Clear();
+
         return CreateSuccessResponse(
             data: new
             {
-                // This tool is generation-only: it returns extractedCode + replacementCode for
-                // the caller to apply via Edit/Write. The `preview` request parameter is accepted
-                // for API symmetry with other refactoring tools, but the response always reflects
-                // generation-only semantics — nothing is written to disk and the workspace is
-                // unchanged regardless of the value passed.
-                appliesEditsAutomatically = false,
+                applied = true,
                 methodName,
-                signature = $"{accessibility} {returnType} {methodName}({paramString})",
+                signature,
                 parameters,
                 returnType,
                 returnVariable,
-                returnReason,
                 statementsExtracted = statements.Count,
-                extractedCode = sb.ToString(),
-                replacementCode,
-                location = new
-                {
-                    filePath,
-                    startLine,
-                    endLine
-                }
+                filesModified = new[] { FormatPath(filePath) },
+                location = new { filePath, startLine, endLine }
             },
             suggestedNextTools: new[]
             {
-                "Use Edit/Write to (1) add the extracted method to the containing type, (2) replace the selected statements with replacementCode",
-                "validate_code on extractedCode to confirm it compiles",
-                "sync_documents after editing, then get_diagnostics to check for errors"
+                "get_diagnostics to verify no new errors",
+                $"find_references on {methodName} to confirm the extracted method is called"
             }
         );
     }

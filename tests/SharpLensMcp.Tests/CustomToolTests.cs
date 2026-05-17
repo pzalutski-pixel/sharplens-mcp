@@ -212,22 +212,22 @@ public class CustomToolTests : RoslynServiceTestBase
     #region Batch Lookups Tests
 
     [Fact]
-    public async Task GetTypeMembersBatch_WithMultipleTypes_ReturnsAllResults()
+    public async Task GetTypeMembersBatch_WithMultipleTypes_BothTypesReturnedByName()
     {
-        // Act - correct signature uses List<string>
         var result = await Service.GetTypeMembersBatchAsync(
             new List<string> { "RoslynService", "McpServer" });
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         var results = data["results"] as JArray;
         results.Should().NotBeNull();
         results!.Count.Should().Be(2);
 
+        var typeNames = results.Select(r => r["typeName"]?.Value<string>()).ToList();
+        typeNames.Should().Contain("RoslynService");
+        typeNames.Should().Contain("McpServer");
         foreach (var typeResult in results)
         {
-            typeResult["typeName"].Should().NotBeNull();
             typeResult["success"]?.Value<bool>().Should().BeTrue();
         }
     }
@@ -288,9 +288,8 @@ public class CustomToolTests : RoslynServiceTestBase
     #region Method Source Batch Tests
 
     [Fact]
-    public async Task GetMethodSourceBatch_WithMultipleMethods_ReturnsAllSources()
+    public async Task GetMethodSourceBatch_WithMultipleMethods_EachSourceContainsItsMethodName()
     {
-        // Act
         var result = await Service.GetMethodSourceBatchAsync(
             new List<Dictionary<string, object>>
             {
@@ -298,21 +297,16 @@ public class CustomToolTests : RoslynServiceTestBase
                 new() { ["typeName"] = "RoslynService", ["methodName"] = "GetHealthCheckAsync" }
             });
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         data["totalRequested"]?.Value<int>().Should().Be(2);
         data["successCount"]?.Value<int>().Should().Be(2);
 
         var results = data["results"] as JArray;
-        results.Should().NotBeNull();
         results!.Count.Should().Be(2);
-
-        foreach (var methodResult in results)
-        {
-            methodResult["success"]?.Value<bool>().Should().BeTrue();
-            methodResult["data"]?["fullSource"].Should().NotBeNull();
-        }
+        // Each result's source must contain its specific method name.
+        results[0]["data"]?["fullSource"]?.Value<string>().Should().Contain("LoadSolutionAsync");
+        results[1]["data"]?["fullSource"]?.Value<string>().Should().Contain("GetHealthCheckAsync");
     }
 
     [Fact]
@@ -334,15 +328,11 @@ public class CustomToolTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task GetMethodSourceBatch_WithEmptyList_ReturnsError()
+    public async Task GetMethodSourceBatch_WithEmptyList_ReturnsInvalidParameter()
     {
-        // Act
         var result = await Service.GetMethodSourceBatchAsync(
             new List<Dictionary<string, object>>());
-
-        // Assert - should return error for empty list
-        var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeFalse();
+        AssertError(result, ErrorCodes.InvalidParameter);
     }
 
     #endregion
@@ -350,45 +340,45 @@ public class CustomToolTests : RoslynServiceTestBase
     #region Analyze Method with Outgoing Calls Tests
 
     [Fact]
-    public async Task AnalyzeMethod_WithOutgoingCalls_ReturnsCallsInfo()
+    public async Task AnalyzeMethod_OnLoadSolution_OutgoingCallsIncludeMSBuildWorkspace()
     {
-        // Act
         var result = await Service.AnalyzeMethodAsync(
             typeName: "RoslynService",
             methodName: "LoadSolutionAsync",
             includeCallers: true,
             includeOutgoingCalls: true);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["signature"].Should().NotBeNull();
-        data["outgoingCalls"].Should().NotBeNull();
-        data["totalOutgoingCalls"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
+        data["signature"]!["name"]?.Value<string>().Should().Be("LoadSolutionAsync");
+        var outgoing = data["outgoingCalls"] as JArray;
+        outgoing.Should().NotBeNullOrEmpty();
+        // LoadSolutionAsync calls MSBuildWorkspace.Create and OpenSolutionAsync per RoslynService.cs:272-278.
+        outgoing!.Any(c => c["shortName"]?.Value<string>()?.Contains("OpenSolutionAsync") == true
+                       || c["shortName"]?.Value<string>()?.Contains("Create") == true)
+            .Should().BeTrue();
     }
 
     [Fact]
-    public async Task AnalyzeMethod_WithoutOutgoingCalls_DoesNotIncludeThem()
+    public async Task AnalyzeMethod_WithoutOutgoingCalls_OmitsThem()
     {
-        // Act
         var result = await Service.AnalyzeMethodAsync(
             typeName: "RoslynService",
             methodName: "GetHealthCheckAsync",
             includeCallers: true,
             includeOutgoingCalls: false);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["signature"].Should().NotBeNull();
+        data["signature"]!["name"]?.Value<string>().Should().Be("GetHealthCheckAsync");
         // outgoingCalls should be null when not requested
         data["outgoingCalls"]?.Type.Should().Be(JTokenType.Null);
+        data["outgoingCallsShown"]?.Value<int>().Should().Be(0);
     }
 
     [Fact]
-    public async Task AnalyzeMethod_WithBothCallersAndOutgoing_ReturnsComplete()
+    public async Task AnalyzeMethod_WithBothCallersAndOutgoing_RespectsMaxCaps()
     {
-        // Act
         var result = await Service.AnalyzeMethodAsync(
             typeName: "RoslynService",
             methodName: "FindTypeByNameAsync",
@@ -397,14 +387,15 @@ public class CustomToolTests : RoslynServiceTestBase
             maxCallers: 5,
             maxOutgoingCalls: 10);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["signature"].Should().NotBeNull();
-        data["callers"].Should().NotBeNull();
-        data["outgoingCalls"].Should().NotBeNull();
-        data["callersShown"]?.Value<int>().Should().BeLessThanOrEqualTo(5);
-        data["outgoingCallsShown"]?.Value<int>().Should().BeLessThanOrEqualTo(10);
+        data["signature"]!["name"]?.Value<string>().Should().Be("FindTypeByNameAsync");
+        var callers = data["callers"] as JArray;
+        callers!.Count.Should().BeLessThanOrEqualTo(5);
+        var outgoing = data["outgoingCalls"] as JArray;
+        outgoing!.Count.Should().BeLessThanOrEqualTo(10);
+        data["callersShown"]?.Value<int>().Should().Be(callers.Count);
+        data["outgoingCallsShown"]?.Value<int>().Should().Be(outgoing.Count);
     }
 
     #endregion

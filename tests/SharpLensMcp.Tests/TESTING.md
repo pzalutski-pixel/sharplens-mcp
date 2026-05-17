@@ -54,12 +54,11 @@ Reviewers: if you see any of these, ask the author what concrete failure the tes
 
 ## When you can't pin to a specific value
 
-Some tools (Roslyn refactorings, code actions) legitimately return success-or-clear-error depending on cursor position quirks. For those, write a *behavior contract* test:
+Build a deterministic fixture that pins it down. No exceptions.
 
-```csharp
-var json = JObject.FromObject(result);
-(json["success"]?.Value<bool>() == true || json["error"] != null)
-    .Should().BeTrue("tool must return either a structured success or a structured error");
-```
+The `(json["success"]?.Value<bool>() == true || json["error"] != null).Should().BeTrue()` "behavior contract" pattern is **forbidden** — it passes on the wrong outcome and is functionally identical to a smoke test. Cursor-position-sensitive Roslyn refactoring tools must either:
 
-That still catches: null returns, raw exceptions, malformed JSON. Don't dilute it to "no crash."
+1. Use a fixture position where the action is **always** offered, then assert on specific preview content (success-path locking); OR
+2. Use a fixture position where the action is **never** offered, then assert on the specific `ErrorCodes.*` value the wrapper returns (error-path locking).
+
+If neither path is reliably reproducible, the tool needs better engineering — not a weaker test.

@@ -34,7 +34,7 @@ public class RefactoringTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task RenameSymbol_WithInvalidName_ReturnsError()
+    public async Task RenameSymbol_WithInvalidName_ReturnsInvalidParameter()
     {
         var searchResult = await Service.SearchSymbolsAsync("_workspace", kind: "Field", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -49,7 +49,7 @@ public class RefactoringTests : RoslynServiceTestBase
             newName: "123invalid",
             preview: true);
 
-        AssertError(result);
+        AssertError(result, ErrorCodes.InvalidParameter);
     }
 
     [Fact]
@@ -141,7 +141,7 @@ public class RefactoringTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task GetOutgoingCalls_OnHealthCheck_ListsCallees()
+    public async Task GetOutgoingCalls_OnHealthCheck_IncludesGetProjectCompilationAsync()
     {
         var searchResult = await Service.SearchSymbolsAsync("GetHealthCheckAsync", kind: "Method", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -157,21 +157,26 @@ public class RefactoringTests : RoslynServiceTestBase
         AssertSuccess(result);
         var data = GetData(result);
         var calls = data["calls"] as JArray;
-        calls.Should().NotBeNull("calls array must always be present, even if empty");
+        calls.Should().NotBeNullOrEmpty();
+        // GetHealthCheckAsync calls GetProjectCompilationAsync per RoslynService.cs:491.
+        calls!.Any(c => c["shortName"]?.Value<string>()?.EndsWith(".GetProjectCompilationAsync") == true)
+            .Should().BeTrue();
     }
 
     [Fact]
-    public async Task OrganizeUsings_FormatsFile()
+    public async Task OrganizeUsings_OnRoslynServiceCs_ReturnsTextWithUsings()
     {
         var result = await Service.OrganizeUsingsAsync(RoslynServicePath);
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["organizedText"].Should().NotBeNull();
+        var organized = data["organizedText"]!.Value<string>()!;
+        organized.Should().Contain("using System");
+        organized.Should().Contain("using Microsoft.CodeAnalysis");
     }
 
     [Fact]
-    public async Task OrganizeUsingsBatch_ProcessesProject()
+    public async Task OrganizeUsingsBatch_ProcessesProject_ReportsFilesProcessed()
     {
         var result = await Service.OrganizeUsingsBatchAsync(
             projectName: "SharpLensMcp",
@@ -180,12 +185,14 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Response contains fileCount or files array
-        (data["fileCount"] ?? data["files"]).Should().NotBeNull();
+        var fileCount = data["fileCount"]?.Value<int>() ?? (data["files"] as JArray)?.Count;
+        fileCount.Should().NotBeNull();
+        fileCount!.Value.Should().BeGreaterThan(0,
+            "the project has multiple .cs files with using directives");
     }
 
     [Fact]
-    public async Task FormatDocumentBatch_FormatsProject()
+    public async Task FormatDocumentBatch_FormatsProject_ReportsFilesProcessed()
     {
         var result = await Service.FormatDocumentBatchAsync(
             projectName: "SharpLensMcp",
@@ -193,12 +200,13 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Response contains fileCount or files array
-        (data["fileCount"] ?? data["files"]).Should().NotBeNull();
+        var fileCount = data["fileCount"]?.Value<int>() ?? (data["files"] as JArray)?.Count;
+        fileCount.Should().NotBeNull();
+        fileCount!.Value.Should().BeGreaterThan(0);
     }
 
     [Fact]
-    public async Task GetMethodOverloads_OnCreateErrorResponse_ReturnsMultipleOverloads()
+    public async Task GetMethodOverloads_OnCreateErrorResponse_AllOverloadsShareName()
     {
         var searchResult = await Service.SearchSymbolsAsync("CreateErrorResponse", kind: "Method", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -213,8 +221,13 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
+        data["methodName"]?.Value<string>().Should().Be("CreateErrorResponse");
         var overloads = data["overloads"] as JArray;
         overloads.Should().NotBeNullOrEmpty();
+        foreach (var o in overloads!)
+        {
+            o["signature"]?.Value<string>().Should().Contain("CreateErrorResponse");
+        }
     }
 
     [Fact]

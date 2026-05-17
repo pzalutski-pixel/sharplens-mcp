@@ -26,14 +26,11 @@ public class NavigationTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task GetSymbolInfo_InvalidPosition_ReturnsError()
+    public async Task GetSymbolInfo_InvalidPosition_ReturnsSymbolNotFound()
     {
         // Position (0, 0) — beginning of file, no symbol there.
         var result = await Service.GetSymbolInfoAsync(RoslynServicePath, line: 0, column: 0);
-
-        // Must report failure with SymbolNotFound — the prior pattern of "success with empty kind"
-        // was vacuous (the if-condition let it pass in either branch).
-        AssertError(result);
+        AssertError(result, ErrorCodes.SymbolNotFound);
     }
 
     [Fact]
@@ -210,7 +207,7 @@ public class NavigationTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task FindCallers_FindsUsages()
+    public async Task FindCallers_OnEnsureSolutionLoaded_FindsManySpecificCallers()
     {
         var searchResult = await Service.SearchSymbolsAsync("EnsureSolutionLoaded", kind: "Method", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -226,8 +223,14 @@ public class NavigationTests : RoslynServiceTestBase
 
         var data = GetData(result);
         var callers = data["callers"] as JArray;
-        callers.Should().NotBeNullOrEmpty(
-            "EnsureSolutionLoaded is called from many tool methods, so callers must be non-empty");
+        callers.Should().NotBeNullOrEmpty();
+        callers!.Count.Should().BeGreaterOrEqualTo(20,
+            "EnsureSolutionLoaded is called from dozens of tool methods");
+        var names = callers
+            .Select(c => c["callingSymbol"]?["name"]?.Value<string>())
+            .ToList();
+        names.Should().Contain("SearchSymbolsAsync");
+        names.Should().Contain("GetDiagnosticsAsync");
     }
 
     [Fact]

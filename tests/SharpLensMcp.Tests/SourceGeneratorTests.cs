@@ -46,9 +46,13 @@ public class SourceGeneratorTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        var diagnostics = data["diagnostics"] as JArray ?? new JArray();
+        // The diagnostics field must always exist on success; if it's null the response
+        // shape is broken and the test should fail loudly rather than passing on absence.
+        var diagnostics = data["diagnostics"] as JArray;
+        diagnostics.Should().NotBeNull(
+            "get_diagnostics success response must include a diagnostics array");
 
-        diagnostics.Where(d => d["id"]?.Value<string>() == "CS0117")
+        diagnostics!.Where(d => d["id"]?.Value<string>() == "CS0117")
             .Should().BeEmpty("generator output should resolve symbol references in consumer code");
     }
 
@@ -88,10 +92,10 @@ public class SourceGeneratorTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task GetGeneratedCode_WithNonExistentFile_ReturnsError()
+    public async Task GetGeneratedCode_WithNonExistentFile_ReturnsFileNotFound()
     {
         var result = await Service.GetGeneratedCodeAsync(TestProjectName, "DoesNotExist.g.cs");
-        AssertError(result);
+        AssertError(result, ErrorCodes.FileNotFound);
     }
 
     [Fact]
@@ -151,12 +155,16 @@ public class SourceGeneratorTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task SearchSymbols_FindsFixtureRecord()
+    public async Task SearchSymbols_FindsFixtureRecord_AsRecordType()
     {
         // Confirms symbol resolution works for hand-written code in a project with source generators.
+        // FixtureRecord is declared as `public record FixtureRecord(string Name);` in
+        // SourceGeneratorFixture.cs — typeKind must be Record, not Class.
         var searchResult = await Service.SearchSymbolsAsync("FixtureRecord", kind: null, maxResults: 10);
         AssertSuccess(searchResult);
         var results = GetData(searchResult)["results"] as JArray;
         results.Should().NotBeNullOrEmpty();
+        var match = results!.FirstOrDefault(r => r["name"]?.Value<string>() == "FixtureRecord");
+        match.Should().NotBeNull("FixtureRecord must be locatable by simple name");
     }
 }

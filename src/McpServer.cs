@@ -100,6 +100,14 @@ public class McpServer
 
     internal async Task<object?> HandleRequestAsync(string requestJson)
     {
+        // Three-state machine for the outer catch's spec compliance:
+        //   parsed=false           — exception before we knew if it was a notification → §5.1 parse-error response
+        //   parsed=true, hasId=true  — a Request → §5.1 error response with the id
+        //   parsed=true, hasId=false — a Notification → §4.3 no response at all
+        var parsed = false;
+        var hasId = false;
+        RequestId? id = null;
+
         try
         {
             var request = JsonSerializer.Deserialize<JsonObject>(requestJson);
@@ -113,10 +121,11 @@ public class McpServer
             // error response). The previous heuristic of `method.StartsWith("notifications/")`
             // was incorrect and produced `{"id":null,...}` for valid notifications like
             // `{"jsonrpc":"2.0","method":"initialize"}`, which Zod-validated clients reject.
-            var hasId = request.ContainsKey("id") && request["id"] != null;
-            RequestId? id = hasId
+            hasId = request.ContainsKey("id") && request["id"] != null;
+            id = hasId
                 ? JsonSerializer.Deserialize<RequestId>(request["id"]!, _jsonOptions)
                 : null;
+            parsed = true;
             var method = request["method"]?.GetValue<string>();
             var paramsNode = request["params"];
 
@@ -148,7 +157,12 @@ public class McpServer
         catch (Exception ex)
         {
             await LogAsync("Error", $"Error handling request: {ex}");
-            return CreateErrorResponse((RequestId?)null, -32603, $"Internal error: {ex.Message}");
+            if (parsed && !hasId)
+            {
+                // Notification path: spec §4.3 forbids any response, even on exception.
+                return null;
+            }
+            return CreateErrorResponse(id, -32603, $"Internal error: {ex.Message}");
         }
     }
 

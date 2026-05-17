@@ -36,13 +36,16 @@ public class DiscoveryToolTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task FindAttributeUsages_WithProjectFilter_FiltersResults()
+    public async Task FindAttributeUsages_WithProjectFilter_OnlyMainProjectMatches()
     {
         var result = await Service.FindAttributeUsagesAsync("JsonConverter", projectName: "SharpLensMcp");
         AssertSuccess(result);
         var data = GetData(result);
         var usages = data["usages"] as JArray;
-        usages.Should().NotBeNull();
+        usages.Should().NotBeNullOrEmpty(
+            "RequestId in SharpLensMcp is decorated with [JsonConverter]");
+        usages!.Any(u => u["symbolName"]?.Value<string>()?.Contains("RequestId") == true)
+            .Should().BeTrue();
     }
 
     #endregion
@@ -61,10 +64,13 @@ public class DiscoveryToolTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task GetDiRegistrations_ReturnsSuccessResponse()
+    public async Task GetDiRegistrations_FilteredToMainProject_IsEmpty()
     {
         var result = await Service.GetDiRegistrationsAsync(projectName: "SharpLensMcp");
         AssertSuccess(result);
+        var registrations = GetData(result)["registrations"] as JArray;
+        registrations!.Count.Should().Be(0,
+            "SharpLensMcp is a stdio MCP server — no IServiceCollection registrations");
     }
 
     #endregion
@@ -72,19 +78,28 @@ public class DiscoveryToolTests : RoslynServiceTestBase
     #region find_reflection_usage
 
     [Fact]
-    public async Task FindReflectionUsage_OnSolution_ReturnsSuccessResponse()
+    public async Task FindReflectionUsage_OnSolution_FindsRoslynServiceHelpers()
     {
+        // RoslynService's IsSuccessResponse/GetResponseData/GetResponseError each call
+        // Type.GetProperty(...) and PropertyInfo.GetValue(...). At least 3 of each.
         var result = await Service.FindReflectionUsageAsync();
         AssertSuccess(result);
-        var data = GetData(result);
-        data["usages"].Should().NotBeNull();
+        var usages = GetData(result)["usages"] as JArray;
+        usages.Should().NotBeNullOrEmpty();
+        usages!.Count(u => u["reflectionApi"]?.Value<string>() == "Type.GetProperty"
+                       && u["location"]?["filePath"]?.Value<string>()?.EndsWith("RoslynService.cs") == true)
+            .Should().BeGreaterOrEqualTo(3);
     }
 
     [Fact]
-    public async Task FindReflectionUsage_WithProjectFilter_FiltersResults()
+    public async Task FindReflectionUsage_WithProjectFilter_ReturnsSameRoslynServiceUsages()
     {
         var result = await Service.FindReflectionUsageAsync(projectName: "SharpLensMcp");
         AssertSuccess(result);
+        var usages = GetData(result)["usages"] as JArray;
+        usages!.Any(u => u["reflectionApi"]?.Value<string>() == "Type.GetProperty")
+            .Should().BeTrue(
+                "the SharpLensMcp project contains the reflection helpers in RoslynService.cs");
     }
 
     #endregion
@@ -92,23 +107,30 @@ public class DiscoveryToolTests : RoslynServiceTestBase
     #region find_circular_dependencies
 
     [Fact]
-    public async Task FindCircularDependencies_ProjectLevel_ReturnsGraph()
+    public async Task FindCircularDependencies_ProjectLevel_GraphIncludesTestProjectDep()
     {
         var result = await Service.FindCircularDependenciesAsync("project");
         AssertSuccess(result);
         var data = GetData(result);
         data["level"]?.Value<string>().Should().Be("project");
-        data["graph"].Should().NotBeNull();
+        // Graph is keyed by project name; SharpLensMcp.Tests references SharpLensMcp.
+        var graph = data["graph"] as JObject;
+        graph.Should().NotBeNull();
+        var testDeps = graph!["SharpLensMcp.Tests"] as JArray;
+        testDeps.Should().NotBeNull();
+        testDeps!.Select(t => t.Value<string>()).Should().Contain("SharpLensMcp");
     }
 
     [Fact]
-    public async Task FindCircularDependencies_NamespaceLevel_ReturnsGraph()
+    public async Task FindCircularDependencies_NamespaceLevel_ReportsKnownNamespaceCount()
     {
         var result = await Service.FindCircularDependenciesAsync("namespace");
         AssertSuccess(result);
         var data = GetData(result);
         data["level"]?.Value<string>().Should().Be("namespace");
-        data["namespaceCount"].Should().NotBeNull();
+        // Our solution has multiple namespaces (SharpLensMcp, SharpLensMcp.Tests,
+        // SharpLensMcp.Tests.Mcp, SharpLensMcp.Tests.Fixtures, etc.).
+        data["namespaceCount"]?.Value<int>().Should().BeGreaterOrEqualTo(4);
     }
 
     [Fact]
@@ -168,19 +190,28 @@ public class DiscoveryToolTests : RoslynServiceTestBase
     #region get_source_generators
 
     [Fact]
-    public async Task GetSourceGenerators_ReturnsSuccessResponse()
+    public async Task GetSourceGenerators_OnSolution_OnlyIncludesProjectsWithGenerators()
     {
         var result = await Service.GetSourceGeneratorsAsync();
         AssertSuccess(result);
-        var data = GetData(result);
-        data["projects"].Should().NotBeNull();
+        var projects = GetData(result)["projects"] as JArray;
+        projects.Should().NotBeNull();
+        // Every entry must have at least one generator (impl skips empty projects).
+        foreach (var p in projects!)
+        {
+            var gens = p["generators"] as JArray;
+            gens.Should().NotBeNullOrEmpty();
+        }
     }
 
     [Fact]
-    public async Task GetSourceGenerators_WithProjectFilter_FiltersResults()
+    public async Task GetSourceGenerators_FilteredToTestAnalyzers_ReturnsEmpty()
     {
-        var result = await Service.GetSourceGeneratorsAsync(projectName: "SharpLensMcp");
+        // TestAnalyzers project hosts an analyzer, not a generator; it must be excluded.
+        var result = await Service.GetSourceGeneratorsAsync(projectName: "SharpLensMcp.Tests.TestAnalyzers");
         AssertSuccess(result);
+        var projects = GetData(result)["projects"] as JArray;
+        projects!.Count.Should().Be(0);
     }
 
     #endregion
@@ -188,11 +219,10 @@ public class DiscoveryToolTests : RoslynServiceTestBase
     #region get_generated_code
 
     [Fact]
-    public async Task GetGeneratedCode_WithNonExistentFile_ReturnsError()
+    public async Task GetGeneratedCode_WithNonExistentFile_ReturnsFileNotFound()
     {
         var result = await Service.GetGeneratedCodeAsync("SharpLensMcp", "NonExistentFile.g.cs");
-        var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeFalse();
+        AssertError(result, ErrorCodes.FileNotFound);
     }
 
     #endregion

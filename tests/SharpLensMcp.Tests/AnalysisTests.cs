@@ -10,7 +10,7 @@ namespace SharpLensMcp.Tests;
 public class AnalysisTests : RoslynServiceTestBase
 {
     [Fact]
-    public async Task GetDiagnostics_ReturnsArray()
+    public async Task GetDiagnostics_ReturnsArrayWithConsistentCounts()
     {
         var result = await Service.GetDiagnosticsAsync(
             filePath: null,
@@ -22,13 +22,16 @@ public class AnalysisTests : RoslynServiceTestBase
         var data = GetData(result);
         var diagnostics = data["diagnostics"] as JArray;
         diagnostics.Should().NotBeNull("a clean build still produces a diagnostics array, even if empty");
+        // The reported errorCount/warningCount must match the array contents (cap aside).
+        var errors = diagnostics!.Count(d => d["severity"]?.Value<string>() == "Error");
+        var warnings = diagnostics!.Count(d => d["severity"]?.Value<string>() == "Warning");
+        data["errorCount"]?.Value<int>().Should().Be(errors);
+        data["warningCount"]?.Value<int>().Should().Be(warnings);
     }
 
     [Fact]
-    public async Task GetDiagnostics_WithRunAnalyzersTrue_ReportsAnalyzersRan()
+    public async Task GetDiagnostics_WithRunAnalyzersTrue_HasConsistentAnalyzerFields()
     {
-        // Default runAnalyzers=true: the response must surface whether analyzers actually ran
-        // so callers know if the diagnostics they got match what CI would produce.
         var result = await Service.GetDiagnosticsAsync(
             filePath: null,
             projectPath: null,
@@ -38,10 +41,17 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["analyzersRan"].Should().NotBeNull("response must surface whether analyzers ran");
-        data["analyzerCount"].Should().NotBeNull("response must report how many analyzers were invoked");
-        // analyzersRan can be false if no project references any analyzer package — that's
-        // legitimate. analyzerCount is then 0. The contract is that BOTH fields exist.
+        // The contract: analyzersRan and analyzerCount must agree.
+        var ran = data["analyzersRan"]!.Value<bool>();
+        var count = data["analyzerCount"]!.Value<int>();
+        if (ran)
+        {
+            count.Should().BeGreaterThan(0, "analyzersRan=true requires at least one analyzer");
+        }
+        else
+        {
+            count.Should().Be(0, "analyzersRan=false requires zero analyzer count");
+        }
     }
 
     [Fact]
@@ -159,64 +169,76 @@ public class AnalysisTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task GetFileOverview_ReturnsComprehensiveInfo()
+    public async Task GetFileOverview_OnRoslynService_IncludesRoslynServiceTypeDeclaration()
     {
-        // Act
         var result = await Service.GetFileOverviewAsync(RoslynServicePath);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         data["filePath"]?.Value<string>().Should().Contain("RoslynService");
-        data["lineCount"]?.Value<int>().Should().BeGreaterThan(1000);
-        data["typeDeclarations"].Should().NotBeNull();
+        data["lineCount"]?.Value<int>().Should().BeGreaterThan(400,
+            "RoslynService.cs is hundreds of lines after the partial-class split");
+
+        var typeDecls = data["typeDeclarations"] as JArray;
+        typeDecls.Should().NotBeNullOrEmpty();
+        typeDecls!.Any(t => t["name"]?.Value<string>() == "RoslynService")
+            .Should().BeTrue("file declares the RoslynService partial class");
     }
 
     [Fact]
-    public async Task GetTypeOverview_ReturnsComprehensiveInfo()
+    public async Task GetTypeOverview_OnRoslynService_HasExpectedMemberCounts()
     {
-        // Act
         var result = await Service.GetTypeOverviewAsync("RoslynService");
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         data["typeName"]?.Value<string>().Should().Contain("RoslynService");
         data["typeKind"]?.Value<string>().Should().Be("Class");
-        data["memberSummary"].Should().NotBeNull();
+        var memberSummary = data["memberSummary"]!;
+        memberSummary["methods"]?.Value<int>().Should().BeGreaterOrEqualTo(20,
+            "RoslynService has dozens of methods across partials");
+        memberSummary["fields"]?.Value<int>().Should().BeGreaterOrEqualTo(1,
+            "RoslynService has at least _workspace, _solution, etc. fields");
     }
 
     [Fact]
-    public async Task AnalyzeMethod_ReturnsSignatureAndCallers()
+    public async Task AnalyzeMethod_OnLoadSolutionAsync_SignatureHasExpectedShape()
     {
-        // Act
         var result = await Service.AnalyzeMethodAsync(
             "RoslynService",
             "LoadSolutionAsync",
             includeCallers: true);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["methodName"]?.Value<string>().Should().Be("LoadSolutionAsync");
-        data["signature"].Should().NotBeNull();
+        var signature = data["signature"]!;
+        signature["name"]?.Value<string>().Should().Be("LoadSolutionAsync");
+        signature["returnType"]?.Value<string>().Should().Contain("Task<object>");
+        signature["isAsync"]?.Value<bool>().Should().BeTrue();
+
+        var parameters = signature["parameters"] as JArray;
+        parameters!.Count.Should().Be(1);
+        parameters[0]["name"]?.Value<string>().Should().Be("solutionPath");
     }
 
     [Fact]
-    public async Task GetMethodSource_ReturnsSourceCode()
+    public async Task GetMethodSource_OnHealthCheck_ReturnsFullSourceWithSignature()
     {
-        // Act
         var result = await Service.GetMethodSourceAsync("RoslynService", "GetHealthCheckAsync");
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["source"]?.Value<string>().Should().Contain("HealthCheck");
-        data["lineCount"]?.Value<int>().Should().BeGreaterThan(0);
+        // The response field is `fullSource` (RoslynService.Inspection.cs:1399), not `source`.
+        // The prior assertion read `data["source"]` which silently passed via null-conditional.
+        var source = data["fullSource"]!.Value<string>()!;
+        source.Should().Contain("public async Task<object> GetHealthCheckAsync()");
+        source.Should().Contain("CreateSuccessResponse",
+            "the body uses CreateSuccessResponse after the 1.5.3 health_check shape fix");
+        data["lineCount"]?.Value<int>().Should().BeGreaterThan(20);
     }
 
     [Fact]
-    public async Task FindUnusedCode_ReturnsArrayWithExpectedShape()
+    public async Task FindUnusedCode_DefaultArgs_EveryEntryHasFullShape()
     {
         var result = await Service.FindUnusedCodeAsync(
             projectName: null,
@@ -230,6 +252,15 @@ public class AnalysisTests : RoslynServiceTestBase
         var unusedSymbols = data["unusedSymbols"] as JArray;
         unusedSymbols.Should().NotBeNull("response must always include an unusedSymbols array");
         unusedSymbols!.Count.Should().BeLessOrEqualTo(10, "maxResults must be enforced");
+        // Every returned entry must conform to the documented UnusedSymbolEntry shape.
+        foreach (var entry in unusedSymbols)
+        {
+            entry["name"]?.Value<string>().Should().NotBeNullOrEmpty();
+            entry["fullyQualifiedName"]?.Value<string>().Should().NotBeNullOrEmpty();
+            entry["kind"]?.Value<string>().Should().NotBeNullOrEmpty();
+            entry["accessibility"]?.Value<string>().Should().NotBeNullOrEmpty();
+            entry["filePath"]?.Value<string>().Should().EndWith(".cs");
+        }
     }
 
     [Fact]
@@ -284,20 +315,23 @@ public class AnalysisTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task GetInstantiationOptions_ReturnsConstructorInfo()
+    public async Task GetInstantiationOptions_OnRoslynService_HasParameterlessConstructor()
     {
-        // Act
         var result = await Service.GetInstantiationOptionsAsync("RoslynService");
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         data["typeName"]?.Value<string>().Should().Contain("RoslynService");
-        data["constructors"].Should().NotBeNull();
+        data["typeKind"]?.Value<string>().Should().Be("Class");
+        data["implementsIDisposable"]?.Value<bool>().Should().BeFalse();
+        var ctors = data["constructors"] as JArray;
+        ctors.Should().NotBeNullOrEmpty();
+        ctors!.Any(c => (c["parameters"] as JArray)?.Count == 0)
+            .Should().BeTrue("RoslynService has a parameterless public constructor");
     }
 
     [Fact]
-    public async Task AnalyzeChangeImpact_ShowsAffectedLocations()
+    public async Task AnalyzeChangeImpact_RenameCreateSuccessResponse_AllInfoNonBreaking()
     {
         var searchResult = await Service.SearchSymbolsAsync("CreateSuccessResponse", kind: "Method", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -314,8 +348,15 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
+        // Rename is always non-breaking per Inspection.cs:1180-1183.
+        data["safe"]?.Value<bool>().Should().BeTrue();
+        data["breakingChanges"]?.Value<int>().Should().Be(0);
+
         var locations = data["impactedLocations"] as JArray;
-        locations.Should().NotBeNullOrEmpty(
-            "CreateSuccessResponse is called from many sites, so impactedLocations must be non-empty");
+        locations.Should().NotBeNullOrEmpty();
+        foreach (var l in locations!)
+        {
+            l["severity"]?.Value<string>().Should().Be("info");
+        }
     }
 }

@@ -140,4 +140,31 @@ public class McpServerTests
 
         response.Should().BeNull();
     }
+
+    [Fact]
+    public async Task HandleRequest_NotificationThatTriggersInternalException_ReturnsNull()
+    {
+        // tools/call expects params.name to be a string; passing a non-object `params`
+        // (here a string literal) trips `paramsNode?.AsObject()` and throws
+        // InvalidOperationException — that exception escapes the dispatcher and
+        // hits the outer catch. With NO `id` (notification), per JSON-RPC 2.0
+        // §4.3, the response MUST be null even on internal error.
+        var request = """{"jsonrpc":"2.0","method":"tools/call","params":"not-an-object"}""";
+        var response = await _server.HandleRequestAsync(request);
+
+        response.Should().BeNull(
+            "notifications must produce no response, even when an exception escapes dispatch");
+    }
+
+    [Fact]
+    public async Task HandleRequest_RequestThatTriggersInternalException_ReturnsErrorWithId()
+    {
+        // Same shape but WITH an id — must produce a structured -32603 error.
+        var request = """{"jsonrpc":"2.0","id":42,"method":"tools/call","params":"not-an-object"}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["id"]!.GetValue<long>().Should().Be(42);
+        var error = response["error"]!.AsObject();
+        error["code"]!.GetValue<int>().Should().Be(-32603);
+    }
 }
