@@ -85,12 +85,23 @@ public static class TestHelpers
 
         var solution = workspace.CurrentSolution.AddProject(projectInfo);
 
+        // Give each doc a real-looking FilePath under a per-test temp dir so
+        // RoslynService.TryFindDocument can resolve them — the production path
+        // matches by FilePath, not by Name.
+        var tempDir = Path.Combine(Path.GetTempPath(), $"adhoc-{Guid.NewGuid():N}");
         var documentIds = new List<DocumentId>();
         foreach (var (code, fileName) in files)
         {
             var documentId = DocumentId.CreateNewId(projectId);
             documentIds.Add(documentId);
-            solution = solution.AddDocument(documentId, fileName, SourceText.From(code));
+            var virtualPath = Path.Combine(tempDir, fileName);
+            var documentInfo = DocumentInfo.Create(
+                documentId,
+                name: fileName,
+                loader: TextLoader.From(TextAndVersion.Create(
+                    SourceText.From(code), VersionStamp.Create())),
+                filePath: virtualPath);
+            solution = solution.AddDocument(documentInfo);
         }
 
         workspace.TryApplyChanges(solution);

@@ -7,114 +7,14 @@ namespace SharpLensMcp.Tests;
 /// <summary>
 /// Tests for analysis tools: get_diagnostics, analyze_data_flow, analyze_control_flow, etc.
 /// </summary>
+//
+// get_diagnostics filter/severity/includeHidden coverage lives in
+// GetDiagnosticsFilterTests.cs — those tests use an AdhocWorkspace seeded with
+// known compiler diagnostics + InfoFiresAnalyzer/HiddenFiresAnalyzer/AlwaysFiresAnalyzer
+// so each filter branch can be content-locked against deterministic output. The
+// previous solution-loaded variants here were tautologies on a clean codebase.
 public class AnalysisTests : RoslynServiceTestBase
 {
-    [Fact]
-    public async Task GetDiagnostics_ReturnsArrayWithConsistentCounts()
-    {
-        var result = await Service.GetDiagnosticsAsync(
-            filePath: null,
-            projectPath: null,
-            severity: null,
-            includeHidden: false);
-
-        AssertSuccess(result);
-        var data = GetData(result);
-        var diagnostics = data["diagnostics"] as JArray;
-        diagnostics.Should().NotBeNull("a clean build still produces a diagnostics array, even if empty");
-        // The reported errorCount/warningCount must match the array contents (cap aside).
-        var errors = diagnostics!.Count(d => d["severity"]?.Value<string>() == "Error");
-        var warnings = diagnostics!.Count(d => d["severity"]?.Value<string>() == "Warning");
-        data["errorCount"]?.Value<int>().Should().Be(errors);
-        data["warningCount"]?.Value<int>().Should().Be(warnings);
-    }
-
-    [Fact]
-    public async Task GetDiagnostics_WithRunAnalyzersTrue_HasConsistentAnalyzerFields()
-    {
-        var result = await Service.GetDiagnosticsAsync(
-            filePath: null,
-            projectPath: null,
-            severity: null,
-            includeHidden: false,
-            runAnalyzers: true);
-
-        AssertSuccess(result);
-        var data = GetData(result);
-        // The contract: analyzersRan and analyzerCount must agree.
-        var ran = data["analyzersRan"]!.Value<bool>();
-        var count = data["analyzerCount"]!.Value<int>();
-        if (ran)
-        {
-            count.Should().BeGreaterThan(0, "analyzersRan=true requires at least one analyzer");
-        }
-        else
-        {
-            count.Should().Be(0, "analyzersRan=false requires zero analyzer count");
-        }
-    }
-
-    [Fact]
-    public async Task GetDiagnostics_WithRunAnalyzersFalse_FlagsAnalyzersDidNotRun()
-    {
-        var result = await Service.GetDiagnosticsAsync(
-            filePath: null,
-            projectPath: null,
-            severity: null,
-            includeHidden: false,
-            runAnalyzers: false);
-
-        AssertSuccess(result);
-        var data = GetData(result);
-        data["analyzersRan"]?.Value<bool>().Should().BeFalse(
-            "runAnalyzers:false must skip analyzer execution");
-        data["analyzerCount"]?.Value<int>().Should().Be(0);
-    }
-
-    [Fact]
-    public async Task GetDiagnostics_ForSpecificFile_OnlyContainsThatFile()
-    {
-        var result = await Service.GetDiagnosticsAsync(
-            filePath: RoslynServicePath,
-            projectPath: null,
-            severity: null,
-            includeHidden: false);
-
-        AssertSuccess(result);
-        var data = GetData(result);
-        var diagnostics = data["diagnostics"] as JArray;
-        diagnostics.Should().NotBeNull();
-
-        // Every diagnostic (if any) must reference RoslynService.cs — the filter
-        // is the whole point of this test. Empty result is also acceptable for a
-        // warning-free file, but a non-RoslynService entry would mean the filter is broken.
-        foreach (var diag in diagnostics!)
-        {
-            diag["filePath"]?.Value<string>().Should().EndWith("RoslynService.cs");
-        }
-    }
-
-    [Fact]
-    public async Task GetDiagnostics_FilterBySeverity_OnlyErrorsOrEmpty()
-    {
-        var result = await Service.GetDiagnosticsAsync(
-            filePath: null,
-            projectPath: null,
-            severity: "Error",
-            includeHidden: false);
-
-        AssertSuccess(result);
-        var data = GetData(result);
-        var diagnostics = data["diagnostics"] as JArray;
-        diagnostics.Should().NotBeNull();
-
-        foreach (var diag in diagnostics!)
-        {
-            diag["severity"]?.Value<string>().Should().Be("Error",
-                "severity filter must include only Error-level diagnostics");
-        }
-    }
-
     private static (string file, int firstStmt, int lastStmt) LocateSumBody(RoslynService service)
     {
         // Resolve the fixture path off the loaded solution, then read the file to find
@@ -197,8 +97,9 @@ public class AnalysisTests : RoslynServiceTestBase
         var memberSummary = data["memberSummary"]!;
         memberSummary["methods"]?.Value<int>().Should().BeGreaterOrEqualTo(20,
             "RoslynService has dozens of methods across partials");
-        memberSummary["fields"]?.Value<int>().Should().BeGreaterOrEqualTo(1,
-            "RoslynService has at least _workspace, _solution, etc. fields");
+        memberSummary["fields"]?.Value<int>().Should().BeGreaterOrEqualTo(5,
+            "RoslynService declares at least _workspace, _solution, _solutionLoadedAt, " +
+            "_documentCache, _compilationCache");
     }
 
     [Fact]
@@ -369,5 +270,243 @@ public class AnalysisTests : RoslynServiceTestBase
         {
             l["severity"]?.Value<string>().Should().Be("info");
         }
+    }
+
+    private async Task<(string file, int line, int col)> LocateCreateSuccessResponseAsync()
+    {
+        var searchResult = await Service.SearchSymbolsAsync("CreateSuccessResponse", kind: "Method", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
+        var loc = symbols![0]["location"]!;
+        return (loc["filePath"]!.Value<string>()!,
+                loc["line"]!.Value<int>(),
+                loc["column"]!.Value<int>());
+    }
+
+    [Fact]
+    public async Task AnalyzeChangeImpact_AddParameter_ReportsBreakingChangesAndErrorSeverity()
+    {
+        var (file, line, col) = await LocateCreateSuccessResponseAsync();
+        var result = await Service.AnalyzeChangeImpactAsync(
+            file, line, col, changeType: "addParameter");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        // Inspection.cs:1192-1197 marks every call site as error / breakingChanges++.
+        data["breakingChanges"]?.Value<int>().Should().BeGreaterThan(0,
+            "addParameter must report every call site as a breaking change");
+        data["safe"]?.Value<bool>().Should().BeFalse(
+            "addParameter cannot be safe — call sites lose a required argument");
+        data["changeType"]?.Value<string>().Should().Be("addParameter");
+
+        var locations = data["impactedLocations"] as JArray;
+        locations.Should().NotBeNullOrEmpty();
+        foreach (var l in locations!)
+        {
+            l["severity"]?.Value<string>().Should().Be("error");
+            l["impact"]?.Value<string>().Should().Contain("missing new parameter");
+        }
+    }
+
+    [Fact]
+    public async Task AnalyzeChangeImpact_RemoveParameter_ReportsBreakingChangesAndErrorSeverity()
+    {
+        var (file, line, col) = await LocateCreateSuccessResponseAsync();
+        var result = await Service.AnalyzeChangeImpactAsync(
+            file, line, col, changeType: "removeParameter");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["breakingChanges"]?.Value<int>().Should().BeGreaterThan(0);
+        data["safe"]?.Value<bool>().Should().BeFalse();
+        var locations = data["impactedLocations"] as JArray;
+        locations.Should().NotBeNullOrEmpty();
+        foreach (var l in locations!)
+        {
+            l["severity"]?.Value<string>().Should().Be("error");
+            l["impact"]?.Value<string>().Should().Contain("extra parameter");
+        }
+    }
+
+    [Fact]
+    public async Task AnalyzeChangeImpact_ChangeType_ReportsWarningSeverityNotBreaking()
+    {
+        var (file, line, col) = await LocateCreateSuccessResponseAsync();
+        var result = await Service.AnalyzeChangeImpactAsync(
+            file, line, col, changeType: "changeType");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        // Inspection.cs:1185-1190: changeType produces warnings, not breaking changes.
+        data["breakingChanges"]?.Value<int>().Should().Be(0);
+        data["warnings"]?.Value<int>().Should().BeGreaterThan(0,
+            "changeType must increment the warnings counter once per call site");
+        data["safe"]?.Value<bool>().Should().BeTrue("warnings don't count toward safe=false");
+
+        var locations = data["impactedLocations"] as JArray;
+        locations.Should().NotBeNullOrEmpty();
+        foreach (var l in locations!)
+        {
+            l["severity"]?.Value<string>().Should().Be("warning");
+        }
+    }
+
+    [Fact]
+    public async Task AnalyzeChangeImpact_Delete_ReportsBreakingChanges()
+    {
+        var (file, line, col) = await LocateCreateSuccessResponseAsync();
+        var result = await Service.AnalyzeChangeImpactAsync(
+            file, line, col, changeType: "delete");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["breakingChanges"]?.Value<int>().Should().BeGreaterThan(0);
+        data["safe"]?.Value<bool>().Should().BeFalse();
+        var locations = data["impactedLocations"] as JArray;
+        locations.Should().NotBeNullOrEmpty();
+        foreach (var l in locations!)
+        {
+            l["severity"]?.Value<string>().Should().Be("error");
+            l["impact"]?.Value<string>().Should().Contain("Reference will be broken");
+        }
+    }
+
+    [Fact]
+    public async Task AnalyzeChangeImpact_ChangeAccessibility_OnPrivateSymbol_ReportsWarning()
+    {
+        // CreateSuccessResponse is private — Inspection.cs:1206-1219 takes the non-public
+        // branch, emitting warning severity and incrementing warnings (not breakingChanges).
+        var (file, line, col) = await LocateCreateSuccessResponseAsync();
+        var result = await Service.AnalyzeChangeImpactAsync(
+            file, line, col, changeType: "changeAccessibility");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["safe"]?.Value<bool>().Should().BeTrue();
+        data["breakingChanges"]?.Value<int>().Should().Be(0);
+        data["warnings"]?.Value<int>().Should().BeGreaterThan(0);
+        var locations = data["impactedLocations"] as JArray;
+        locations.Should().NotBeNullOrEmpty();
+        foreach (var l in locations!)
+        {
+            l["severity"]?.Value<string>().Should().Be("warning");
+        }
+    }
+
+    [Fact]
+    public async Task AnalyzeChangeImpact_UnknownChangeType_FallsThroughToInfoSeverity()
+    {
+        var (file, line, col) = await LocateCreateSuccessResponseAsync();
+        var result = await Service.AnalyzeChangeImpactAsync(
+            file, line, col, changeType: "made_up_change_type_xyz");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        // Default branch (Inspection.cs:1228-1231): unknown change → info severity, no counters.
+        data["breakingChanges"]?.Value<int>().Should().Be(0);
+        data["warnings"]?.Value<int>().Should().Be(0);
+        data["safe"]?.Value<bool>().Should().BeTrue();
+        var locations = data["impactedLocations"] as JArray;
+        locations.Should().NotBeNullOrEmpty();
+        foreach (var l in locations!)
+        {
+            l["severity"]?.Value<string>().Should().Be("info");
+            l["impact"]?.Value<string>().Should().Be("Unknown impact");
+        }
+    }
+
+    [Fact]
+    public async Task AnalyzeDataFlow_OnSingleStatement_ExercisesEqualFirstLastBranch()
+    {
+        // When startLine == endLine and ResolveAnalysisStatements returns the same
+        // node for both, the impl takes the AnalyzeDataFlow(singleStatement) branch
+        // at Compound.cs:75-77. Lock that path against the Sum body's `var partial` line.
+        var (file, firstStmt, _) = LocateSumBody(Service);
+
+        var result = await Service.AnalyzeDataFlowAsync(file, startLine: firstStmt, endLine: firstStmt);
+        AssertSuccess(result);
+
+        var data = GetData(result);
+        data["succeeded"]?.Value<bool>().Should().BeTrue(
+            "the single-statement branch must still produce a successful analysis");
+
+        // `var partial = a + b;` declares partial and reads a, b.
+        var declared = (data["variablesDeclared"] as JArray)!.Select(v => v.Value<string>()).ToList();
+        declared.Should().Contain("partial",
+            "the single-statement region must report the declaration it contains");
+
+        var read = (data["readInside"] as JArray)!.Select(v => v.Value<string>()).ToList();
+        read.Should().Contain("a");
+        read.Should().Contain("b",
+            "single-statement analysis must surface BOTH operands of `a + b`");
+    }
+
+    [Fact]
+    public async Task AnalyzeControlFlow_OnLoopWithBreakAndContinue_ReportsBothExitKinds()
+    {
+        // ControlFlowFixtureTarget.FilterAndSum has a for-loop containing both `continue`
+        // and `break`. Their ExitPoints kinds must surface in the response.
+        var searchResult = await Service.SearchSymbolsAsync("FilterAndSum", kind: "Method", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty(
+            "ControlFlowFixtureTarget.FilterAndSum must be declared in the fixtures project");
+
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var file = loc["filePath"]!.Value<string>()!;
+        // file is solution-relative; resolve to absolute against the solution dir for the local read.
+        var absoluteFile = Path.Combine(Path.GetDirectoryName(SolutionPath)!, file);
+        var lines = File.ReadAllLines(absoluteFile);
+        // Select the LOOP BODY (the three if/if/+= statements) — NOT the for construct
+        // itself. Roslyn classifies break/continue as exit points only when they leave
+        // the analyzed region; if the region IS the loop, break/continue stay inside it.
+        var firstIfLine = Array.FindIndex(lines, l => l.Contains("if (values[i] < 0)"));
+        var totalLine = Array.FindIndex(lines, l => l.Contains("total += values[i];"));
+        firstIfLine.Should().BeGreaterThan(-1);
+        totalLine.Should().BeGreaterThan(firstIfLine);
+
+        var result = await Service.AnalyzeControlFlowAsync(file, startLine: firstIfLine, endLine: totalLine);
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["succeeded"]?.Value<bool>().Should().BeTrue();
+
+        var exitPoints = data["exitPoints"] as JArray;
+        exitPoints.Should().NotBeNullOrEmpty(
+            "a region containing break and continue must report exit points");
+        var kinds = exitPoints!.Select(e => e["kind"]?.Value<string>()).ToList();
+        kinds.Should().Contain("BreakStatement",
+            "the loop's break statement must surface as an exit point");
+        kinds.Should().Contain("ContinueStatement",
+            "the loop's continue statement must surface as an exit point");
+    }
+
+    [Fact]
+    public async Task CheckTypeCompatibility_ListOfIntToIEnumerableOfInt_IsCompatible()
+    {
+        var result = await Service.CheckTypeCompatibilityAsync(
+            "System.Collections.Generic.List`1",
+            "System.Collections.Generic.IEnumerable`1");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["compatible"]?.Value<bool>().Should().BeTrue(
+            "List<T> implements IEnumerable<T>; the generic compatibility must resolve");
+    }
+
+    [Fact]
+    public async Task CheckTypeCompatibility_OpenGenericDictionaryToString_IsIncompatible()
+    {
+        // Negative companion to ListOfIntToIEnumerableOfInt: an open generic type
+        // (Dictionary<,>) has no conversion to System.String. Locks the "incompatible"
+        // branch on a generic source type — the existing Int32→String test covers
+        // only non-generic source types.
+        var result = await Service.CheckTypeCompatibilityAsync(
+            "System.Collections.Generic.Dictionary`2",
+            "System.String");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["compatible"]?.Value<bool>().Should().BeFalse(
+            "Dictionary<,> has no conversion to System.String");
     }
 }
