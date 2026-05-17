@@ -471,16 +471,15 @@ public partial class RoslynService
     {
         if (_solution == null || _workspace == null)
         {
-            return new
+            return CreateSuccessResponse(data: new
             {
                 status = "Not Ready",
                 message = "No solution loaded. Call roslyn:load_solution first or set DOTNET_SOLUTION_PATH environment variable.",
                 solution = (object?)null,
                 workspace = (object?)null
-            };
+            });
         }
 
-        // Get diagnostic summary
         var errorCount = 0;
         var warningCount = 0;
 
@@ -505,7 +504,7 @@ public partial class RoslynService
         var projectCount = _solution.ProjectIds.Count;
         var documentCount = _solution.Projects.Sum(p => p.DocumentIds.Count);
 
-        return new
+        return CreateSuccessResponse(data: new
         {
             status = "Ready",
             message = "Roslyn MCP Server is operational",
@@ -538,7 +537,7 @@ public partial class RoslynService
                 timeoutSeconds = _timeoutSeconds,
                 semanticCacheEnabled = Environment.GetEnvironmentVariable("ROSLYN_ENABLE_SEMANTIC_CACHE") != "false"
             }
-        };
+        });
     }
 
     // Helper methods

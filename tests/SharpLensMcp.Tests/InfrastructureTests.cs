@@ -12,14 +12,13 @@ public class InfrastructureTests : RoslynServiceTestBase
     [Fact]
     public async Task GetHealthCheck_ReturnsSolutionInfo()
     {
-        // Act
         var result = await Service.GetHealthCheckAsync();
 
-        // Assert - health check has different structure (status, solution.loaded, etc.)
-        var json = JObject.FromObject(result);
-        json["status"]?.Value<string>().Should().Be("Ready");
-        json["solution"]?["loaded"]?.Value<bool>().Should().BeTrue();
-        json["solution"]?["path"]?.Value<string>().Should().EndWith("SharpLensMcp.sln");
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["status"]?.Value<string>().Should().Be("Ready");
+        data["solution"]?["loaded"]?.Value<bool>().Should().BeTrue();
+        data["solution"]?["path"]?.Value<string>().Should().EndWith("SharpLensMcp.sln");
     }
 
     [Fact]
@@ -99,13 +98,14 @@ public class InfrastructureTests : RoslynServiceTestBase
     [Fact]
     public async Task DependencyGraph_ReturnsMermaidFormat()
     {
-        // Act
         var result = await Service.GetDependencyGraphAsync(format: "mermaid");
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["mermaid"]?.Value<string>().Should().Contain("graph");
+        // The response field is `graph` (not `mermaid`); previous test asserted on a
+        // non-existent field via `?.` short-circuit, so it silently passed forever.
+        data["format"]?.Value<string>().Should().Be("mermaid");
+        data["graph"]?.Value<string>().Should().Contain("graph TD");
     }
 
     [Fact]
