@@ -198,6 +198,22 @@ public partial class RoslynService
 
         var selectedAction = matchingAction.action;
 
+        // Roslyn surfaces some refactorings as CodeActionWithNestedActions — a menu
+        // wrapper with no operations of its own. Calling GetOperationsAsync on one
+        // throws NotSupportedException. Descend into NestedCodeActions and pick the
+        // first leaf action whose title still matches the caller's request (so a
+        // request for "Introduce local" doesn't accidentally apply "Introduce constant").
+        // NestedCodeActions is internal in Roslyn 5.0; reach it via reflection.
+        while (true)
+        {
+            var nested = GetNestedActionsOrEmpty(selectedAction);
+            if (nested.Length == 0) break;
+            var leaf = nested.FirstOrDefault(child =>
+                child.Title.Contains(title, StringComparison.OrdinalIgnoreCase))
+                ?? nested[0];
+            selectedAction = leaf;
+        }
+
         // Apply the code action
         var operations = await selectedAction.GetOperationsAsync(CancellationToken.None);
         var changedSolution = _solution;
@@ -509,5 +525,23 @@ public partial class RoslynService
         );
     }
 
-
+    // Reach Roslyn's internal CodeAction.NestedCodeActions via reflection. The property
+    // is internal in Microsoft.CodeAnalysis 5.0 but is the only way to discover whether
+    // a CodeAction is a menu wrapper (CodeActionWithNestedActions) vs a leaf action that
+    // can produce operations. Cached PropertyInfo per type to avoid repeated lookups.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, System.Reflection.PropertyInfo?> _nestedActionsPropCache = new();
+    private static System.Collections.Immutable.ImmutableArray<CodeAction> GetNestedActionsOrEmpty(CodeAction action)
+    {
+        var prop = _nestedActionsPropCache.GetOrAdd(
+            action.GetType(),
+            t => t.GetProperty("NestedCodeActions",
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic));
+        if (prop == null) return System.Collections.Immutable.ImmutableArray<CodeAction>.Empty;
+        var value = prop.GetValue(action);
+        return value is System.Collections.Immutable.ImmutableArray<CodeAction> arr
+            ? arr
+            : System.Collections.Immutable.ImmutableArray<CodeAction>.Empty;
+    }
 }
