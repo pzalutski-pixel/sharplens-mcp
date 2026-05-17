@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.5.3] - 2026-05-16
 
 ### Added
 - **`get_external_type_info`** — inspect types from NuGet packages, BCL, and closed-source assemblies the solution references. Returns members, signatures, and XML doc summaries via `GetTypeByMetadataName` + `GetDocumentationCommentXml`. Eliminates the AI-hallucination class against dependency APIs.

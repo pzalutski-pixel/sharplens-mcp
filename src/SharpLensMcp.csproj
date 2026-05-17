@@ -8,16 +8,17 @@
     <LangVersion>latest</LangVersion>
 
     <!-- Package metadata -->
-    <Version>1.5.2</Version>
+    <Version>1.5.3</Version>
     <Authors>Peter Zalutski</Authors>
     <Copyright>Copyright (c) 2025 Peter Zalutski</Copyright>
-    <Description>MCP server providing 62 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
+    <Description>MCP server providing 67 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/pzalutski-pixel/sharplens-mcp</PackageProjectUrl>
     <RepositoryUrl>https://github.com/pzalutski-pixel/sharplens-mcp</RepositoryUrl>
     <PackageTags>mcp;roslyn;csharp;dotnet;code-analysis;ai;semantic-analysis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
+v1.5.3: Added 5 audit/discovery tools (get_external_type_info, get_call_graph, find_untested_code, find_god_objects, get_project_health). get_diagnostics now runs configured analyzers (StyleCop, Roslynator, NetAnalyzers, custom) by default; runAnalyzers:false for old behavior. find_references reports cast kind plus optional server-side kind filter. extract_method response renamed misleading preview mirror to appliesEditsAutomatically:false (tool was always generation-only). Eliminated all dynamic dispatch from src/ via centralized reflection helpers and typed records. Test count 159 to 195.
 v1.5.2: Run source generators so tools see generator-produced code (#7). Fixes phantom CS0117, missed references, wrong unused-code results for projects with generators.
 v1.5.1: Fixed notifications/initialized breaking MCP client connections (#6).
 v1.5.0: Added 7 discovery tools: attribute usages, DI registrations, reflection detection, circular dependencies, NuGet dependencies, source generators, generated code viewer.

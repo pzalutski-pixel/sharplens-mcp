@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/sharplens-mcp.svg)](https://www.npmjs.com/package/sharplens-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/pzalutski-pixel/sharplens-mcp/blob/main/LICENSE)
 
-An MCP server providing **62 semantic analysis tools** for .NET/C#, built on Microsoft Roslyn for compiler-accurate code understanding.
+An MCP server providing **67 semantic analysis tools** for .NET/C#, built on Microsoft Roslyn for compiler-accurate code understanding.
 
 ## Requirements
 
@@ -48,26 +48,29 @@ AI systems need compiler-accurate insights that reading source files cannot prov
 
 ## Features
 
-### Navigation & Discovery (17 tools)
-Symbol info, go to definition, find references, find implementations, find callers, type hierarchy, symbol search, semantic query, type members, method signatures, derived types, base types, attributes, containing member, method overloads, attribute usage search.
+### Navigation & Discovery (19 tools)
+Symbol info, go to definition, find references (now reports `read`/`write`/`invocation`/`cast`/`typeof`/`nameof`/`attribute` kind with optional server-side filter), find implementations, find callers, multi-hop call graph with depth bound + cycle detection, type hierarchy, symbol search, semantic query, type members, batch type members, method signatures, derived types, base types, attributes, containing member, method overloads, attribute usage search, **external type inspection** (NuGet/BCL/closed-source assemblies with members + XML doc summaries).
 
 ### Analysis (11 tools)
-Diagnostics, data flow analysis, control flow analysis, change impact analysis, type compatibility, outgoing calls, unused code detection, code validation, complexity metrics, circular dependency detection, missing members.
+Diagnostics (now runs configured `DiagnosticAnalyzer`s — StyleCop, Roslynator, NetAnalyzers, custom — by default; matches CI output), data flow analysis, control flow analysis, change impact analysis, type compatibility, outgoing calls, unused code detection, code validation, complexity metrics, circular dependency detection, missing members.
 
 ### Refactoring (14 tools)
-Rename, change signature, extract method, extract interface, generate constructor, organize usings, batch format, code actions, implement missing members, encapsulate field, inline variable, extract variable.
+Rename, change signature (fully applies declaration + every call site across `Foo(...)` / `new Foo(...)` / `: this(...)` / `: base(...)` / `new(...)`), extract method, extract interface, generate constructor, organize usings, batch organize, batch format, code actions, apply code action by title, implement missing members, encapsulate field, inline variable, extract variable.
 
 ### Code Generation (2 tools)
 Null check generation, equality member generation.
 
-### Compound Tools (6 tools)
-Type overview, method analysis, file overview, method source, batch method source, instantiation options — combining multiple queries to reduce round-trips.
+### Compound Tools (7 tools)
+Type overview, method analysis, file overview, method source, batch method source, instantiation options, **project health audit** (composite dashboard: diagnostics + unused + coupling + coverage in one call) — combining multiple queries to reduce round-trips.
+
+### Audit & Quality (2 tools)
+**Detect god-objects** via efferent + afferent coupling + member-count thresholds (audit-time scoring). **Find untested code** — public/internal surface not transitively reachable from any `[Fact]`/`[Theory]`/`[Test]`/`[TestMethod]`, sorted by cyclomatic complexity so the riskiest gaps surface first.
 
 ### Discovery (2 tools)
 DI registration scanning, reflection usage detection.
 
 ### Infrastructure (10 tools)
-Health check, solution loading, document synchronization, project structure, dependency graph, code fixes, NuGet dependency listing, source generator inspection, generated code viewer.
+Health check, solution loading, document synchronization, project structure, dependency graph, code fixes, apply code fix, NuGet dependency listing, source generator inspection, generated code viewer.
 
 ## Configuration
 
@@ -77,6 +80,7 @@ Health check, solution loading, document synchronization, project structure, dep
 | `ROSLYN_LOG_LEVEL` | Trace/Debug/Information/Warning/Error | Information |
 | `ROSLYN_TIMEOUT_SECONDS` | Operation timeout | 30 |
 | `ROSLYN_MAX_DIAGNOSTICS` | Maximum diagnostics to return | 100 |
+| `ROSLYN_ENABLE_SEMANTIC_CACHE` | Enable semantic model caching | true |
 | `SHARPLENS_ABSOLUTE_PATHS` | Use absolute paths instead of relative | false |
 
 ## Uninstall

@@ -2,17 +2,17 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.pzalutski-pixel/sharplens",
   "title": "SharpLens",
-  "description": "62 semantic C#/.NET analysis tools via Roslyn: navigation, refactoring, code generation.",
+  "description": "67 semantic C#/.NET analysis tools via Roslyn: navigation, refactoring, code generation, audit/quality.",
   "repository": {
     "url": "https://github.com/pzalutski-pixel/sharplens-mcp",
     "source": "github"
   },
-  "version": "1.4.0",
+  "version": "1.5.3",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "sharplens-mcp",
-      "version": "1.4.0",
+      "version": "1.5.3",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
@@ -40,7 +40,7 @@
     {
       "registryType": "nuget",
       "identifier": "SharpLensMcp",
-      "version": "1.4.0",
+      "version": "1.5.3",
       "runtimeHint": "dotnet tool run",
       "transport": {
         "type": "stdio"

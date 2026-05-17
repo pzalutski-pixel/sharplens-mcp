@@ -1,7 +1,7 @@
 {
   "name": "sharplens-mcp",
-  "version": "1.5.2",
-  "description": "MCP server providing 62 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.",
+  "version": "1.5.3",
+  "description": "MCP server providing 67 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.",
   "bin": {
     "sharplens-mcp": "./bin/sharplens-mcp.js"
   },
