@@ -42,20 +42,28 @@ public class ProjectHealthTests : RoslynServiceTestBase
         topDiags.Should().NotBeNull();
         topDiags!.Count.Should().BeLessOrEqualTo(2);
 
+        // Hotspot arrays may be absent if the section emits no candidates. When present
+        // they must honor topN; when absent we lock that the parent section still exists.
         var godHotspots = data["coupling"]!["hotspots"] as JArray;
         if (godHotspots != null)
-            godHotspots.Count.Should().BeLessOrEqualTo(2);
+        {
+            godHotspots.Count.Should().BeLessOrEqualTo(2,
+                "topN must cap the coupling hotspots list when it is present");
+        }
 
         var coverageHotspots = data["coverage"]!["hotspots"] as JArray;
         if (coverageHotspots != null)
-            coverageHotspots.Count.Should().BeLessOrEqualTo(2);
+        {
+            coverageHotspots.Count.Should().BeLessOrEqualTo(2,
+                "topN must cap the coverage hotspots list when it is present");
+        }
     }
 
     [Fact]
-    public async Task GetProjectHealth_OnNonExistentProject_ReturnsError()
+    public async Task GetProjectHealth_OnNonExistentProject_ReturnsInvalidParameter()
     {
         var result = await Service.GetProjectHealthAsync("DoesNotExist_12345");
-        AssertError(result, "INVALID");
+        AssertError(result, ErrorCodes.InvalidParameter);
     }
 
     [Fact]

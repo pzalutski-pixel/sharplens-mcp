@@ -85,14 +85,21 @@ public class CodeActionTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task ApplyCodeActionByTitle_WithNonExistentTitle_ReturnsSymbolNotFound()
+    public async Task ApplyCodeActionByTitle_WithNonExistentTitle_ReturnsSymbolNotFoundListingAvailableTitles()
     {
         var result = await Service.ApplyCodeActionByTitleAsync(
             RoslynServicePath, line: 10, column: 10,
             title: "This action does not exist 12345");
 
-        // CodeActions.cs:189 returns SymbolNotFound when no action title matches.
         AssertError(result, ErrorCodes.SymbolNotFound);
+        // Line 10/col 10 sits inside the using directives and surfaces "Sort Usings".
+        // The non-matching title triggers CodeActions.cs:192-193 where availableTitles
+        // count > 0 — the hint becomes "Available actions: ..." listing what IS offered.
+        var json = JObject.FromObject(result);
+        json["error"]?["hint"]?.Value<string>().Should().Contain("Available actions:",
+            "when titles exist at the position, hint must list them rather than say 'No actions available'");
+        json["error"]?["hint"]?.Value<string>().Should().Contain("Sort Usings",
+            "Sort Usings is the deterministic refactoring offered in a using directive");
     }
 
     [Fact]

@@ -61,14 +61,30 @@ public class McpServerTests
     }
 
     [Fact]
-    public async Task HandleRequest_ToolsList_ReturnsTools()
+    public async Task HandleRequest_ToolsList_ReturnsAllRegisteredTools()
     {
         var request = """{"jsonrpc":"2.0","id":1,"method":"tools/list"}""";
         var response = ParseResponse(await _server.HandleRequestAsync(request));
 
         var result = response["result"]!.AsObject();
         var tools = result["tools"]!.AsArray();
-        tools.Count.Should().BeGreaterThan(0);
+        // The dispatcher in McpServer.cs has 67 registered tool names; the list response
+        // must surface every one of them. A lower count means a tool was forgotten in
+        // HandleListToolsAsync; a higher count means a duplicate or stale entry.
+        tools.Count.Should().Be(67, "the dispatcher registers exactly 67 tools as of 1.5.3");
+        // Every tool entry must carry name + description, the contract for MCP clients.
+        foreach (var tool in tools)
+        {
+            var t = tool!.AsObject();
+            t["name"]!.GetValue<string>().Should().StartWith("roslyn:");
+            t["description"]!.GetValue<string>().Should().NotBeNullOrEmpty();
+        }
+        // Spot-check: a few representative tools across categories must appear.
+        var names = tools.Select(t => t!.AsObject()["name"]!.GetValue<string>()).ToList();
+        names.Should().Contain("roslyn:health_check");
+        names.Should().Contain("roslyn:search_symbols");
+        names.Should().Contain("roslyn:extract_method");
+        names.Should().Contain("roslyn:get_code_actions_at_position");
     }
 
     [Fact]
@@ -116,13 +132,22 @@ public class McpServerTests
     }
 
     [Fact]
-    public async Task HandleRequest_ToolCallWithoutSolution_ReturnsError()
+    public async Task HandleRequest_ToolCallHealthCheckWithoutSolution_ReportsNotReady()
     {
         var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"roslyn:health_check","arguments":{}}}""";
         var response = ParseResponse(await _server.HandleRequestAsync(request));
 
         response["id"]!.GetValue<long>().Should().Be(1);
-        response["result"].Should().NotBeNull();
+        // tools/call returns result.content[0].text containing the tool's JSON envelope.
+        var result = response["result"]!.AsObject();
+        var content = result["content"]!.AsArray();
+        content.Count.Should().BeGreaterThan(0, "tools/call always wraps tool output in a content array");
+        var text = content[0]!.AsObject()["text"]!.GetValue<string>();
+        // health_check without a loaded solution reports status "Not Ready" per RoslynService.cs:474-480.
+        text.Should().Contain("\"status\":\"Not Ready\"",
+            "an unloaded solution must surface as Not Ready, not as an error");
+        text.Should().Contain("load_solution",
+            "the message must point the caller at load_solution");
     }
 
     [Fact]

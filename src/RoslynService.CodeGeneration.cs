@@ -476,7 +476,9 @@ public partial class RoslynService
         // Apply the change
         await File.WriteAllTextAsync(filePath, newText.ToString());
 
-        // Reload solution to pick up changes
+        // Reload solution to pick up changes. Note: cache clear forces re-resolution
+        // but the in-memory _solution still has pre-edit text — caller must call
+        // sync_documents to refresh the workspace before downstream tool calls.
         _documentCache.Clear();
         _compilationCache.Clear();
 
@@ -488,7 +490,7 @@ public partial class RoslynService
                 parametersWithNullChecks = nullableParams,
                 generatedCode = nullChecks.ToString().Trim()
             },
-            suggestedNextTools: new[] { "get_diagnostics to verify changes" }
+            suggestedNextTools: new[] { "sync_documents to refresh the workspace, then get_diagnostics to verify" }
         );
     }
 
@@ -639,8 +641,10 @@ public partial class RoslynService
         var newText = sourceText.Replace(new TextSpan(insertPosition, 0), equalsCode.ToString());
         await File.WriteAllTextAsync(filePath, newText.ToString());
 
-        // Clear cache
+        // Clear both caches — subsequent compilation requests must re-read from disk
+        // rather than serve the pre-edit version. Matches AddNullChecksAsync.
         _documentCache.Clear();
+        _compilationCache.Clear();
 
         return CreateSuccessResponse(
             data: new
@@ -650,7 +654,7 @@ public partial class RoslynService
                 membersCompared = members,
                 includeOperators
             },
-            suggestedNextTools: new[] { "get_diagnostics to verify changes" }
+            suggestedNextTools: new[] { "sync_documents to refresh the workspace, then get_diagnostics to verify" }
         );
     }
 

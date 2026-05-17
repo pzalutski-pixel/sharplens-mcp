@@ -181,8 +181,11 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         AssertSuccess(result);
         var data = GetData(result);
         var packages = (data["projects"] as JArray)?[0]?["packages"] as JArray;
-        packages.Should().NotBeNull();
-        packages!.All(p => p["version"]?.Value<string>() != null).Should().BeTrue();
+        // SharpLensMcp.csproj declares 6+ PackageReferences — packages must be non-empty,
+        // or the .All() check silently passes regardless of impl behavior.
+        packages.Should().NotBeNullOrEmpty("SharpLensMcp project has direct package references");
+        packages!.All(p => p["version"]?.Value<string>() != null).Should().BeTrue(
+            "every reported package must include a resolved version string");
     }
 
     #endregion
@@ -195,8 +198,11 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         var result = await Service.GetSourceGeneratorsAsync();
         AssertSuccess(result);
         var projects = GetData(result)["projects"] as JArray;
-        projects.Should().NotBeNull();
-        // Every entry must have at least one generator (impl skips empty projects).
+        // SharpLensMcp.Tests uses [JsonSerializable] which triggers System.Text.Json's
+        // source generator — at least one project must be reported, or the foreach
+        // silently passes regardless of impl behavior.
+        projects.Should().NotBeNullOrEmpty(
+            "SharpLensMcp.Tests has a [JsonSerializable] consumer that triggers the JSON source generator");
         foreach (var p in projects!)
         {
             var gens = p["generators"] as JArray;

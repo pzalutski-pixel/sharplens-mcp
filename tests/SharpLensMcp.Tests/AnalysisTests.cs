@@ -250,7 +250,11 @@ public class AnalysisTests : RoslynServiceTestBase
         AssertSuccess(result);
         var data = GetData(result);
         var unusedSymbols = data["unusedSymbols"] as JArray;
-        unusedSymbols.Should().NotBeNull("response must always include an unusedSymbols array");
+        // Our solution has the deliberately-untested UntestedCodeFrameworkTests fixtures
+        // (UntestedCodeFixture, UntestedFrameworkTarget) and a CompoundedTestabilityTarget
+        // — at least one unused symbol must appear, or the foreach silently passes.
+        unusedSymbols.Should().NotBeNullOrEmpty(
+            "the solution intentionally contains fixtures with untested public surface");
         unusedSymbols!.Count.Should().BeLessOrEqualTo(10, "maxResults must be enforced");
         // Every returned entry must conform to the documented UnusedSymbolEntry shape.
         foreach (var entry in unusedSymbols)
@@ -279,15 +283,22 @@ public class AnalysisTests : RoslynServiceTestBase
     [Fact]
     public async Task ValidateCode_WithInvalidCode_ReturnsErrors()
     {
-        // Act
         var code = "public class Test { public void Foo() { invalidSyntax!!!! } }";
         var result = await Service.ValidateCodeAsync(code, standalone: true);
 
-        // Assert
         AssertSuccess(result);
         var data = GetData(result);
         data["compiles"]?.Value<bool>().Should().BeFalse();
-        data["errors"].Should().NotBeNull();
+        var errors = data["errors"] as JArray;
+        errors.Should().NotBeNullOrEmpty(
+            "an obviously malformed expression must surface compiler errors, not an empty list");
+        // Every emitted error must carry a real diagnostic ID (CS####) — empty IDs would
+        // mean the response shape is broken even though compiles=false.
+        foreach (var err in errors!)
+        {
+            err["id"]?.Value<string>().Should().StartWith("CS",
+                "compiler errors are reported with CS-prefixed IDs");
+        }
     }
 
     [Fact]

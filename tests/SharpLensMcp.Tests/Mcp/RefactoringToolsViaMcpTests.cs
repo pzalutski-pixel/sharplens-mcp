@@ -335,4 +335,46 @@ public class RefactoringToolsViaMcpTests : McpTestBase
         error["code"]?.Value<string>().Should().Be(ErrorCodes.SymbolNotFound);
         error["message"]?.Value<string>().Should().Contain("extract variable");
     }
+
+    [Fact]
+    public async Task ApplyCodeActionByTitle_PreviewFalseOnSortUsings_WritesToDiskThenRestoresOnFinally()
+    {
+        // End-to-end apply via MCP for apply_code_action_by_title. Pick "Sort Usings" at
+        // line 10 col 10 of RoslynService.cs (already locked as a deterministic refactoring
+        // by the GetCodeActionsAtPosition_InUsingsBlock test). Snapshot/restore the file
+        // so the apply runs against real disk but downstream tests see the original content.
+        var snapshot = File.ReadAllText(Fixture.RoslynServicePath);
+        try
+        {
+            var data = await CallAndGetDataAsync("roslyn:apply_code_action_by_title", new
+            {
+                filePath = Fixture.RoslynServicePath,
+                line = 10, column = 10,
+                title = "Sort Usings",
+                preview = false
+            });
+
+            // preview=false contract: applied flips to true; changedFiles[0].newText is
+            // null because writing went to disk rather than the response payload.
+            data["applied"]?.Value<bool>().Should().BeTrue(
+                "preview=false must report applied=true per CodeActions.cs:310");
+            data["preview"]?.Value<bool>().Should().BeFalse();
+            data["actionTitle"]?.Value<string>().Should().Be("Sort Usings");
+
+            var changed = data["changedFiles"] as JArray;
+            changed.Should().NotBeNullOrEmpty(
+                "apply must report at least one changed file even if the sort is a no-op");
+            var first = changed![0];
+            first["newText"]?.Type.Should().Be(JTokenType.Null,
+                "preview=false must not embed the new text in the response — it went to disk");
+            first["isNewFile"]?.Value<bool>().Should().BeFalse();
+            first["changeType"]?.Value<string>().Should().Be("Modified");
+        }
+        finally
+        {
+            // Mandatory restore: even if the test failed mid-assertion, leave the
+            // working tree pristine so downstream tests see the original file.
+            File.WriteAllText(Fixture.RoslynServicePath, snapshot);
+        }
+    }
 }

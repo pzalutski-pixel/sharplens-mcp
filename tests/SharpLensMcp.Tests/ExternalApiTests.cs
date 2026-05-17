@@ -36,7 +36,7 @@ public class ExternalApiTests : RoslynServiceTestBase
     public async Task GetExternalTypeInfo_OnUnknownType_ReturnsTypeNotFound()
     {
         var result = await Service.GetExternalTypeInfoAsync("System.Garbage.DoesNotExist");
-        AssertError(result, "TYPE_NOT_FOUND");
+        AssertError(result, ErrorCodes.TypeNotFound);
     }
 
     [Fact]

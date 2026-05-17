@@ -102,7 +102,7 @@ public class CallGraphTests : RoslynServiceTestBase
     {
         var (file, line, col) = await LocateAsync("ChainA");
         var result = await Service.GetCallGraphAsync(file, line, col, maxDepth: 0);
-        AssertError(result, "INVALID");
+        AssertError(result, ErrorCodes.InvalidParameter);
     }
 
     [Fact]
@@ -110,6 +110,6 @@ public class CallGraphTests : RoslynServiceTestBase
     {
         var (file, line, col) = await LocateAsync("ChainA");
         var result = await Service.GetCallGraphAsync(file, line, col, maxDepth: 100);
-        AssertError(result, "INVALID");
+        AssertError(result, ErrorCodes.InvalidParameter);
     }
 }

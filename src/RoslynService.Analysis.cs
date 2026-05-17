@@ -1082,6 +1082,15 @@ public partial class RoslynService
             }
         }
 
+        // On apply, clear caches so subsequent compilation reads pick up the new on-disk
+        // content. Caller should call sync_documents to refresh the workspace's solution
+        // since we wrote directly through File.WriteAllTextAsync rather than via SolutionEditor.
+        if (!preview && filesWithChanges > 0)
+        {
+            _documentCache.Clear();
+            _compilationCache.Clear();
+        }
+
         return CreateSuccessResponse(
             data: new
             {
@@ -1092,7 +1101,7 @@ public partial class RoslynService
             },
             suggestedNextTools: preview
                 ? new[] { "organize_usings_batch with preview=false to apply changes" }
-                : new[] { "get_diagnostics to verify no issues introduced", "format_document_batch for consistent formatting" },
+                : new[] { "sync_documents to refresh the workspace, then get_diagnostics to verify" },
             totalCount: totalFiles,
             returnedCount: processedFiles.Count
         );
@@ -1167,6 +1176,15 @@ public partial class RoslynService
             }
         }
 
+        // On apply, clear caches so subsequent compilation reads pick up the new on-disk
+        // content. Caller should call sync_documents to refresh the workspace's solution
+        // since we wrote directly through File.WriteAllTextAsync rather than via SolutionEditor.
+        if (!preview && filesFormatted > 0)
+        {
+            _documentCache.Clear();
+            _compilationCache.Clear();
+        }
+
         return CreateSuccessResponse(
             data: new
             {
@@ -1177,7 +1195,7 @@ public partial class RoslynService
             },
             suggestedNextTools: preview
                 ? new[] { "format_document_batch with preview=false to apply changes" }
-                : new[] { "get_diagnostics to verify no issues introduced" },
+                : new[] { "sync_documents to refresh the workspace, then get_diagnostics to verify" },
             totalCount: totalFiles,
             returnedCount: processedFiles.Count
         );

@@ -353,6 +353,68 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task GetDiagnostics_SeverityInfoFilter_OnlyInfoEntries()
+    {
+        var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        {
+            filePath = (string?)null,
+            projectPath = (string?)null,
+            severity = "Info",
+            includeHidden = false,
+            runAnalyzers = false
+        });
+        var diagnostics = data["diagnostics"] as JArray;
+        diagnostics.Should().NotBeNull("response must always carry a diagnostics array");
+        // Severity filter contract: every entry that survives the filter must match.
+        // A clean compiler-only build may yield zero Info diagnostics — that's acceptable.
+        foreach (var d in diagnostics!)
+        {
+            d["severity"]?.Value<string>().Should().Be("Info",
+                "the severity=Info filter must drop every non-Info entry");
+        }
+        data["errorCount"]?.Value<int>().Should().Be(0,
+            "with severity=Info, errorCount must be 0");
+        data["warningCount"]?.Value<int>().Should().Be(0,
+            "with severity=Info, warningCount must be 0");
+    }
+
+    [Fact]
+    public async Task GetDiagnostics_IncludeHiddenTrue_IsSupersetOfIncludeHiddenFalse()
+    {
+        // includeHidden controls whether Severity=Hidden diagnostics surface. Setting it
+        // to true must produce a superset (or equal set) of the includeHidden=false call.
+        var withoutHidden = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        {
+            filePath = (string?)null,
+            projectPath = (string?)null,
+            severity = (string?)null,
+            includeHidden = false,
+            runAnalyzers = false
+        });
+        var withHidden = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        {
+            filePath = (string?)null,
+            projectPath = (string?)null,
+            severity = (string?)null,
+            includeHidden = true,
+            runAnalyzers = false
+        });
+        var visibleCount = (withoutHidden["diagnostics"] as JArray)!.Count;
+        var allCount = (withHidden["diagnostics"] as JArray)!.Count;
+        allCount.Should().BeGreaterOrEqualTo(visibleCount,
+            "the includeHidden=true result set must contain every includeHidden=false entry plus any hidden ones");
+        // Every visible (non-hidden) id from the smaller set must also appear in the larger set.
+        var visibleIds = (withoutHidden["diagnostics"] as JArray)!
+            .Select(d => $"{d["id"]?.Value<string>()}:{d["line"]?.Value<int>()}")
+            .ToHashSet();
+        var allIds = (withHidden["diagnostics"] as JArray)!
+            .Select(d => $"{d["id"]?.Value<string>()}:{d["line"]?.Value<int>()}")
+            .ToHashSet();
+        visibleIds.IsSubsetOf(allIds).Should().BeTrue(
+            "every visible diagnostic id+line must also appear in the includeHidden=true set");
+    }
+
+    [Fact]
     public async Task GetMissingMembers_OnRoslynService_NoneMissing()
     {
         // RoslynService is a complete partial class. Resolve the MatchesGlobPattern
