@@ -36,9 +36,14 @@ public abstract class RoslynServiceTestBase : IAsyncLifetime
         Service = new RoslynService();
         var result = await Service.LoadSolutionAsync(SolutionPath);
 
-        // Verify solution loaded successfully
+        // Verify solution loaded successfully. Lock success NotBeNull-first to defeat
+        // the null-conditional silent-pass pattern — `json["success"]?.Value<bool>()
+        // .Should().BeTrue(...)` would skip the assertion entirely if the success
+        // field were missing (e.g., a regression that bypasses CreateSuccessResponse).
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue("Solution should load successfully");
+        json["success"].Should().NotBeNull(
+            "every response envelope must include a success field");
+        json["success"]!.Value<bool>().Should().BeTrue("Solution should load successfully");
     }
 
     public Task DisposeAsync()
@@ -48,26 +53,39 @@ public abstract class RoslynServiceTestBase : IAsyncLifetime
     }
 
     /// <summary>
-    /// Asserts that a response indicates success.
+    /// Asserts that a response indicates success. Locks the success field NotBeNull-first
+    /// so a missing-envelope regression can't silently pass via the null-conditional
+    /// short-circuit on `.Should()`.
     /// </summary>
     protected void AssertSuccess(object response)
     {
         var json = JObject.FromObject(response);
-        json["success"]?.Value<bool>().Should().BeTrue(
+        json["success"].Should().NotBeNull("response envelope must include success field");
+        json["success"]!.Value<bool>().Should().BeTrue(
             $"Expected success but got: {json["error"]}");
     }
 
     /// <summary>
     /// Asserts that a response indicates failure with specific error.
+    /// Same NotBeNull-first hardening as AssertSuccess; additionally locks the
+    /// error.code path so missing-error or missing-code regressions can't pass.
     /// </summary>
     protected void AssertError(object response, string? errorCodeContains = null)
     {
         var json = JObject.FromObject(response);
-        json["success"]?.Value<bool>().Should().BeFalse();
+        json["success"].Should().NotBeNull("response envelope must include success field");
+        json["success"]!.Value<bool>().Should().BeFalse();
 
         if (errorCodeContains != null)
         {
-            json["error"]?["code"]?.Value<string>().Should().Contain(errorCodeContains);
+            json["error"].Should().NotBeNull("error responses must carry an error object");
+            // RoslynError uses C# PascalCase properties (Code, Message, Hint, Context),
+            // and Newtonsoft.Json's JObject.FromObject preserves the casing as-is. The
+            // prior `["error"]?["code"]?.Value<string>().Should().Contain(...)` chain
+            // was silently passing because (a) the field is "Code" not "code", and
+            // (b) the null-conditional short-circuited the entire assertion.
+            json["error"]!["Code"].Should().NotBeNull("error.Code field is required");
+            json["error"]!["Code"]!.Value<string>().Should().Contain(errorCodeContains);
         }
     }
 
