@@ -98,9 +98,15 @@ public class DispatcherContractTests : McpTestBase
                 new { typeName = "RoslynService", methodName = "GetHealthCheckAsync" }
             }
         });
-        data["totalRequested"]?.Value<int>().Should().Be(2);
-        data["successCount"]?.Value<int>().Should().Be(2);
-        data["errorCount"]?.Value<int>().Should().Be(0);
+        // NotBeNull-first defeats the null-conditional silent-pass — if these fields
+        // were renamed/removed, the bare `?.Value<int>().Should().Be(N)` chain would
+        // skip the assertion instead of failing.
+        data["totalRequested"].Should().NotBeNull();
+        data["totalRequested"]!.Value<int>().Should().Be(2);
+        data["successCount"].Should().NotBeNull();
+        data["successCount"]!.Value<int>().Should().Be(2);
+        data["errorCount"].Should().NotBeNull();
+        data["errorCount"]!.Value<int>().Should().Be(0);
 
         // Each result's metadata must reflect the exact requested method.
         var results = data["results"] as JArray;
@@ -119,8 +125,10 @@ public class DispatcherContractTests : McpTestBase
             includeHidden = false,
             runAnalyzers = false
         });
-        data["analyzersRan"]?.Value<bool>().Should().BeFalse();
-        data["analyzerCount"]?.Value<int>().Should().Be(0);
+        data["analyzersRan"].Should().NotBeNull();
+        data["analyzersRan"]!.Value<bool>().Should().BeFalse();
+        data["analyzerCount"].Should().NotBeNull();
+        data["analyzerCount"]!.Value<int>().Should().Be(0);
     }
 
     [Fact]
@@ -162,7 +170,8 @@ public class DispatcherContractTests : McpTestBase
         pagination.Should().NotBeNull();
         // pagination always has nextOffset (may be null when no more); offset is at the
         // top level of data per Navigation.cs SearchSymbolsAsync.
-        data["offset"]?.Value<int>().Should().Be(0, "default offset is 0");
+        data["offset"].Should().NotBeNull("response must include offset field");
+        data["offset"]!.Value<int>().Should().Be(0, "default offset is 0");
     }
 
     [Fact]
@@ -171,7 +180,8 @@ public class DispatcherContractTests : McpTestBase
         // Explicit envelope-shape test: the harness implicitly verifies this on every
         // call, but a dedicated named test surfaces regressions clearly.
         var inner = await CallToolAsync("roslyn:health_check");
-        inner["success"]?.Value<bool>().Should().BeTrue(
+        inner["success"].Should().NotBeNull("response must include success field");
+        inner["success"]!.Value<bool>().Should().BeTrue(
             "health_check must succeed at the inner contract layer");
         inner["data"].Should().NotBeNull(
             "successful responses must carry a data object");
