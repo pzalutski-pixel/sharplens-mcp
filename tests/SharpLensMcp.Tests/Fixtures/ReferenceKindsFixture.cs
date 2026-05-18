@@ -17,6 +17,11 @@ public class TrackedTarget
 {
     public Func<int> TrackedField = () => 0;
 
+    // A const used directly as an attribute argument (no typeof/nameof/cast/invocation
+    // wrap) so the kind classifier walks up to AttributeSyntax FIRST and returns
+    // "attribute" — the otherwise-unreachable branch.
+    public const string TrackedMarker = "marker";
+
     [Tracked(nameof(TrackedField))]   // nameof + attribute argument
     public void Use()
     {
@@ -34,4 +39,10 @@ public class TrackedTarget
         _ = t;
         _ = read;
     }
+
+    // Separate method whose attribute argument is TrackedMarker (a const) directly —
+    // no nameof/typeof/cast/invocation wrapper, so the classifier returns "attribute".
+    // TrackedAttribute lacks AllowMultiple, so we can't stack two on Use().
+    [Tracked(TrackedMarker)]
+    public void UseMarker() { }
 }

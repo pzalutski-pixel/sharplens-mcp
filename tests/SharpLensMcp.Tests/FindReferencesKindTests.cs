@@ -20,20 +20,65 @@ public class FindReferencesKindTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task FindReferences_OnFixtureTrackedTarget_ClassifiesCast()
+    public async Task FindReferences_OnFixtureTrackedTarget_ClassifiesCastAndTypeof()
     {
         // Search returns the type-declaration position. find_references finds every use
-        // of the type, including `(TrackedTarget)boxed` in Fixtures.TrackedTarget.Use.
+        // of the type, including `(TrackedTarget)boxed` AND `typeof(TrackedTarget)` in
+        // Fixtures.TrackedTarget.Use.
         var (file, line, col) = await LocateAsync("TrackedTarget", kind: "Class");
         var result = await Service.FindReferencesAsync(file, line, col);
         AssertSuccess(result);
 
-        var refs = GetData(result)["references"] as JArray;
+        var data = GetData(result);
+        var refs = data["references"] as JArray;
         refs.Should().NotBeNullOrEmpty();
 
         var kinds = refs!.Select(r => r["kind"]?.Value<string>()).ToList();
         kinds.Should().Contain("cast",
             $"the fixture has `(TrackedTarget)boxed`; got kinds: {string.Join(", ", kinds)}");
+        kinds.Should().Contain("typeof",
+            $"the fixture has `typeof(TrackedTarget)`; got kinds: {string.Join(", ", kinds)}");
+
+        data["totalReferences"]?.Value<int>().Should().Be(refs.Count,
+            "totalReferences must match the array length when no kind filter is applied");
+    }
+
+    [Fact]
+    public async Task FindReferences_OnTrackedField_ClassifiesAllReadInvocationWriteNameofKinds()
+    {
+        // The fixture references TrackedField in every classifier branch except
+        // "attribute" (which requires a non-wrapped attribute argument — covered
+        // by TrackedMarker below).
+        var (file, line, col) = await LocateAsync("TrackedField", kind: "Field");
+        var result = await Service.FindReferencesAsync(file, line, col);
+        AssertSuccess(result);
+
+        var refs = (GetData(result)["references"] as JArray)!;
+        var kinds = refs.Select(r => r["kind"]?.Value<string>()).Distinct().ToList();
+        kinds.Should().Contain("write",
+            $"the fixture has `TrackedField = () => 7`; got kinds: {string.Join(", ", kinds)}");
+        kinds.Should().Contain("invocation",
+            $"the fixture has `TrackedField()`; got kinds: {string.Join(", ", kinds)}");
+        kinds.Should().Contain("read",
+            $"the fixture has `var read = TrackedField`; got kinds: {string.Join(", ", kinds)}");
+        kinds.Should().Contain("nameof",
+            $"the fixture has `nameof(TrackedField)`; got kinds: {string.Join(", ", kinds)}");
+    }
+
+    [Fact]
+    public async Task FindReferences_OnTrackedMarker_ClassifiesAttribute()
+    {
+        // TrackedMarker is a const referenced directly in `[Tracked(TrackedMarker)]`.
+        // The classifier walks up from the identifier and reaches AttributeSyntax
+        // before any other matched kind — returns "attribute" (Navigation.cs:718-719).
+        var (file, line, col) = await LocateAsync("TrackedMarker", kind: "Field");
+        var result = await Service.FindReferencesAsync(file, line, col);
+        AssertSuccess(result);
+
+        var refs = (GetData(result)["references"] as JArray)!;
+        refs.Should().NotBeNullOrEmpty();
+        refs.Any(r => r["kind"]?.Value<string>() == "attribute")
+            .Should().BeTrue("TrackedMarker is used directly as an attribute argument");
     }
 
     [Fact]
