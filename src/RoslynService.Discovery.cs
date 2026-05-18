@@ -227,6 +227,18 @@ public partial class RoslynService
 
         var analysisLevel = level?.ToLower() ?? "project";
 
+        // Validate level explicitly — silently treating unknown values as namespace
+        // (the prior behavior) hides typos from callers and produces wrong-but-plausible
+        // output. The supported set is just {project, namespace}.
+        if (analysisLevel != "project" && analysisLevel != "namespace")
+        {
+            return Task.FromResult(CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                $"level must be 'project' or 'namespace' (got '{level}')",
+                context: new { level }
+            ));
+        }
+
         if (analysisLevel == "project")
         {
             var projectGraph = new Dictionary<string, List<string>>();
@@ -298,7 +310,11 @@ public partial class RoslynService
                 level = "namespace",
                 hasCycles = cycles.Count > 0,
                 cycles,
-                namespaceCount = namespaceGraph.Count
+                namespaceCount = namespaceGraph.Count,
+                // Emit the graph for consistency with the project-level response. Without
+                // this, the namespace-level response shape diverged from project-level for
+                // no documented reason.
+                graph = graphForCycleDetection
             },
             suggestedNextTools: new[] { "dependency_graph", "get_project_structure" }
         );

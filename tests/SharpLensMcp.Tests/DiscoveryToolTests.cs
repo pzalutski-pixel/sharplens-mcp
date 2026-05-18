@@ -14,14 +14,28 @@ public class DiscoveryToolTests : RoslynServiceTestBase
     #region find_attribute_usages
 
     [Fact]
-    public async Task FindAttributeUsages_WithJsonConverterAttribute_FindsRequestId()
+    public async Task FindAttributeUsages_WithJsonConverterAttribute_FindsRequestIdWithFullEntryShape()
     {
         var result = await Service.FindAttributeUsagesAsync("JsonConverter");
         AssertSuccess(result);
         var data = GetData(result);
         var usages = data["usages"] as JArray;
-        usages.Should().NotBeNull();
-        usages!.Any(u => u["symbolName"]?.Value<string>()?.Contains("RequestId") == true).Should().BeTrue();
+        usages.Should().NotBeNullOrEmpty(
+            "RequestId in SharpLensMcp is decorated with [JsonConverter]");
+
+        // Lock the entry shape on the matched RequestId usage so a regression that
+        // drops attribute/location fields would fail.
+        var requestIdUsage = usages!.First(u =>
+            u["symbolName"]?.Value<string>()?.Contains("RequestId") == true);
+        requestIdUsage["attribute"]?["name"]?.Value<string>().Should()
+            .Be("JsonConverterAttribute", "the matched attribute's full type name must appear");
+        requestIdUsage["location"]?["filePath"]?.Value<string>().Should()
+            .EndWith(".cs", "every usage must carry a source filePath");
+        requestIdUsage["location"]?["line"]?.Type.Should().Be(JTokenType.Integer);
+
+        // totalCount is the unbounded counter; returnedCount might equal it or be capped.
+        var meta = JObject.FromObject(result)["meta"];
+        meta?["totalCount"]?.Value<int>().Should().BeGreaterThan(0);
     }
 
     [Fact]
@@ -46,6 +60,18 @@ public class DiscoveryToolTests : RoslynServiceTestBase
             "RequestId in SharpLensMcp is decorated with [JsonConverter]");
         usages!.Any(u => u["symbolName"]?.Value<string>()?.Contains("RequestId") == true)
             .Should().BeTrue();
+
+        // The filter contract: NO usage from outside the SharpLensMcp project may appear.
+        // Without this, "only main project matches" is unproven — the filter could be
+        // a no-op and the test would still pass.
+        foreach (var usage in usages)
+        {
+            var path = usage["location"]?["filePath"]?.Value<string>() ?? "";
+            path.Should().NotContain("/tests/",
+                "filter=SharpLensMcp must exclude test-project files");
+            path.Should().NotContain("\\tests\\",
+                "filter=SharpLensMcp must exclude test-project files (Windows path)");
+        }
     }
 
     #endregion
@@ -92,7 +118,7 @@ public class DiscoveryToolTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task FindReflectionUsage_WithProjectFilter_ReturnsSameRoslynServiceUsages()
+    public async Task FindReflectionUsage_WithProjectFilter_RestrictsToFilteredProject()
     {
         var result = await Service.FindReflectionUsageAsync(projectName: "SharpLensMcp");
         AssertSuccess(result);
@@ -100,6 +126,16 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         usages!.Any(u => u["reflectionApi"]?.Value<string>() == "Type.GetProperty")
             .Should().BeTrue(
                 "the SharpLensMcp project contains the reflection helpers in RoslynService.cs");
+
+        // Prove the filter — every reported usage must be in the SharpLensMcp project,
+        // not in a test file.
+        foreach (var usage in usages)
+        {
+            var path = usage["location"]?["filePath"]?.Value<string>() ?? "";
+            path.Should().NotContain("/tests/",
+                "filter=SharpLensMcp must exclude test-project reflection usages");
+            path.Should().NotContain("\\tests\\");
+        }
     }
 
     #endregion
@@ -128,9 +164,22 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         AssertSuccess(result);
         var data = GetData(result);
         data["level"]?.Value<string>().Should().Be("namespace");
-        // Our solution has multiple namespaces (SharpLensMcp, SharpLensMcp.Tests,
-        // SharpLensMcp.Tests.Mcp, SharpLensMcp.Tests.Fixtures, etc.).
-        data["namespaceCount"]?.Value<int>().Should().BeGreaterOrEqualTo(4);
+        // Our solution declares at least SharpLensMcp, SharpLensMcp.Tests,
+        // SharpLensMcp.Tests.Mcp, SharpLensMcp.Tests.Fixtures, SharpLensMcp.Tests.TestAnalyzers.
+        data["namespaceCount"]?.Value<int>().Should().BeGreaterOrEqualTo(5);
+        // The graph keys must include the well-known namespaces.
+        var graph = data["graph"] as JObject;
+        graph.Should().NotBeNull();
+        graph!.ContainsKey("SharpLensMcp").Should().BeTrue();
+        graph.ContainsKey("SharpLensMcp.Tests").Should().BeTrue();
+        graph.ContainsKey("SharpLensMcp.Tests.Fixtures").Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task FindCircularDependencies_WithInvalidLevel_ReturnsInvalidParameter()
+    {
+        var result = await Service.FindCircularDependenciesAsync("filesystem");
+        AssertError(result, ErrorCodes.InvalidParameter);
     }
 
     [Fact]
@@ -184,8 +233,14 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         // SharpLensMcp.csproj declares 6+ PackageReferences — packages must be non-empty,
         // or the .All() check silently passes regardless of impl behavior.
         packages.Should().NotBeNullOrEmpty("SharpLensMcp project has direct package references");
-        packages!.All(p => p["version"]?.Value<string>() != null).Should().BeTrue(
-            "every reported package must include a resolved version string");
+        // Per-entry shape: every package must carry packageName (non-empty) AND version (non-empty).
+        foreach (var pkg in packages!)
+        {
+            pkg["packageName"]?.Value<string>().Should().NotBeNullOrEmpty(
+                "every package entry must carry a non-empty packageName");
+            pkg["version"]?.Value<string>().Should().NotBeNullOrEmpty(
+                "every package entry must carry a non-empty resolved version string");
+        }
     }
 
     #endregion
