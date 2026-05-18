@@ -49,7 +49,7 @@ public class McpServerTests
     }
 
     [Fact]
-    public async Task HandleRequest_Initialize_ReturnsProtocolVersion()
+    public async Task HandleRequest_Initialize_ReturnsProtocolVersionAndSemverServerVersion()
     {
         var request = """{"jsonrpc":"2.0","id":1,"method":"initialize"}""";
         var response = ParseResponse(await _server.HandleRequestAsync(request));
@@ -57,7 +57,11 @@ public class McpServerTests
         var result = response["result"]!.AsObject();
         result["protocolVersion"]!.GetValue<string>().Should().NotBeEmpty();
         result["serverInfo"]!.AsObject()["name"]!.GetValue<string>().Should().Be("SharpLensMcp");
-        result["serverInfo"]!.AsObject()["version"]!.GetValue<string>().Should().NotBe("1.0.0");
+        // The version must match a semver-like pattern (X.Y.Z), not the literal default
+        // "1.0.0". Replaces a non-equality check that would pass for any other string.
+        var version = result["serverInfo"]!.AsObject()["version"]!.GetValue<string>();
+        version.Should().MatchRegex(@"^\d+\.\d+\.\d+",
+            "serverInfo.version must be a semver-like X.Y.Z string");
     }
 
     [Fact]
@@ -99,17 +103,19 @@ public class McpServerTests
     }
 
     [Fact]
-    public async Task HandleRequest_MissingMethod_ReturnsInvalidRequest()
+    public async Task HandleRequest_MissingMethod_ReturnsInvalidRequestWithMessage()
     {
         var request = """{"jsonrpc":"2.0","id":1}""";
         var response = ParseResponse(await _server.HandleRequestAsync(request));
 
         var error = response["error"]!.AsObject();
         error["code"]!.GetValue<int>().Should().Be(-32600);
+        error["message"]!.GetValue<string>().Should().Contain("method",
+            "the error message must mention the missing 'method' field");
     }
 
     [Fact]
-    public async Task HandleRequest_InvalidJson_Returns32700ParseError()
+    public async Task HandleRequest_InvalidJson_Returns32700ParseErrorWithNullId()
     {
         var request = "not valid json";
         var response = ParseResponse(await _server.HandleRequestAsync(request));
@@ -118,6 +124,13 @@ public class McpServerTests
         // Per JSON-RPC 2.0 §5.1, malformed JSON must surface as -32700 Parse error.
         error["code"]!.GetValue<int>().Should().Be(-32700);
         error["message"]!.GetValue<string>().Should().Contain("Parse error");
+        // §5: when the id field cannot be determined (parse failure), id MUST be null.
+        // JsonObject indexing collapses missing-key and JSON-null to the same C# null,
+        // so distinguish them via ContainsKey.
+        response.ContainsKey("id").Should().BeTrue(
+            "the envelope must always include the id key (per JSON-RPC §5)");
+        response["id"].Should().BeNull(
+            "parse-error responses must carry id=null, not an echoed bogus id");
     }
 
     [Fact]
@@ -193,5 +206,49 @@ public class McpServerTests
         response["id"]!.GetValue<long>().Should().Be(42);
         var error = response["error"]!.AsObject();
         error["code"]!.GetValue<int>().Should().Be(-32603);
+    }
+
+    [Fact]
+    public async Task HandleRequest_ToolsCall_UnknownToolName_Returns32602InvalidParams()
+    {
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"roslyn:does_not_exist_xyz","arguments":{}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["id"]!.GetValue<long>().Should().Be(1);
+        var error = response["error"]!.AsObject();
+        // Unknown tool maps to -32602 (Invalid params) per the dispatcher contract;
+        // the message must mention "Unknown tool" and echo the bad name.
+        error["code"]!.GetValue<int>().Should().Be(-32602);
+        error["message"]!.GetValue<string>().Should().Contain("Unknown tool");
+        error["message"]!.GetValue<string>().Should().Contain("roslyn:does_not_exist_xyz");
+    }
+
+    [Fact]
+    public async Task HandleRequest_ToolsCall_MissingParamsName_Returns32602InvalidParams()
+    {
+        // tools/call requires params.name. Missing it must surface as -32602.
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        var error = response["error"]!.AsObject();
+        error["code"]!.GetValue<int>().Should().Be(-32602);
+        error["message"]!.GetValue<string>().Should().Contain("missing tool name",
+            "the dispatcher must point at the missing tool name specifically");
+    }
+
+    [Fact]
+    public async Task HandleRequest_ToolsCall_MissingArgumentsObject_HealthCheckStillWorks()
+    {
+        // params.arguments is optional — for tools with no required params (like
+        // health_check), omitting it must not be an error. The dispatcher's
+        // JsonRpcParameters(args: null) constructor handles this (verified separately
+        // in JsonRpcParametersTests).
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"roslyn:health_check"}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["id"]!.GetValue<long>().Should().Be(1);
+        response["error"].Should().BeNull("missing arguments must not produce an error for parameterless tools");
+        var content = response["result"]!.AsObject()["content"]!.AsArray();
+        content.Count.Should().BeGreaterThan(0);
     }
 }
