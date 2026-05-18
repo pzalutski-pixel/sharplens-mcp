@@ -39,7 +39,8 @@ public class FindReferencesKindTests : RoslynServiceTestBase
         kinds.Should().Contain("typeof",
             $"the fixture has `typeof(TrackedTarget)`; got kinds: {string.Join(", ", kinds)}");
 
-        data["totalReferences"]?.Value<int>().Should().Be(refs.Count,
+        data["totalReferences"].Should().NotBeNull();
+        data["totalReferences"]!.Value<int>().Should().Be(refs!.Count,
             "totalReferences must match the array length when no kind filter is applied");
     }
 

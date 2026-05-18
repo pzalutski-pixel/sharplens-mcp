@@ -44,7 +44,7 @@ public class ExternalApiTests : RoslynServiceTestBase
         names.Should().Contain("Trim");
 
         // Per-member shape — Length is a public instance property.
-        var length = members.First(m => m["name"]?.Value<string>() == "Length");
+        var length = members!.First(m => m["name"]?.Value<string>() == "Length");
         length["kind"]?.Value<string>().Should().Be("Property",
             "Length is a property, not a method or field");
         length["accessibility"]?.Value<string>().Should().Be("Public");
@@ -53,7 +53,7 @@ public class ExternalApiTests : RoslynServiceTestBase
         length["signature"]?.Value<string>().Should().Contain("Length");
 
         // At least one well-known member should carry a non-empty XML doc summary.
-        members.Any(m => !string.IsNullOrEmpty(m["xmlDoc"]?.Value<string>()))
+        members!.Any(m => !string.IsNullOrEmpty(m["xmlDoc"]?.Value<string>()))
             .Should().BeTrue("System.String members ship with XML docs in the .NET runtime reference assemblies");
     }
 

@@ -413,7 +413,7 @@ public class CustomToolTests : RoslynServiceTestBase
         // one was found, missing a regression that drops the other.
         outgoing!.Any(c => c["shortName"]?.Value<string>()?.Contains("OpenSolutionAsync") == true)
             .Should().BeTrue("LoadSolutionAsync must invoke MSBuildWorkspace.OpenSolutionAsync");
-        outgoing.Any(c => c["shortName"]?.Value<string>()?.Contains("Create") == true)
+        outgoing!.Any(c => c["shortName"]?.Value<string>()?.Contains("Create") == true)
             .Should().BeTrue("LoadSolutionAsync must invoke MSBuildWorkspace.Create");
     }
 

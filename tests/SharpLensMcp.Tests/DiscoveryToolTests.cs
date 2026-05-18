@@ -64,7 +64,7 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         // The filter contract: NO usage from outside the SharpLensMcp project may appear.
         // Without this, "only main project matches" is unproven — the filter could be
         // a no-op and the test would still pass.
-        foreach (var usage in usages)
+        foreach (var usage in usages!)
         {
             var path = usage["location"]?["filePath"]?.Value<string>() ?? "";
             path.Should().NotContain("/tests/",
@@ -129,7 +129,7 @@ public class DiscoveryToolTests : RoslynServiceTestBase
 
         // Prove the filter — every reported usage must be in the SharpLensMcp project,
         // not in a test file.
-        foreach (var usage in usages)
+        foreach (var usage in usages!)
         {
             var path = usage["location"]?["filePath"]?.Value<string>() ?? "";
             path.Should().NotContain("/tests/",
