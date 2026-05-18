@@ -37,7 +37,9 @@ public sealed class McpServerFixture : IAsyncLifetime
         var harness = new McpHarnessOps(Server);
         var loadInner = await harness.CallToolAsync("roslyn:load_solution",
             new { solutionPath = SolutionPath });
-        loadInner["success"]?.Value<bool>().Should().BeTrue(
+        loadInner["success"].Should().NotBeNull(
+            "response must include success field");
+        loadInner["success"]!.Value<bool>().Should().BeTrue(
             $"solution must load via MCP at fixture setup; got: {loadInner}");
     }
 
@@ -77,9 +79,13 @@ internal sealed class McpHarnessOps
 
         var responseJson = JsonSerializer.Serialize(response, SerializeOpts);
         var envelope = JObject.Parse(responseJson);
-        envelope["jsonrpc"]?.Value<string>().Should().Be("2.0",
+        // NotBeNull-first defeats the null-conditional silent-pass — without this,
+        // a regression that drops the jsonrpc/id fields would skip the assertion.
+        envelope["jsonrpc"].Should().NotBeNull("JSON-RPC envelope must include jsonrpc field");
+        envelope["jsonrpc"]!.Value<string>().Should().Be("2.0",
             "JSON-RPC envelope must declare protocol version");
-        envelope["id"]?.Value<long>().Should().Be(id,
+        envelope["id"].Should().NotBeNull("JSON-RPC envelope must include id");
+        envelope["id"]!.Value<long>().Should().Be(id,
             "id must round-trip");
 
         if (envelope["error"] != null)
@@ -96,7 +102,8 @@ internal sealed class McpHarnessOps
             $"tool '{toolName}' must produce at least one content entry");
 
         var first = content[0];
-        first["type"]?.Value<string>().Should().Be("text",
+        first["type"].Should().NotBeNull("MCP content entry must include type field");
+        first["type"]!.Value<string>().Should().Be("text",
             "MCP content type must be 'text' per the protocol");
         var innerText = first["text"]?.Value<string>();
         innerText.Should().NotBeNullOrEmpty(
@@ -153,26 +160,34 @@ public abstract class McpTestBase
         => _ops.CallToolAsync(toolName, arguments);
 
     // Convenience: calls the tool and asserts the inner response is success.
+    // NotBeNull-first defeats the null-conditional silent-pass pattern on success.
     protected async Task<JToken> CallAndGetDataAsync(string toolName, object? arguments = null)
     {
         var inner = await CallToolAsync(toolName, arguments);
-        inner["success"]?.Value<bool>().Should().BeTrue(
+        inner["success"].Should().NotBeNull(
+            $"tool '{toolName}' inner response must include success field");
+        inner["success"]!.Value<bool>().Should().BeTrue(
             $"tool '{toolName}' must succeed; got: {inner}");
         return inner["data"]!;
     }
 
     // Convenience: calls the tool and asserts the inner response is error
     // (i.e., success=false with a structured error). Returns the error
-    // object for further assertions on code/message.
+    // object for further assertions on code/message. NotBeNull-first on every
+    // chained accessor defeats the null-conditional silent-pass pattern.
     protected async Task<JToken> CallAndGetErrorAsync(string toolName, object? arguments = null, string? codeContains = null)
     {
         var inner = await CallToolAsync(toolName, arguments);
-        inner["success"]?.Value<bool>().Should().BeFalse(
+        inner["success"].Should().NotBeNull(
+            $"tool '{toolName}' inner response must include success field");
+        inner["success"]!.Value<bool>().Should().BeFalse(
             $"tool '{toolName}' must fail; got: {inner}");
         var error = inner["error"]!;
         if (codeContains != null)
         {
-            error["code"]?.Value<string>().Should().Contain(codeContains);
+            error["code"].Should().NotBeNull(
+                $"tool '{toolName}' error must include code field");
+            error["code"]!.Value<string>().Should().Contain(codeContains);
         }
         return error;
     }
