@@ -96,9 +96,12 @@ public class SourceGeneratorTests : RoslynServiceTestBase
         source.Should().NotBeNullOrEmpty("generator output must include actual source text");
         source!.Should().Contain("FixtureJsonContext",
             "the generator output for the FixtureJsonContext file must reference its partial class");
-        // The generator emits at least the class shell + an accessor, so the file is
-        // multi-line; pinning to >5 catches a regression where the generator emits a stub.
-        data["lineCount"]?.Value<int>().Should().BeGreaterThan(5);
+        // lineCount field must exist (locked NotBeNull first to defeat the null-conditional
+        // silent-pass pattern) and exceed 5 — the generator emits at least the class shell
+        // plus an accessor, so the file is multi-line. A regression that emitted a stub
+        // would now fail.
+        data["lineCount"].Should().NotBeNull();
+        data["lineCount"]!.Value<int>().Should().BeGreaterThan(5);
     }
 
     [Fact]
@@ -165,18 +168,40 @@ public class SourceGeneratorTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task SearchSymbols_FindsFixtureRecord_AsRecordType()
+    public async Task GetTypeOverview_OnFixtureRecord_ClassifiesAsRecord()
     {
-        // Confirms symbol resolution works for hand-written code in a project with source generators.
-        // FixtureRecord is declared as `public record FixtureRecord(string Name, int Age);` in
-        // SourceGeneratorFixture.cs — typeKind must report Record, not Class.
+        // The previous version of this test asserted match["typeKind"] == "Record" on
+        // a search_symbols result, but the search_symbols entry shape (Navigation.cs:661-674)
+        // doesn't include a typeKind field — only `kind` ("NamedType" for all types).
+        // The `?.Value<string>().Should().Be(...)` chain silently passed because the
+        // null-conditional short-circuits when the field is missing. Switched to
+        // get_type_overview which DOES emit typeKind (Compound.cs:313).
+        var result = await Service.GetTypeOverviewAsync("FixtureRecord");
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["typeName"].Should().NotBeNull();
+        data["typeName"]!.Value<string>().Should().Contain("FixtureRecord");
+        // GetTypeKindString in RoslynService.cs:59 classifies records as Record (not Class).
+        data["typeKind"].Should().NotBeNull();
+        data["typeKind"]!.Value<string>().Should().Be("Record",
+            "positional records must be classified as Record, not Class");
+    }
+
+    [Fact]
+    public async Task SearchSymbols_FindsFixtureRecord_AsNamedTypeWithRecordContainingTypeShape()
+    {
+        // Companion to the GetTypeOverview test above: confirms search_symbols ITSELF
+        // can find a record by simple name. The search entry's `kind` is "NamedType"
+        // (the symbol kind, not the type kind) — distinguishing Record vs Class
+        // requires a follow-up get_type_overview call (locked above).
         var searchResult = await Service.SearchSymbolsAsync("FixtureRecord", kind: null, maxResults: 10);
         AssertSuccess(searchResult);
         var results = GetData(searchResult)["results"] as JArray;
         results.Should().NotBeNullOrEmpty();
         var match = results!.FirstOrDefault(r => r["name"]?.Value<string>() == "FixtureRecord");
         match.Should().NotBeNull("FixtureRecord must be locatable by simple name");
-        match!["typeKind"]?.Value<string>().Should().Be("Record",
-            "GetTypeKindString in RoslynService.cs:59 must classify positional records as Record, not Class");
+        match!["kind"].Should().NotBeNull();
+        match["kind"]!.Value<string>().Should().Be("NamedType",
+            "search_symbols reports the symbol Kind ('NamedType' for any type), not typeKind");
     }
 }
