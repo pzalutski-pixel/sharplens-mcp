@@ -192,19 +192,31 @@ namespace Tests
 
     private static async Task<JArray> RunAndGetUncovered(string code)
     {
+        var data = await RunAndGetData(code, includeProperties: true, includeInternal: true);
+        return (data["uncoveredSymbols"] as JArray)!;
+    }
+
+    // Helper that returns the full data object (not just the uncoveredSymbols array)
+    // so callers can inspect testMethodCount, productionProject, per-entry shape, etc.
+    // Locks `success` with NotBeNull-first to defeat the null-conditional silent-pass
+    // pattern (`json["success"]?.Value<bool>().Should().BeTrue(...)` short-circuits if
+    // the field is missing).
+    private static async Task<JToken> RunAndGetData(string code, bool includeProperties, bool includeInternal)
+    {
         var (workspace, _) = TestHelpers.CreateWorkspaceWithCode(code);
         var service = new RoslynService();
         service.LoadFromWorkspaceForTesting(workspace);
 
         var result = await service.FindUntestedCodeAsync(
             projectName: null,
-            includeProperties: true,
-            includeInternal: true,
+            includeProperties: includeProperties,
+            includeInternal: includeInternal,
             maxResults: 50);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
-        return (json["data"]!["uncoveredSymbols"] as JArray)!;
+        json["success"].Should().NotBeNull("response envelope must include success field");
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+        return json["data"]!;
     }
 
     [Fact]
@@ -268,5 +280,54 @@ namespace Tests
         var names = uncovered.Select(u => u["fullName"]?.Value<string>() ?? "").ToList();
         names.Should().Contain(n => n.Contains("Target.NotActuallyTested"),
             "the look-alike attribute is in MyApp.Attributes, not Xunit, so the 'test' method shouldn't count as a test");
+    }
+
+    [Fact]
+    public async Task FindUntestedCode_ResponseLocksTestMethodCountAndPerEntryShape()
+    {
+        // The previous tests only checked uncoveredSymbols[*].fullName. Lock the
+        // top-level testMethodCount AND the per-entry shape — without this, a
+        // regression that drops kind/accessibility/complexity/location/reason would
+        // silently pass every prior test.
+        var data = await RunAndGetData(XunitTheoryCode, includeProperties: true, includeInternal: true);
+
+        // Each fixture above has exactly one test method (TestReachedByTheory).
+        data["testMethodCount"].Should().NotBeNull();
+        data["testMethodCount"]!.Value<int>().Should().Be(1,
+            "XunitTheoryCode has exactly one [Theory] test method");
+
+        var uncovered = (data["uncoveredSymbols"] as JArray)!;
+        var unreached = uncovered.FirstOrDefault(u =>
+            u["fullName"]?.Value<string>()?.Contains("Target.Unreached") == true);
+        unreached.Should().NotBeNull();
+
+        // Per-entry shape (Quality.cs:62-70): fullName, kind, complexity, accessibility,
+        // location, reason — every field must be present on the matched entry.
+        unreached!["kind"].Should().NotBeNull("entry must carry kind");
+        unreached["kind"]!.Value<string>().Should().Be("Method",
+            "Unreached is declared as a method");
+        unreached["accessibility"].Should().NotBeNull();
+        unreached["accessibility"]!.Value<string>().Should().Be("Public");
+        unreached["complexity"].Should().NotBeNull();
+        unreached["complexity"]!.Type.Should().Be(JTokenType.Integer,
+            "complexity is always reported as an integer (cyclomatic)");
+        unreached["location"].Should().NotBeNull(
+            "every uncovered entry must surface its declaration location");
+        unreached["reason"]!.Value<string>().Should().Contain("Not reachable from any test method",
+            "the impl's documented reason string must round-trip");
+    }
+
+    [Fact]
+    public async Task FindUntestedCode_IncludeInternalFalse_ExcludesInternalMethods()
+    {
+        // Companion to IncludeInternal_SurfacesInternalUnreached (which uses true).
+        // With includeInternal=false (the default), internal symbols must NOT appear
+        // in the uncovered list.
+        var data = await RunAndGetData(InternalCode, includeProperties: true, includeInternal: false);
+        var uncovered = (data["uncoveredSymbols"] as JArray)!;
+        var names = uncovered.Select(u => u["fullName"]?.Value<string>() ?? "").ToList();
+
+        names.Should().NotContain(n => n.Contains("InternalUnreached"),
+            "with includeInternal=false, the internal method must NOT appear in the uncovered list");
     }
 }
