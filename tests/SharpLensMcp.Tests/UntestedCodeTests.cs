@@ -21,7 +21,11 @@ public class UntestedCodeTests : RoslynServiceTestBase
         AssertSuccess(result);
 
         var data = GetData(result);
-        data["testMethodCount"]?.Value<int>().Should().BeGreaterThan(0,
+        // Lock testMethodCount with NotBeNull-first to defeat the null-conditional
+        // silent-pass pattern (`data["X"]?.Value<int>().Should().Be(...)` skips the
+        // assertion entirely if `X` is missing).
+        data["testMethodCount"].Should().NotBeNull();
+        data["testMethodCount"]!.Value<int>().Should().BeGreaterThan(0,
             "the test project has many [Fact] methods");
 
         var uncovered = data["uncoveredSymbols"] as JArray;
@@ -33,6 +37,8 @@ public class UntestedCodeTests : RoslynServiceTestBase
             "NeverCalled has no caller of any kind");
         names.Should().Contain(n => n.Contains("CoverageTarget.OnlyCalledByProduction"),
             "OnlyCalledByProduction is reached only from production code, not tests");
+        names.Should().Contain(n => n.Contains("CoverageTarget.ProductionUser"),
+            "ProductionUser has no [Fact] reaching it — only OnlyCalledByProduction via prod chain");
 
         names.Should().NotContain(n => n.Contains("CoverageTarget.CoveredByTest"),
             "CoveredByTest is directly invoked by a [Fact]");
@@ -40,5 +46,12 @@ public class UntestedCodeTests : RoslynServiceTestBase
             "CalledByChainedFromTest is reached transitively via ChainedFromTest");
         names.Should().NotContain(n => n.Contains("CoverageTarget.ChainedFromTest"),
             "ChainedFromTest is the entry called by a [Fact]");
+
+        // Test methods themselves must NOT appear in uncovered — they're the test
+        // surface, not the production surface.
+        names.Should().NotContain(n => n.Contains("CoverageTargetTests.CoveredByTest_Test"),
+            "test methods are excluded from the production-surface uncovered list");
+        names.Should().NotContain(n => n.Contains("CoverageTargetTests.ChainedFromTest_Test"),
+            "test methods are excluded from the production-surface uncovered list");
     }
 }
