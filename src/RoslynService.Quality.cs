@@ -327,7 +327,14 @@ public partial class RoslynService
             ? _solution!.Projects
             : _solution!.Projects.Where(p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase));
 
-        // Step 1: enumerate every source type in scope.
+        // Step 1: enumerate every source type in scope. GetAllNamedTypes walks the
+        // compilation's GlobalNamespace which includes types from referenced assemblies
+        // (since the cross-project namespaces are merged at compile time). We MUST
+        // restrict to types whose ContainingAssembly matches the current compilation's
+        // own assembly — otherwise a project filter still pulls in referenced source
+        // types (e.g. RoslynService from SharpLensMcp surfacing when scanning
+        // SharpLensMcp.Tests). Without this, the projectName filter is a no-op for
+        // intra-source-project types.
         var allTypes = new List<INamedTypeSymbol>();
         foreach (var project in projectsToScan)
         {
@@ -336,6 +343,7 @@ public partial class RoslynService
             foreach (var type in GetAllNamedTypes(compilation))
             {
                 if (!type.Locations.Any(l => l.IsInSource)) continue;
+                if (!SymbolEqualityComparer.Default.Equals(type.ContainingAssembly, compilation.Assembly)) continue;
                 allTypes.Add(type);
             }
         }

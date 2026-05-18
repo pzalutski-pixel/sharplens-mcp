@@ -31,7 +31,7 @@ public class GodObjectTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task FindGodObjects_GodClassHasExpectedCouplingNumbers()
+    public async Task FindGodObjects_GodClassHasExpectedCouplingNumbersAndFullEntryShape()
     {
         var result = await Service.FindGodObjectsAsync(
             projectName: "SharpLensMcp.Tests",
@@ -41,6 +41,15 @@ public class GodObjectTests : RoslynServiceTestBase
         AssertSuccess(result);
 
         var data = GetData(result);
+
+        // The top-level threshold field must round-trip the caller's arguments. Without
+        // this, a regression that returns wrong thresholds in the response (decoupling
+        // the displayed thresholds from the applied ones) would go undetected.
+        var threshold = data["threshold"] as JObject;
+        threshold.Should().NotBeNull();
+        threshold!["efferent"]?.Value<int>().Should().Be(20);
+        threshold["members"]?.Value<int>().Should().Be(20);
+
         var candidates = data["candidates"] as JArray;
         var god = candidates!.First(c => c["typeName"]!.Value<string>()!.EndsWith("GodObjectFixtureClass"));
 
@@ -48,10 +57,20 @@ public class GodObjectTests : RoslynServiceTestBase
             "fixture has 25 fields, each of a distinct GodObjectTypeNN type");
         god["memberCount"]?.Value<int>().Should().BeGreaterOrEqualTo(25,
             "fixture has 25 fields");
+
+        // Every entry's shape: afferentCoupling, score, location must be present.
+        god["afferentCoupling"]?.Type.Should().Be(JTokenType.Integer,
+            "afferentCoupling is always reported as an integer");
+        // score is a numeric scalar; the impl computes it from coupling/member counts.
+        // Either int or float — assert >0 covers both via .Value<double>().
+        god["score"]?.Value<double>().Should().BeGreaterThan(0,
+            "the god class must have a positive numeric score");
+        god["location"].Should().NotBeNull(
+            "every candidate must surface its declaration location");
     }
 
     [Fact]
-    public async Task FindGodObjects_RespectsMaxResults()
+    public async Task FindGodObjects_RespectsMaxResults_FillsExactlyOne()
     {
         var result = await Service.FindGodObjectsAsync(
             projectName: "SharpLensMcp.Tests",
@@ -62,7 +81,11 @@ public class GodObjectTests : RoslynServiceTestBase
 
         var data = GetData(result);
         var candidates = data["candidates"] as JArray;
-        candidates!.Count.Should().BeLessOrEqualTo(1);
+        // GodObjectFixtureClass deterministically meets the thresholds — Count must
+        // FILL the cap, not be 0. Otherwise "maxResults" looks like "max OR fewer
+        // because nothing qualified" which is the silent-pass pattern.
+        candidates!.Count.Should().Be(1, "maxResults=1 must fill the cap given a qualifying candidate");
+        candidates![0]["typeName"]!.Value<string>().Should().EndWith("GodObjectFixtureClass");
     }
 
     [Fact]
@@ -79,5 +102,24 @@ public class GodObjectTests : RoslynServiceTestBase
         var data = GetData(result);
         var candidates = data["candidates"] as JArray;
         candidates!.Count.Should().Be(0, "no type meets these absurd thresholds");
+    }
+
+    [Fact]
+    public async Task FindGodObjects_WithoutProjectFilter_FindsGodAcrossAllProjects()
+    {
+        // No projectName → scans ALL projects (RoslynService.Quality.cs:326-328).
+        // The god-object fixture lives in SharpLensMcp.Tests and must still be flagged.
+        var result = await Service.FindGodObjectsAsync(
+            projectName: null,
+            minEfferentCoupling: 20,
+            minMembers: 20,
+            maxResults: 50);
+        AssertSuccess(result);
+
+        var data = GetData(result);
+        var candidates = data["candidates"] as JArray;
+        candidates.Should().NotBeNullOrEmpty();
+        candidates!.Any(c => c["typeName"]?.Value<string>()?.EndsWith("GodObjectFixtureClass") == true)
+            .Should().BeTrue("the god class must surface in a no-filter scan");
     }
 }
