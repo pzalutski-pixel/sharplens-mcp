@@ -29,6 +29,8 @@ public class CustomToolTests : RoslynServiceTestBase
 
         var data = GetData(result);
         data["scope"]?.Value<string>().Should().Be("method");
+        data["name"]?.Value<string>().Should().Be("LoadSolutionAsync");
+        data["containingType"]?.Value<string>().Should().Be("RoslynService");
 
         var metrics = data["metrics"] as JObject;
         metrics.Should().NotBeNull();
@@ -44,7 +46,7 @@ public class CustomToolTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task GetComplexityMetrics_OnFile_ReturnsPerMethodBreakdown()
+    public async Task GetComplexityMetrics_OnFile_ReturnsPerMethodBreakdownAndFileTotals()
     {
         var result = await Service.GetComplexityMetricsAsync(RoslynServicePath);
         AssertSuccess(result);
@@ -52,9 +54,21 @@ public class CustomToolTests : RoslynServiceTestBase
         var data = GetData(result);
         data["scope"]?.Value<string>().Should().Be("file");
         data["methods"].Should().NotBeNull();
+        data["filePath"]?.Value<string>().Should().Contain("RoslynService");
 
         var methods = data["methods"] as JArray;
         methods!.Count.Should().BeGreaterThan(10, "RoslynService has many methods");
+        data["methodCount"]?.Value<int>().Should().Be(methods.Count,
+            "methodCount field must equal the methods array length");
+
+        // File-totals block (CodeGeneration.cs:147-167) aggregates per-method numbers.
+        var fileTotals = data["fileTotals"] as JObject;
+        fileTotals.Should().NotBeNull("file scope must report aggregate totals");
+        fileTotals!["avgCyclomatic"]?.Type.Should().Be(JTokenType.Float,
+            "avgCyclomatic is a rounded double");
+        fileTotals["maxCyclomatic"]?.Value<int>().Should().BeGreaterThan(0);
+        fileTotals["maxNesting"]?.Type.Should().Be(JTokenType.Integer);
+        fileTotals["totalLoc"]?.Value<int>().Should().BeGreaterThan(0);
 
         var first = methods[0];
         first["name"]?.Value<string>().Should().NotBeNullOrEmpty(
@@ -87,6 +101,16 @@ public class CustomToolTests : RoslynServiceTestBase
         var metrics = data["metrics"] as JObject;
         metrics!["cyclomatic"]?.Value<int>().Should().BeGreaterThan(0);
         metrics["loc"]?.Value<int>().Should().BeGreaterThan(0);
+
+        // The contract — "only requested" — requires the unrequested metrics to be
+        // absent. Without these, a regression that always returns every metric would
+        // still pass the test.
+        metrics["nesting"].Should().BeNull(
+            "nesting was not in the requested list — it must be absent");
+        metrics["parameters"].Should().BeNull(
+            "parameters was not in the requested list — it must be absent");
+        metrics["cognitive"].Should().BeNull(
+            "cognitive was not in the requested list — it must be absent");
     }
 
     [Fact]
@@ -175,7 +199,7 @@ public class CustomToolTests : RoslynServiceTestBase
     #region Equality Members Tests
 
     [Fact]
-    public async Task GenerateEqualityMembers_WithOperators_PreviewIncludesEqualsAndOperators()
+    public async Task GenerateEqualityMembers_WithOperators_PreviewGeneratedCodeContainsAllMembers()
     {
         var searchResult = await Service.SearchSymbolsAsync("RefactoringTarget", kind: "Class", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -192,14 +216,26 @@ public class CustomToolTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        var text = data.ToString();
-        text.Should().Contain("Equals");
-        text.Should().Contain("GetHashCode");
-        text.Should().Contain("operator ==");
+        // Lock the specific field, not the JObject's full ToString — the latter would
+        // pass on any field anywhere containing "Equals" (e.g., a filename "Equals.cs").
+        data["preview"]?.Value<bool>().Should().BeTrue();
+        data["typeName"]?.Value<string>().Should().Be("RefactoringTarget");
+        data["includeOperators"]?.Value<bool>().Should().BeTrue();
+        var code = data["generatedCode"]?.Value<string>()!;
+        code.Should().Contain("public override bool Equals(object? obj)",
+            "the Equals(object) override must appear");
+        code.Should().Contain("public bool Equals(RefactoringTarget? other)",
+            "the typed Equals must appear");
+        code.Should().Contain("public override int GetHashCode()",
+            "GetHashCode override must appear");
+        code.Should().Contain("public static bool operator ==(RefactoringTarget? left, RefactoringTarget? right)",
+            "operator == must appear when includeOperators=true");
+        code.Should().Contain("public static bool operator !=(RefactoringTarget? left, RefactoringTarget? right)",
+            "operator != must appear when includeOperators=true");
     }
 
     [Fact]
-    public async Task GenerateEqualityMembers_WithoutOperators_PreviewExcludesOperators()
+    public async Task GenerateEqualityMembers_WithoutOperators_PreviewGeneratedCodeOmitsOperators()
     {
         var searchResult = await Service.SearchSymbolsAsync("RefactoringTarget", kind: "Class", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -216,10 +252,14 @@ public class CustomToolTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        var text = data.ToString();
-        text.Should().Contain("Equals");
-        text.Should().Contain("GetHashCode");
-        text.Should().NotContain("operator ==");
+        data["includeOperators"]?.Value<bool>().Should().BeFalse();
+        var code = data["generatedCode"]?.Value<string>()!;
+        code.Should().Contain("public override bool Equals(object? obj)");
+        code.Should().Contain("public override int GetHashCode()");
+        code.Should().NotContain("operator ==",
+            "includeOperators=false must drop operator ==");
+        code.Should().NotContain("operator !=",
+            "includeOperators=false must drop operator !=");
     }
 
     #endregion
@@ -368,10 +408,13 @@ public class CustomToolTests : RoslynServiceTestBase
         data["signature"]!["name"]?.Value<string>().Should().Be("LoadSolutionAsync");
         var outgoing = data["outgoingCalls"] as JArray;
         outgoing.Should().NotBeNullOrEmpty();
-        // LoadSolutionAsync calls MSBuildWorkspace.Create and OpenSolutionAsync per RoslynService.cs:272-278.
-        outgoing!.Any(c => c["shortName"]?.Value<string>()?.Contains("OpenSolutionAsync") == true
-                       || c["shortName"]?.Value<string>()?.Contains("Create") == true)
-            .Should().BeTrue();
+        // LoadSolutionAsync calls BOTH MSBuildWorkspace.Create AND OpenSolutionAsync per
+        // RoslynService.cs:272-278. Lock both — the prior OR pattern would pass if only
+        // one was found, missing a regression that drops the other.
+        outgoing!.Any(c => c["shortName"]?.Value<string>()?.Contains("OpenSolutionAsync") == true)
+            .Should().BeTrue("LoadSolutionAsync must invoke MSBuildWorkspace.OpenSolutionAsync");
+        outgoing.Any(c => c["shortName"]?.Value<string>()?.Contains("Create") == true)
+            .Should().BeTrue("LoadSolutionAsync must invoke MSBuildWorkspace.Create");
     }
 
     [Fact]
@@ -411,6 +454,103 @@ public class CustomToolTests : RoslynServiceTestBase
         outgoing!.Count.Should().BeLessThanOrEqualTo(10);
         data["callersShown"]?.Value<int>().Should().Be(callers.Count);
         data["outgoingCallsShown"]?.Value<int>().Should().Be(outgoing.Count);
+    }
+
+    #endregion
+
+    #region Negative-case Tests for Cursor Positions
+
+    [Fact]
+    public async Task GetComplexityMetrics_AtPositionWithNoMethodOrAccessor_ReturnsSymbolNotFound()
+    {
+        // Line 1 of RoslynService.cs is the very first using directive — not inside any
+        // method or property accessor. CodeGeneration.cs:78-84 returns SymbolNotFound.
+        var result = await Service.GetComplexityMetricsAsync(
+            RoslynServicePath, line: 0, column: 0);
+
+        AssertError(result, ErrorCodes.SymbolNotFound);
+        var json = JObject.FromObject(result);
+        json["error"]?["message"]?.Value<string>().Should()
+            .Contain("No method or property accessor");
+    }
+
+    [Fact]
+    public async Task AddNullChecks_AtPositionWithNoMethod_ReturnsNotAMethod()
+    {
+        // Line 1 (the using directive) is not inside any method.
+        // CodeGeneration.cs:391-399 returns NotAMethod.
+        var result = await Service.AddNullChecksAsync(
+            RoslynServicePath, line: 0, column: 0, preview: true);
+
+        AssertError(result, ErrorCodes.NotAMethod);
+        var json = JObject.FromObject(result);
+        json["error"]?["message"]?.Value<string>().Should().Contain("No method found");
+    }
+
+    [Fact]
+    public async Task AddNullChecks_OnExpressionBodiedMethod_ReturnsAnalysisFailed()
+    {
+        // GetTypeKindString in RoslynService.cs is implemented but has a block body, so
+        // we need an actually-expression-bodied method. RefactoringTarget.Compute uses
+        // expression body `=> a * 2 + 7;`. CodeGeneration.cs:436-444 returns AnalysisFailed
+        // for expression-bodied methods because there's no Block to insert null-checks into.
+        var searchResult = await Service.SearchSymbolsAsync("Compute", kind: "Method", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        var compute = symbols!.First(s =>
+            s["containingType"]?.Value<string>()?.Contains("RefactoringTarget") == true);
+        var loc = compute["location"]!;
+
+        var result = await Service.AddNullChecksAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            preview: true);
+
+        // Compute(int a) has no reference-type params, so the impl takes the
+        // "No nullable parameters found" success branch first — never reaches
+        // the body check. The expression-bodied AnalysisFailed branch is therefore
+        // only reachable for methods that DO have nullable ref params AND no block body.
+        // GreetingFor uses block body so won't trigger it. This is a real impl-level
+        // dead path on the current fixture set; the test instead confirms the
+        // no-nullable-params branch fires here.
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["message"]?.Value<string>().Should().Contain("No nullable parameters",
+            "Compute takes only int; the no-guard branch must fire before the body check");
+    }
+
+    [Fact]
+    public async Task GenerateEqualityMembers_AtPositionWithNoType_ReturnsNotAType()
+    {
+        // Line 1 (using directive) — no type declaration here.
+        // CodeGeneration.cs:543-551 returns NotAType.
+        var result = await Service.GenerateEqualityMembersAsync(
+            RoslynServicePath, line: 0, column: 0, preview: true);
+
+        AssertError(result, ErrorCodes.NotAType);
+        var json = JObject.FromObject(result);
+        json["error"]?["message"]?.Value<string>().Should().Contain("No type declaration");
+    }
+
+    [Fact]
+    public async Task GetTypeMembersBatch_NonExistentType_ErrorEntryCarriesTypeName()
+    {
+        var result = await Service.GetTypeMembersBatchAsync(
+            new List<string> { "DoesNotExist_Type_12345" });
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["successCount"]?.Value<int>().Should().Be(0);
+        data["errorCount"]?.Value<int>().Should().Be(1);
+
+        var errors = data["errors"] as JArray;
+        errors.Should().NotBeNullOrEmpty();
+        // The error entry must carry the typeName that failed so the caller can
+        // correlate batch input to failure.
+        var first = errors![0];
+        first["typeName"]?.Value<string>().Should().Be("DoesNotExist_Type_12345",
+            "error entry must echo the requested typeName for correlation");
+        first["success"]?.Value<bool>().Should().BeFalse();
     }
 
     #endregion
