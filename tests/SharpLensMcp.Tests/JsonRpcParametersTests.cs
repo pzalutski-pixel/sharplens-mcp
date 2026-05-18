@@ -119,4 +119,101 @@ public class JsonRpcParametersTests
         act.Should().Throw<JsonRpcInvalidParamsException>()
             .WithMessage("*typeNames*test-tool*");
     }
+
+    [Fact]
+    public void Required_PresentInt_Returns()
+    {
+        // Counterpart to Required_PresentString — the generic Required<T> must work
+        // for value types, not just reference types.
+        var p = Make("""{"line":42}""");
+        p.Required<int>("line").Should().Be(42);
+    }
+
+    [Fact]
+    public void OptionalStringFallback_Present_ReturnsValue()
+    {
+        // Counterpart to OptionalStringFallback_Missing_ReturnsFallback — when the
+        // value IS present, the fallback must be ignored.
+        var p = Make("""{"verbosity":"detailed"}""");
+        p.Optional("verbosity", "compact").Should().Be("detailed");
+    }
+
+    [Fact]
+    public void OptionalStruct_WrongType_Throws()
+    {
+        // OptionalStruct must throw on type mismatch with the canonical "wrong type"
+        // wording so callers can distinguish missing (null) from invalid (exception).
+        var p = Make("""{"maxResults":"not-a-number"}""");
+        var act = () => p.OptionalStruct<int>("maxResults");
+        act.Should().Throw<JsonRpcInvalidParamsException>()
+            .WithMessage("*maxResults*wrong type*");
+    }
+
+    [Fact]
+    public void OptionalWithFallback_WrongType_Throws()
+    {
+        // The fallback overload must also throw on wrong type rather than silently
+        // returning the fallback — caller intent was "I supplied a value, parse it",
+        // not "fall back if it's malformed".
+        var p = Make("""{"maxResults":"not-a-number"}""");
+        var act = () => p.Optional("maxResults", 50);
+        act.Should().Throw<JsonRpcInvalidParamsException>()
+            .WithMessage("*maxResults*wrong type*");
+    }
+
+    [Fact]
+    public void OptionalStringArray_NullElement_DroppedFromResult()
+    {
+        // Per JsonRpcParameters.cs:95-96, non-string/null entries are filtered out
+        // (mapped to empty string, then dropped). Verify a null array element
+        // doesn't crash AND doesn't appear in the returned list.
+        var p = Make("""{"kinds":["Method",null,"Field"]}""");
+        var list = p.OptionalStringArray("kinds");
+        list.Should().BeEquivalentTo(new[] { "Method", "Field" },
+            "null entries must be silently filtered, not crash or appear as empty strings");
+    }
+
+    [Fact]
+    public void Raw_PresentField_ReturnsNode()
+    {
+        // Raw(name) is the escape hatch for complex shapes (array-of-objects, nested
+        // objects). It must return the raw JsonNode without type coercion.
+        var p = Make("""{"method":{"name":"foo","args":[1,2,3]}}""");
+        var raw = p.Raw("method");
+        raw.Should().NotBeNull();
+        raw!["name"]?.GetValue<string>().Should().Be("foo");
+        (raw["args"] as JsonArray)!.Count.Should().Be(3);
+    }
+
+    [Fact]
+    public void Raw_MissingField_ReturnsNull()
+    {
+        var p = Make("""{}""");
+        p.Raw("missing").Should().BeNull();
+    }
+
+    [Fact]
+    public void Constructor_WithNullArgs_AllAccessorsTreatAsEmpty()
+    {
+        // When the caller's tools/call params lack an `arguments` object entirely,
+        // the dispatcher constructs JsonRpcParameters with args=null. The accessors
+        // must behave as if every parameter is missing — not NullReferenceException.
+        var p = new JsonRpcParameters(args: null, "test-tool");
+
+        p.Optional<string>("x").Should().BeNull();
+        p.OptionalStruct<int>("n").Should().BeNull();
+        p.Optional("x", "fallback").Should().Be("fallback");
+        p.Optional("n", 42).Should().Be(42);
+        p.OptionalStringArray("arr").Should().BeNull();
+        p.Raw("x").Should().BeNull();
+
+        // Required-* must still throw with the canonical missing wording.
+        var requiredAct = () => p.Required<string>("x");
+        requiredAct.Should().Throw<JsonRpcInvalidParamsException>()
+            .WithMessage("*x*test-tool*");
+
+        var requiredArrAct = () => p.RequiredStringArray("arr");
+        requiredArrAct.Should().Throw<JsonRpcInvalidParamsException>()
+            .WithMessage("*arr*test-tool*");
+    }
 }
