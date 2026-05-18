@@ -27,8 +27,15 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["newName"]?.Value<string>().Should().Be("_roslynWorkspace");
-        data["preview"]?.Value<bool>().Should().BeTrue();
+        // Field names verified against Refactoring.cs:233 (rename preview branch):
+        // symbolName, symbolKind, newName, verbosity, changes, preview, applied.
+        // Use `!` so a regression that drops the field throws NRE instead of
+        // silently passing via `?.` short-circuit.
+        data["newName"]!.Value<string>().Should().Be("_roslynWorkspace");
+        data["preview"]!.Value<bool>().Should().BeTrue();
+        data["applied"]!.Value<bool>().Should().BeFalse(
+            "preview=true must report applied=false (Refactoring.cs:237)");
+        data["symbolName"]!.Value<string>().Should().Be("_workspace");
         var changes = data["changes"] as JArray;
         changes.Should().NotBeNullOrEmpty("renaming _workspace touches at least RoslynService.cs");
     }
@@ -70,7 +77,12 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        var code = data["interfaceCode"]?.Value<string>();
+        // Two-step pattern (var + Should) is safe — null assigned to `code` then
+        // .Should().Contain(...) called on null Subject throws NRE. The single-line
+        // `data["X"]?.Value<string>().Should().Contain(Y)` would silently pass.
+        data["interfaceCode"].Should().NotBeNull(
+            "extract_interface must always emit interfaceCode in the success branch");
+        var code = data["interfaceCode"]!.Value<string>();
         code.Should().Contain("interface IFixtureRectangle");
         code.Should().Contain("Width");
         code.Should().Contain("Height");
@@ -94,7 +106,9 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        var code = data["constructorCode"]?.Value<string>();
+        data["constructorCode"].Should().NotBeNull(
+            "generate_constructor must emit constructorCode");
+        var code = data["constructorCode"]!.Value<string>();
         code.Should().NotBeNullOrEmpty();
         code.Should().Contain("public RefactoringTarget");
     }
@@ -122,18 +136,21 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["methodName"]?.Value<string>().Should().Be("ComputePartial");
+        // Field names verified against Refactoring.cs:1151-1170 (extract_method preview):
+        // preview, methodName, signature, parameters, returnType, returnVariable,
+        // returnReason, statementsExtracted, extractedCode, replacementCode, location.
+        data["methodName"]!.Value<string>().Should().Be("ComputePartial");
         // RefactoringTarget.Sum returns int and the selected slice produces a single
         // `total` local that flows out — so the extracted method returns int via `total`.
-        data["returnType"]?.Value<string>().Should().Be("int");
-        data["returnVariable"]?.Value<string>().Should().Be("total");
-        data["signature"]?.Value<string>().Should()
+        data["returnType"]!.Value<string>().Should().Be("int");
+        data["returnVariable"]!.Value<string>().Should().Be("total");
+        data["signature"]!.Value<string>().Should()
             .Contain("private int ComputePartial",
                 "the generated signature must declare the new private method named ComputePartial returning int");
-        data["extractedCode"]?.Value<string>().Should()
+        data["extractedCode"]!.Value<string>().Should()
             .Contain("private int ComputePartial",
                 "the extracted method body must open with the generated signature");
-        data["replacementCode"]?.Value<string>().Should()
+        data["replacementCode"]!.Value<string>().Should()
             .Be("var total = ComputePartial(a, b, c);",
                 "the call-site replacement must capture the returned `total` and forward Sum's parameters in order");
     }
@@ -255,12 +272,14 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["methodName"]?.Value<string>().Should().Be("CreateErrorResponse");
+        // GetMethodOverloads response (Inspection.cs:129-131): methodName,
+        // containingType, overloads (each with signature, parameters, etc.).
+        data["methodName"]!.Value<string>().Should().Be("CreateErrorResponse");
         var overloads = data["overloads"] as JArray;
         overloads.Should().NotBeNullOrEmpty();
         foreach (var o in overloads!)
         {
-            o["signature"]?.Value<string>().Should().Contain("CreateErrorResponse");
+            o["signature"]!.Value<string>().Should().Contain("CreateErrorResponse");
         }
     }
 
@@ -277,8 +296,8 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["memberName"]?.Value<string>().Should().Be("MatchesGlobPattern");
-        data["memberKind"]?.Value<string>().Should().Be("Method");
+        data["memberName"]!.Value<string>().Should().Be("MatchesGlobPattern");
+        data["memberKind"]!.Value<string>().Should().Be("Method");
     }
 
     [Fact]
