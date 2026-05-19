@@ -568,17 +568,12 @@ public partial class RoslynService
                     changeType = "Modified"
                 });
 
-                // Write to disk if not preview
                 if (!preview && newDoc.FilePath != null)
                 {
                     await File.WriteAllTextAsync(newDoc.FilePath, newText.ToString());
-
-                    // Update solution with changes for subsequent operations
-                    _solution = changedSolution;
                 }
             }
 
-            // Check for removed documents
             foreach (var removedDocId in projectChanges.GetRemovedDocuments())
             {
                 var removedDoc = _solution!.GetDocument(removedDocId);
@@ -592,12 +587,18 @@ public partial class RoslynService
                     changeType = "Removed"
                 });
 
-                // Delete file if not preview
                 if (!preview && removedDoc.FilePath != null && File.Exists(removedDoc.FilePath))
                 {
                     File.Delete(removedDoc.FilePath);
                 }
             }
+        }
+
+        if (!preview)
+        {
+            _solution = changedSolution;
+            _documentCache.Clear();
+            _compilationCache.Clear();
         }
 
         return CreateSuccessResponse(
