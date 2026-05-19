@@ -147,6 +147,103 @@ public class NavigationToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task FindReferences_KindFilterInvocation_OnTrackedField_OnlyReturnsInvocations()
+    {
+        var (file, line, col) = await LocateSymbolAsync("TrackedField", kind: "Field");
+        var data = await CallAndGetDataAsync("roslyn:find_references", new
+        {
+            filePath = file, line, column = col, kind = "invocation"
+        });
+        var refs = (data["references"] as JArray)!;
+        refs.Should().NotBeEmpty(
+            "TrackedField is invoked as `TrackedField()` in the fixture");
+        refs.All(r => r["kind"]!.Value<string>() == "invocation").Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task FindReferences_KindFilterTypeof_OnTrackedTarget_OnlyReturnsTypeofRefs()
+    {
+        var (file, line, col) = await LocateSymbolAsync("TrackedTarget", kind: "Class");
+        var data = await CallAndGetDataAsync("roslyn:find_references", new
+        {
+            filePath = file, line, column = col, kind = "typeof"
+        });
+        var refs = (data["references"] as JArray)!;
+        refs.Should().NotBeEmpty(
+            "the fixture has `typeof(TrackedTarget)`");
+        refs.All(r => r["kind"]!.Value<string>() == "typeof").Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task FindReferences_KindFilterNameof_OnTrackedField_OnlyReturnsNameofRefs()
+    {
+        var (file, line, col) = await LocateSymbolAsync("TrackedField", kind: "Field");
+        var data = await CallAndGetDataAsync("roslyn:find_references", new
+        {
+            filePath = file, line, column = col, kind = "nameof"
+        });
+        var refs = (data["references"] as JArray)!;
+        refs.Should().NotBeEmpty(
+            "the fixture has `nameof(TrackedField)` as an attribute argument");
+        refs.All(r => r["kind"]!.Value<string>() == "nameof").Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task FindReferences_KindFilterAttribute_OnTrackedMarker_OnlyReturnsAttributeRefs()
+    {
+        var (file, line, col) = await LocateSymbolAsync("TrackedMarker", kind: "Field");
+        var data = await CallAndGetDataAsync("roslyn:find_references", new
+        {
+            filePath = file, line, column = col, kind = "attribute"
+        });
+        var refs = (data["references"] as JArray)!;
+        refs.Should().NotBeEmpty(
+            "TrackedMarker is used as an attribute argument with no wrapper");
+        refs.All(r => r["kind"]!.Value<string>() == "attribute").Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task FindReferences_KindFilterRead_OnTrackedField_OnlyReturnsReadRefs()
+    {
+        var (file, line, col) = await LocateSymbolAsync("TrackedField", kind: "Field");
+        var data = await CallAndGetDataAsync("roslyn:find_references", new
+        {
+            filePath = file, line, column = col, kind = "read"
+        });
+        var refs = (data["references"] as JArray)!;
+        refs.Should().NotBeEmpty(
+            "TrackedField is read as `var read = TrackedField;`");
+        refs.All(r => r["kind"]!.Value<string>() == "read").Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task GoToDefinition_OnMetadataSymbol_ReturnsSymbolNotFound()
+    {
+        // GoToDefinition on a BCL type's usage: the symbol resolves but its
+        // definition is in metadata, not source (Navigation.cs:314-322).
+        // Position cursor on a `using System;` line — actually no, that's the
+        // using directive. Need to find a usage of a BCL type in source.
+        // The line `using System;` at the top of RoslynService.cs has a reference
+        // to the System namespace (no source location for namespace?). Instead use
+        // a Type usage like `Console.Error` — first find the line.
+        var lines = File.ReadAllLines(Fixture.RoslynServicePath);
+        // Look for a Console.Error reference. RoslynService.cs:281 uses Console.Error.WriteLine.
+        var consoleLine = Array.FindIndex(lines, l =>
+            l.Contains("Console.Error.WriteLine"));
+        consoleLine.Should().BeGreaterThan(-1, "RoslynService.cs uses Console.Error");
+        var consoleCol = lines[consoleLine].IndexOf("Console", StringComparison.Ordinal);
+
+        var error = await CallAndGetErrorAsync("roslyn:go_to_definition", new
+        {
+            filePath = Fixture.RoslynServicePath,
+            line = consoleLine,
+            column = consoleCol
+        }, codeContains: ErrorCodes.SymbolNotFound);
+        error["hint"]!.Value<string>()!.Should().Contain("metadata",
+            "the metadata-only branch hint at Navigation.cs:319 mentions metadata");
+    }
+
+    [Fact]
     public async Task FindImplementations_OnIShapeFixture_ReturnsAllThreeWithFqn()
     {
         var (file, line, col) = await LocateSymbolAsync(
