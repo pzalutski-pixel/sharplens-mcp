@@ -193,6 +193,70 @@ public class JsonRpcParametersTests
     }
 
     [Fact]
+    public void Optional_ClassWrongType_Throws()
+    {
+        // Counterpart to Required_WrongType_Throws but for the reference-type
+        // Optional<T> overload (JsonRpcParameters.cs:42-50). A scalar number
+        // passed where a string is expected must surface "has wrong type"
+        // rather than silently returning null or crashing.
+        var p = Make("""{"kind":42}""");
+        var act = () => p.Optional<string>("kind");
+        act.Should().Throw<JsonRpcInvalidParamsException>()
+            .WithMessage("*kind*test-tool*wrong type*");
+    }
+
+    [Fact]
+    public void RequiredStringArray_Missing_ThrowsArraySpecificWording()
+    {
+        // Locks the DISTINCT "Missing required array parameter" wording from
+        // JsonRpcParameters.cs:106-107, separate from the scalar Required's
+        // "Missing required parameter" message. A regression unifying the two
+        // would slip past the existing wildcard `*typeNames*test-tool*` lock.
+        var p = Make("""{}""");
+        var act = () => p.RequiredStringArray("typeNames");
+        act.Should().Throw<JsonRpcInvalidParamsException>()
+            .WithMessage("*Missing required array parameter*typeNames*test-tool*");
+    }
+
+    [Fact]
+    public void RequiredStringArray_Present_ReturnsList()
+    {
+        // Direct success-path test for RequiredStringArray — the existing
+        // suite only exercises the missing-field error path.
+        var p = Make("""{"typeNames":["Foo","Bar"]}""");
+        p.RequiredStringArray("typeNames").Should().BeEquivalentTo(new[] { "Foo", "Bar" });
+    }
+
+    [Fact]
+    public void RequiredStringArray_NotAnArray_PropagatesArrayShapeError()
+    {
+        // RequiredStringArray delegates to OptionalStringArray. A scalar value
+        // (not an array) must surface the "must be an array of strings"
+        // wording — NOT the "Missing required array parameter" wording, which
+        // is reserved for the field-absent case. Two distinct error messages
+        // route through this method depending on whether the field is missing
+        // or malformed.
+        var p = Make("""{"typeNames":"not-an-array"}""");
+        var act = () => p.RequiredStringArray("typeNames");
+        act.Should().Throw<JsonRpcInvalidParamsException>()
+            .WithMessage("*typeNames*test-tool*must be an array of strings*");
+    }
+
+    [Fact]
+    public void OptionalStringArray_NonStringElement_ThrowsArrayShapeError()
+    {
+        // Per-element validation: a number/object/array inside the supposed
+        // string-array must surface the structured "must be an array of
+        // strings" -32602 error, not propagate an uncaught
+        // System.Text.Json.JsonException (which the dispatcher's catch-all
+        // would wrap as -32603 Internal error, hiding the real cause).
+        var p = Make("""{"kinds":["Method",42,"Field"]}""");
+        var act = () => p.OptionalStringArray("kinds");
+        act.Should().Throw<JsonRpcInvalidParamsException>()
+            .WithMessage("*kinds*test-tool*must be an array of strings*");
+    }
+
+    [Fact]
     public void Constructor_WithNullArgs_AllAccessorsTreatAsEmpty()
     {
         // When the caller's tools/call params lack an `arguments` object entirely,
