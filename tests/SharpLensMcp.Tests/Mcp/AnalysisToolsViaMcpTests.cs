@@ -227,6 +227,142 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task AnalyzeChangeImpact_ChangeType_ProducesWarningsNotBreaking()
+    {
+        var (file, line, col) = await LocateSymbolAsync("CreateSuccessResponse", kind: "Method",
+            r => r["containingType"]?.Value<string>()?.Contains("RoslynService") == true);
+        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        {
+            filePath = file, line, column = col,
+            changeType = "changetype",
+            newValue = "Task<object>"
+        });
+        data["breakingChanges"]!.Value<int>().Should().Be(0);
+        data["warnings"]!.Value<int>().Should().BeGreaterOrEqualTo(1);
+        data["safe"]!.Value<bool>().Should().BeTrue("changetype produces warnings, not breaking changes");
+        foreach (var loc in (data["impactedLocations"] as JArray)!)
+        {
+            loc["severity"]!.Value<string>().Should().Be("warning");
+            loc["impact"]!.Value<string>().Should().Be("Usage may be incompatible with new type");
+        }
+    }
+
+    [Fact]
+    public async Task AnalyzeChangeImpact_AddParameter_ProducesBreakingChanges()
+    {
+        var (file, line, col) = await LocateSymbolAsync("CreateSuccessResponse", kind: "Method",
+            r => r["containingType"]?.Value<string>()?.Contains("RoslynService") == true);
+        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        {
+            filePath = file, line, column = col,
+            changeType = "addparameter",
+            newValue = "int extra"
+        });
+        data["safe"]!.Value<bool>().Should().BeFalse();
+        data["breakingChanges"]!.Value<int>().Should().BeGreaterOrEqualTo(1);
+        foreach (var loc in (data["impactedLocations"] as JArray)!)
+        {
+            loc["severity"]!.Value<string>().Should().Be("error");
+            loc["impact"]!.Value<string>().Should().Be("Call site missing new parameter");
+        }
+    }
+
+    [Fact]
+    public async Task AnalyzeChangeImpact_RemoveParameter_ProducesBreakingChanges()
+    {
+        var (file, line, col) = await LocateSymbolAsync("CreateSuccessResponse", kind: "Method",
+            r => r["containingType"]?.Value<string>()?.Contains("RoslynService") == true);
+        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        {
+            filePath = file, line, column = col,
+            changeType = "removeparameter",
+            newValue = "data"
+        });
+        data["safe"]!.Value<bool>().Should().BeFalse();
+        data["breakingChanges"]!.Value<int>().Should().BeGreaterOrEqualTo(1);
+        foreach (var loc in (data["impactedLocations"] as JArray)!)
+        {
+            loc["impact"]!.Value<string>().Should().Be("Call site has extra parameter");
+        }
+    }
+
+    [Fact]
+    public async Task AnalyzeChangeImpact_Delete_ProducesBreakingChanges()
+    {
+        var (file, line, col) = await LocateSymbolAsync("CreateSuccessResponse", kind: "Method",
+            r => r["containingType"]?.Value<string>()?.Contains("RoslynService") == true);
+        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        {
+            filePath = file, line, column = col,
+            changeType = "delete"
+        });
+        data["safe"]!.Value<bool>().Should().BeFalse();
+        foreach (var loc in (data["impactedLocations"] as JArray)!)
+        {
+            loc["severity"]!.Value<string>().Should().Be("error");
+            loc["impact"]!.Value<string>().Should().Be("Reference will be broken");
+        }
+    }
+
+    [Fact]
+    public async Task AnalyzeChangeImpact_ChangeAccessibility_OnPrivateField_ProducesWarnings()
+    {
+        // Non-public symbol → impact="Accessibility change may affect visibility",
+        // severity="warning", warnings++ (Inspection.cs:1214-1219). The _workspace
+        // field is private with references confined to RoslynService partials.
+        var (file, line, col) = await LocateSymbolAsync("_workspace", kind: "Field");
+        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        {
+            filePath = file, line, column = col,
+            changeType = "changeaccessibility",
+            newValue = "public"
+        });
+        data["safe"]!.Value<bool>().Should().BeTrue("non-public accessibility change produces warnings only");
+        foreach (var loc in (data["impactedLocations"] as JArray)!)
+        {
+            loc["severity"]!.Value<string>().Should().Be("warning");
+            loc["impact"]!.Value<string>().Should().Be("Accessibility change may affect visibility");
+        }
+    }
+
+    [Fact]
+    public async Task AnalyzeChangeImpact_UnknownChangeType_DefaultsToInfo()
+    {
+        var (file, line, col) = await LocateSymbolAsync("CreateSuccessResponse", kind: "Method",
+            r => r["containingType"]?.Value<string>()?.Contains("RoslynService") == true);
+        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        {
+            filePath = file, line, column = col,
+            changeType = "somethingUnknown",
+            newValue = "n/a"
+        });
+        data["safe"]!.Value<bool>().Should().BeTrue();
+        foreach (var loc in (data["impactedLocations"] as JArray)!)
+        {
+            loc["severity"]!.Value<string>().Should().Be("info");
+            loc["impact"]!.Value<string>().Should().Be("Unknown impact");
+        }
+    }
+
+    [Fact]
+    public async Task GetCallGraph_MaxNodesReached_FlagsTruncatedByNodes()
+    {
+        // Set maxNodes very low to force truncation. LoadSolutionAsync is a
+        // method with many callees; with maxNodes=2 the BFS halts past the
+        // first level. Locks truncatedByNodes (Inspection.cs:1614).
+        var (file, line, col) = await LocateSymbolAsync("LoadSolutionAsync", kind: "Method");
+        var data = await CallAndGetDataAsync("roslyn:get_call_graph", new
+        {
+            filePath = file, line, column = col,
+            direction = "callees",
+            maxDepth = 5,
+            maxNodes = 2
+        });
+        (data["nodes"] as JArray)!.Count.Should().BeLessOrEqualTo(2);
+        data["truncatedByNodes"]!.Value<bool>().Should().BeTrue();
+    }
+
+    [Fact]
     public async Task CheckTypeCompatibility_StringToObject_IsImplicitReference()
     {
         var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
