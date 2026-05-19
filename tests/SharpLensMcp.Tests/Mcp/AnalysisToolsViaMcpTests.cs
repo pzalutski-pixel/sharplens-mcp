@@ -4,13 +4,22 @@ using Xunit;
 
 namespace SharpLensMcp.Tests.Mcp;
 
-// MCP-layer tests for Analysis category (11 tools). Each assertion is grounded
-// in concrete known facts about the loaded SharpLens solution:
-//  - Clean compiler-only diagnostics (no errors/warnings)
-//  - RefactoringFixture.Sum has known variable flow (partial, total, a, c)
-//  - GetHealthCheckAsync calls GetProjectCompilationAsync (verified in RoslynService.cs:491)
-//  - CreateSuccessResponse has >30 call sites across the tool surface
-//  - No project-level circular dependencies
+// MCP-layer tests for the Analysis category. Every assertion locks a specific
+// field from the impl's documented response shape:
+//  - get_diagnostics:           Analysis.cs:49-57
+//  - analyze_data_flow:         Compound.cs:97-114
+//  - analyze_control_flow:      Compound.cs:232-242
+//  - analyze_change_impact:     Inspection.cs:1244-1256
+//  - check_type_compatibility:  Validation.cs:247-260
+//  - get_outgoing_calls:        Inspection.cs:942-948
+//  - find_unused_code:          Inspection.cs:405-421
+//  - validate_code:             Validation.cs:126-134
+//  - get_complexity_metrics:    CodeGeneration.cs:169-177
+//  - find_circular_dependencies:Discovery.cs:256-258
+//  - get_missing_members:       Inspection.cs:789-796
+//
+// Tightening rule for this file: every accessor uses `!.Value<T>()` (NRE on
+// missing) rather than `?.Value<T>()` (silent-pass via short-circuit).
 public class AnalysisToolsViaMcpTests : McpTestBase
 {
     public AnalysisToolsViaMcpTests(McpServerFixture fixture) : base(fixture) { }
@@ -26,21 +35,26 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             includeHidden = false,
             runAnalyzers = false
         });
-        // runAnalyzers:false locks both fields to deterministic values.
-        data["analyzersRan"]?.Value<bool>().Should().BeFalse();
-        data["analyzerCount"]?.Value<int>().Should().Be(0);
+        data["analyzersRan"]!.Value<bool>().Should().BeFalse();
+        data["analyzerCount"]!.Value<int>().Should().Be(0);
 
-        var diagnostics = data["diagnostics"] as JArray;
-        diagnostics.Should().NotBeNull();
-        // The reported counts must match the entries in the diagnostics array.
-        var errors = diagnostics!.Count(d => d["severity"]?.Value<string>() == "Error");
-        var warnings = diagnostics!.Count(d => d["severity"]?.Value<string>() == "Warning");
-        data["errorCount"]?.Value<int>().Should().Be(errors);
-        data["warningCount"]?.Value<int>().Should().Be(warnings);
+        var diagnostics = (data["diagnostics"] as JArray)!;
+        // Lock that every entry has a severity field — without this, the count
+        // comparison below would silently drop entries with missing severity and
+        // still match against the reported count for the wrong reason.
+        foreach (var d in diagnostics)
+        {
+            d["severity"]!.Value<string>().Should().NotBeNullOrEmpty(
+                "every diagnostic entry must carry a severity field");
+        }
+        var errors = diagnostics.Count(d => d["severity"]!.Value<string>() == "Error");
+        var warnings = diagnostics.Count(d => d["severity"]!.Value<string>() == "Warning");
+        data["errorCount"]!.Value<int>().Should().Be(errors);
+        data["warningCount"]!.Value<int>().Should().Be(warnings);
     }
 
     [Fact]
-    public async Task GetDiagnostics_FullSolutionRunAnalyzersTrue_ReportsAnalyzerFields()
+    public async Task GetDiagnostics_FullSolutionRunAnalyzersTrue_ActuallyRunsAnalyzers()
     {
         var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
         {
@@ -50,10 +64,14 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             includeHidden = false,
             runAnalyzers = true
         });
-        // With analyzers on, the response must surface BOTH flags.
-        // analyzersRan can be false if no project has analyzer references; then count == 0.
-        data["analyzersRan"]?.Type.Should().Be(JTokenType.Boolean);
-        data["analyzerCount"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
+        // The SharpLens solution loads SharpLensMcp.Tests.TestAnalyzers, so the
+        // contract is analyzersRan=true AND analyzerCount > 0. The previous test
+        // just checked the field type was Boolean — a smoke pattern that let any
+        // value pass.
+        data["analyzersRan"]!.Value<bool>().Should().BeTrue(
+            "runAnalyzers=true must actually invoke analyzers in this solution");
+        data["analyzerCount"]!.Value<int>().Should().BeGreaterThan(0,
+            "the SharpLens solution has at least one analyzer reference (TestAnalyzers)");
     }
 
     [Fact]
@@ -67,14 +85,13 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             includeHidden = false,
             runAnalyzers = false
         });
-        var diagnostics = data["diagnostics"] as JArray;
-        diagnostics.Should().NotBeNull();
-        foreach (var d in diagnostics!)
+        var diagnostics = (data["diagnostics"] as JArray)!;
+        foreach (var d in diagnostics)
         {
-            d["severity"]?.Value<string>().Should().Be("Warning",
+            d["severity"]!.Value<string>().Should().Be("Warning",
                 "the severity filter must drop non-Warning entries");
         }
-        data["errorCount"]?.Value<int>().Should().Be(0);
+        data["errorCount"]!.Value<int>().Should().Be(0);
     }
 
     [Fact]
@@ -89,13 +106,10 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             includeHidden = false,
             runAnalyzers = false
         });
-        var diagnostics = data["diagnostics"] as JArray;
-        diagnostics.Should().NotBeNull();
-        // Every diagnostic must come from a file inside the SharpLensMcp/src/ directory.
-        // No tests/* files should appear when the filter is set to the main project.
-        foreach (var d in diagnostics!)
+        var diagnostics = (data["diagnostics"] as JArray)!;
+        foreach (var d in diagnostics)
         {
-            var path = d["filePath"]?.Value<string>() ?? "";
+            var path = d["filePath"]!.Value<string>()!;
             path.Should().NotContain("tests/",
                 "projectPath filter must exclude files from other projects");
             path.Should().NotContain("tests\\");
@@ -113,16 +127,14 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             includeHidden = false,
             runAnalyzers = false
         });
-        var diagnostics = data["diagnostics"] as JArray;
-        diagnostics.Should().NotBeNull();
-        foreach (var d in diagnostics!)
+        var diagnostics = (data["diagnostics"] as JArray)!;
+        foreach (var d in diagnostics)
         {
-            d["severity"]?.Value<string>().Should().Be("Error",
+            d["severity"]!.Value<string>().Should().Be("Error",
                 "severity filter must drop non-Error entries");
         }
-        // With the Error filter, warningCount in the response should be 0.
-        data["warningCount"]?.Value<int>().Should().Be(0);
-        data["errorCount"]?.Value<int>().Should().Be(diagnostics.Count);
+        data["warningCount"]!.Value<int>().Should().Be(0);
+        data["errorCount"]!.Value<int>().Should().Be(diagnostics.Count);
     }
 
     [Fact]
@@ -144,7 +156,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             startLine = firstStmt,
             endLine = lastStmt
         });
-        data["succeeded"]?.Value<bool>().Should().BeTrue();
+        data["succeeded"]!.Value<bool>().Should().BeTrue();
 
         var declared = (data["variablesDeclared"] as JArray)!.Select(v => v.Value<string>()).ToList();
         declared.Should().BeEquivalentTo(new[] { "partial", "total" },
@@ -173,15 +185,14 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             startLine = firstStmt,
             endLine = lastStmt
         });
-        data["succeeded"]?.Value<bool>().Should().BeTrue();
-        data["startPointIsReachable"]?.Value<bool>().Should().BeTrue(
+        data["succeeded"]!.Value<bool>().Should().BeTrue();
+        data["startPointIsReachable"]!.Value<bool>().Should().BeTrue(
             "the region starts with a local declaration that is reachable");
-        data["endPointIsReachable"]?.Value<bool>().Should().BeFalse(
+        data["endPointIsReachable"]!.Value<bool>().Should().BeFalse(
             "the region ends with `return total` so falling off the end is unreachable");
 
-        var returns = data["returnStatements"] as JArray;
-        returns.Should().NotBeNullOrEmpty();
-        returns!.Count.Should().Be(1, "Sum has exactly one return statement in the analyzed region");
+        var returns = (data["returnStatements"] as JArray)!;
+        returns.Count.Should().Be(1, "Sum has exactly one return statement in the analyzed region");
     }
 
     [Fact]
@@ -198,22 +209,21 @@ public class AnalysisToolsViaMcpTests : McpTestBase
         // Rename change: per Inspection.cs:1180-1183, severity is always "info"
         // and breakingChanges is never incremented — these are the load-bearing
         // invariants of the rename classifier.
-        data["safe"]?.Value<bool>().Should().BeTrue("rename is non-breaking per the impact classifier");
-        data["breakingChanges"]?.Value<int>().Should().Be(0);
-        data["warnings"]?.Value<int>().Should().Be(0,
+        data["safe"]!.Value<bool>().Should().BeTrue("rename is non-breaking per the impact classifier");
+        data["breakingChanges"]!.Value<int>().Should().Be(0);
+        data["warnings"]!.Value<int>().Should().Be(0,
             "rename has neither breaking nor warning impacts per the classifier");
 
-        var impacted = data["impactedLocations"] as JArray;
-        impacted.Should().NotBeNullOrEmpty();
-        foreach (var loc in impacted!)
+        var impacted = (data["impactedLocations"] as JArray)!;
+        impacted.Should().NotBeEmpty();
+        foreach (var loc in impacted)
         {
-            loc["severity"]?.Value<string>().Should().Be("info",
+            loc["severity"]!.Value<string>().Should().Be("info",
                 "every rename impact must classify as info");
-            loc["impact"]?.Value<string>().Should().Be("Reference will need to be updated",
+            loc["impact"]!.Value<string>().Should().Be("Reference will need to be updated",
                 "Inspection.cs:1181 sets this exact text for rename");
         }
-        // totalReferences must equal the size of impactedLocations (no filtering between them).
-        data["totalReferences"]?.Value<int>().Should().BeGreaterOrEqualTo(1);
+        data["totalReferences"]!.Value<int>().Should().BeGreaterOrEqualTo(1);
     }
 
     [Fact]
@@ -224,10 +234,10 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             sourceType = "System.String",
             targetType = "System.Object"
         });
-        data["compatible"]?.Value<bool>().Should().BeTrue();
-        data["requiresCast"]?.Value<bool>().Should().BeFalse();
-        data["conversionKind"]?.Value<string>().Should().Be("ImplicitReference");
-        data["isReferenceConversion"]?.Value<bool>().Should().BeTrue();
+        data["compatible"]!.Value<bool>().Should().BeTrue();
+        data["requiresCast"]!.Value<bool>().Should().BeFalse();
+        data["conversionKind"]!.Value<string>().Should().Be("ImplicitReference");
+        data["isReferenceConversion"]!.Value<bool>().Should().BeTrue();
     }
 
     [Fact]
@@ -238,9 +248,9 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             sourceType = "System.Int32",
             targetType = "System.String"
         });
-        data["compatible"]?.Value<bool>().Should().BeFalse();
-        data["requiresCast"]?.Value<bool>().Should().BeFalse();
-        data["conversionKind"]?.Value<string>().Should().Be("None");
+        data["compatible"]!.Value<bool>().Should().BeFalse();
+        data["requiresCast"]!.Value<bool>().Should().BeFalse();
+        data["conversionKind"]!.Value<string>().Should().Be("None");
     }
 
     [Fact]
@@ -254,11 +264,13 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             line = line + 1,
             column = col
         });
-        var calls = data["calls"] as JArray;
-        calls.Should().NotBeNullOrEmpty();
-        // GetHealthCheckAsync's body calls GetProjectCompilationAsync (RoslynService.cs:491).
+        var calls = (data["calls"] as JArray)!;
+        calls.Should().NotBeEmpty();
+        // GetHealthCheckAsync's body calls GetProjectCompilationAsync.
         // The tool's shortName field is "{ContainingType}.{Method}" per Inspection.cs:897.
-        calls!.Any(c =>
+        // The predicate `?.` chain returning false on null is safe — `.Any` returns false
+        // if no entry matches, and the outer .Should().BeTrue() fails.
+        calls.Any(c =>
             c["shortName"]?.Value<string>()?.EndsWith(".GetProjectCompilationAsync") == true)
             .Should().BeTrue("GetHealthCheckAsync explicitly calls GetProjectCompilationAsync");
     }
@@ -274,20 +286,24 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             symbolKindFilter = (string?)null,
             maxResults = 10
         });
-        var unused = data["unusedSymbols"] as JArray;
-        unused.Should().NotBeNull();
-        unused!.Count.Should().BeLessOrEqualTo(10, "maxResults must cap returnedCount");
+        var unused = (data["unusedSymbols"] as JArray)!;
+        unused.Count.Should().BeLessOrEqualTo(10, "maxResults must cap returnedCount");
 
         // Every returned entry must conform to the full UnusedSymbolEntry shape so
-        // a field rename in the data class would fail this test.
+        // a field rename in the data class would fail this test. Includes the
+        // containingType and column fields the impl emits (Inspection.cs:410-420)
+        // that the previous test ignored.
         foreach (var entry in unused)
         {
-            entry["name"]?.Value<string>().Should().NotBeNullOrEmpty();
-            entry["fullyQualifiedName"]?.Value<string>().Should().NotBeNullOrEmpty();
-            entry["kind"]?.Value<string>().Should().NotBeNullOrEmpty();
-            entry["accessibility"]?.Value<string>().Should().NotBeNullOrEmpty();
-            entry["filePath"]?.Value<string>().Should().EndWith(".cs");
-            entry["line"]?.Value<int>().Should().BeGreaterOrEqualTo(0);
+            entry["name"]!.Value<string>().Should().NotBeNullOrEmpty();
+            entry["fullyQualifiedName"]!.Value<string>().Should().NotBeNullOrEmpty();
+            entry["kind"]!.Value<string>().Should().NotBeNullOrEmpty();
+            entry["accessibility"]!.Value<string>().Should().NotBeNullOrEmpty();
+            entry["containingType"].Should().NotBeNull(
+                "every entry must carry containingType (may be null for top-level types)");
+            entry["filePath"]!.Value<string>()!.Should().EndWith(".cs");
+            entry["line"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
+            entry["column"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
         }
     }
 
@@ -299,9 +315,9 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             code = "public class Test { public void Foo() { } }",
             standalone = true
         });
-        data["compiles"]?.Value<bool>().Should().BeTrue();
-        data["errorCount"]?.Value<int>().Should().Be(0);
-        (data["errors"] as JArray)?.Count.Should().Be(0);
+        data["compiles"]!.Value<bool>().Should().BeTrue();
+        data["errorCount"]!.Value<int>().Should().Be(0);
+        (data["errors"] as JArray)!.Count.Should().Be(0);
     }
 
     [Fact]
@@ -312,11 +328,11 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             code = "public class Test { public void Foo() { !!! invalid syntax } }",
             standalone = true
         });
-        data["compiles"]?.Value<bool>().Should().BeFalse();
-        var errors = data["errors"] as JArray;
-        errors.Should().NotBeNullOrEmpty();
+        data["compiles"]!.Value<bool>().Should().BeFalse();
+        var errors = (data["errors"] as JArray)!;
+        errors.Should().NotBeEmpty();
         // Compiler errors are tagged with "CS{number}" diagnostic IDs.
-        errors!.Any(e => e["id"]?.Value<string>()?.StartsWith("CS") == true)
+        errors.Any(e => e["id"]?.Value<string>()?.StartsWith("CS") == true)
             .Should().BeTrue("Roslyn surfaces compiler errors with CS-prefixed IDs");
     }
 
@@ -327,15 +343,15 @@ public class AnalysisToolsViaMcpTests : McpTestBase
         {
             filePath = Fixture.RoslynServicePath
         });
-        data["scope"]?.Value<string>().Should().Be("file");
-        var methods = data["methods"] as JArray;
-        methods.Should().NotBeNullOrEmpty();
+        data["scope"]!.Value<string>().Should().Be("file");
+        var methods = (data["methods"] as JArray)!;
+        methods.Should().NotBeEmpty();
 
-        var loadSolution = methods!.FirstOrDefault(m =>
+        var loadSolution = methods.FirstOrDefault(m =>
             m["name"]?.Value<string>() == "LoadSolutionAsync");
         loadSolution.Should().NotBeNull(
             "LoadSolutionAsync must appear in the per-method breakdown");
-        loadSolution!["metrics"]?["cyclomatic"]?.Value<int>().Should().BeGreaterOrEqualTo(1,
+        loadSolution!["metrics"]!["cyclomatic"]!.Value<int>().Should().BeGreaterOrEqualTo(1,
             "every method has cyclomatic complexity >= 1");
     }
 
@@ -346,10 +362,24 @@ public class AnalysisToolsViaMcpTests : McpTestBase
         {
             level = (string?)null
         });
-        data["level"]?.Value<string>().Should().Be("project");
-        data["hasCycles"]?.Value<bool>().Should().BeFalse(
+        data["level"]!.Value<string>().Should().Be("project");
+        data["hasCycles"]!.Value<bool>().Should().BeFalse(
             "the SharpLens solution has no project-level cycles");
-        (data["cycles"] as JArray)?.Count.Should().Be(0);
+        (data["cycles"] as JArray)!.Count.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task FindCircularDependencies_BadLevel_ReturnsInvalidParameter()
+    {
+        // Discovery.cs:233-240 explicitly rejects levels other than 'project' or
+        // 'namespace'. Without this test, a regression that silently treated unknown
+        // values as 'namespace' (the prior behavior) would go unnoticed.
+        var error = await CallAndGetErrorAsync("roslyn:find_circular_dependencies",
+            new { level = "garbage" },
+            codeContains: ErrorCodes.InvalidParameter);
+        error["message"]!.Value<string>().Should().Contain("project",
+            "the error message must enumerate the supported levels");
+        error["message"]!.Value<string>().Should().Contain("namespace");
     }
 
     [Fact]
@@ -363,26 +393,28 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             includeHidden = false,
             runAnalyzers = false
         });
-        var diagnostics = data["diagnostics"] as JArray;
-        diagnostics.Should().NotBeNull("response must always carry a diagnostics array");
+        var diagnostics = (data["diagnostics"] as JArray)!;
         // Severity filter contract: every entry that survives the filter must match.
-        // A clean compiler-only build may yield zero Info diagnostics — that's acceptable.
-        foreach (var d in diagnostics!)
+        // A clean compiler-only build may yield zero Info diagnostics — that's
+        // acceptable; the per-entry foreach passes vacuously, but the count fields
+        // are independently locked.
+        foreach (var d in diagnostics)
         {
-            d["severity"]?.Value<string>().Should().Be("Info",
+            d["severity"]!.Value<string>().Should().Be("Info",
                 "the severity=Info filter must drop every non-Info entry");
         }
-        data["errorCount"]?.Value<int>().Should().Be(0,
+        data["errorCount"]!.Value<int>().Should().Be(0,
             "with severity=Info, errorCount must be 0");
-        data["warningCount"]?.Value<int>().Should().Be(0,
+        data["warningCount"]!.Value<int>().Should().Be(0,
             "with severity=Info, warningCount must be 0");
     }
 
     [Fact]
     public async Task GetDiagnostics_IncludeHiddenTrue_IsSupersetOfIncludeHiddenFalse()
     {
-        // includeHidden controls whether Severity=Hidden diagnostics surface. Setting it
-        // to true must produce a superset (or equal set) of the includeHidden=false call.
+        // includeHidden controls whether Severity=Hidden diagnostics surface. Setting
+        // it to true must produce a superset (or equal set) of the includeHidden=false
+        // call.
         var withoutHidden = await CallAndGetDataAsync("roslyn:get_diagnostics", new
         {
             filePath = (string?)null,
@@ -399,16 +431,27 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             includeHidden = true,
             runAnalyzers = false
         });
-        var visibleCount = (withoutHidden["diagnostics"] as JArray)!.Count;
-        var allCount = (withHidden["diagnostics"] as JArray)!.Count;
-        allCount.Should().BeGreaterOrEqualTo(visibleCount,
+        var visible = (withoutHidden["diagnostics"] as JArray)!;
+        var all = (withHidden["diagnostics"] as JArray)!;
+        all.Count.Should().BeGreaterOrEqualTo(visible.Count,
             "the includeHidden=true result set must contain every includeHidden=false entry plus any hidden ones");
-        // Every visible (non-hidden) id from the smaller set must also appear in the larger set.
-        var visibleIds = (withoutHidden["diagnostics"] as JArray)!
-            .Select(d => $"{d["id"]?.Value<string>()}:{d["line"]?.Value<int>()}")
+
+        // Every visible (non-hidden) id+line must appear in the larger set.
+        // Lock per-entry id+line presence to defeat null-key collision in the HashSet.
+        foreach (var d in visible)
+        {
+            d["id"]!.Value<string>().Should().NotBeNullOrEmpty();
+            d["line"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
+        }
+        foreach (var d in all)
+        {
+            d["id"]!.Value<string>().Should().NotBeNullOrEmpty();
+        }
+        var visibleIds = visible
+            .Select(d => $"{d["id"]!.Value<string>()}:{d["line"]!.Value<int>()}")
             .ToHashSet();
-        var allIds = (withHidden["diagnostics"] as JArray)!
-            .Select(d => $"{d["id"]?.Value<string>()}:{d["line"]?.Value<int>()}")
+        var allIds = all
+            .Select(d => $"{d["id"]!.Value<string>()}:{d["line"]!.Value<int>()}")
             .ToHashSet();
         visibleIds.IsSubsetOf(allIds).Should().BeTrue(
             "every visible diagnostic id+line must also appear in the includeHidden=true set");
@@ -418,8 +461,8 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     public async Task GetMissingMembers_OnRoslynService_NoneMissing()
     {
         // RoslynService is a complete partial class. Resolve the MatchesGlobPattern
-        // method body dynamically (its line shifts when the file is edited) so the
-        // test pins to its real position, not a hard-coded constant.
+        // method body dynamically so the test pins to its real position even when
+        // the file is edited.
         var lines = File.ReadAllLines(Fixture.RoslynServicePath);
         var methodLine = Array.FindIndex(lines, l => l.Contains("MatchesGlobPattern"));
         methodLine.Should().BeGreaterThan(-1);
@@ -430,13 +473,12 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             line = methodLine + 4,   // inside the method body
             column = 10
         });
-        data["typeName"]?.Value<string>().Should().EndWith("RoslynService");
-        data["isAbstract"]?.Value<bool>().Should().BeFalse();
+        data["typeName"]!.Value<string>()!.Should().EndWith("RoslynService");
+        data["isAbstract"]!.Value<bool>().Should().BeFalse();
         // Inspection.cs returns missingMembers as an empty array (not null) for
-        // complete types — assert exactly that, no OR-pattern weakening.
-        var missing = data["missingMembers"] as JArray;
-        missing.Should().NotBeNull("missingMembers is always emitted as an array");
-        missing!.Count.Should().Be(0,
+        // complete types.
+        var missing = (data["missingMembers"] as JArray)!;
+        missing.Count.Should().Be(0,
             "RoslynService implements all interface/abstract members it inherits from");
     }
 }
