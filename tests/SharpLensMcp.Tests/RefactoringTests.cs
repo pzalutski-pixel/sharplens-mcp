@@ -144,6 +144,126 @@ public class RefactoringTests : RoslynServiceTestBase
     }
 
     [Fact]
+    public async Task ExtractInterface_OnRefactoringTarget_IncludesMethodSignaturesNotFields()
+    {
+        // RefactoringTarget has a public field (BareCounter) plus three public methods
+        // (Sum/GreetingFor/Compute). ExtractInterface filters to methods/properties/
+        // events (Refactoring.cs:347-351) — fields are dropped. The generated interface
+        // exercises the METHOD branch of GenerateInterfaceCode at line 649-655 (only
+        // the property branch was previously tested via FixtureRectangle).
+        var searchResult = await Service.SearchSymbolsAsync("RefactoringTarget", kind: "Class", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        var target = symbols![0];
+        var loc = target["location"]!;
+        var result = await Service.ExtractInterfaceAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            interfaceName: "IRefactoringTarget",
+            includeMemberNames: null);
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        var code = data["interfaceCode"]!.Value<string>()!;
+        code.Should().Contain("Sum(", "Sum is a public method on the target");
+        code.Should().Contain("GreetingFor(");
+        code.Should().Contain("Compute(");
+        code.Should().NotContain("BareCounter",
+            "ExtractInterface excludes fields (Refactoring.cs:347-348 filters to methods/properties/events)");
+    }
+
+    [Fact]
+    public async Task ExtractInterface_IncludeMemberNamesFilter_LimitsToNamedMembers()
+    {
+        // Refactoring.cs:354-357: when includeMemberNames is supplied, only members
+        // whose Name matches survive. Pass just ["Width"] and assert Height/Area drop.
+        var searchResult = await Service.SearchSymbolsAsync("FixtureRectangle", kind: "Class", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        var rect = symbols!.First(s => s["name"]?.Value<string>() == "FixtureRectangle");
+        var loc = rect["location"]!;
+        var result = await Service.ExtractInterfaceAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            interfaceName: "IFixtureRectangle",
+            includeMemberNames: new List<string> { "Width" });
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        var code = data["interfaceCode"]!.Value<string>()!;
+        code.Should().Contain("Width");
+        code.Should().NotContain("Height",
+            "Height was not in includeMemberNames and must be filtered out");
+        code.Should().NotContain("Area");
+    }
+
+    [Fact]
+    public async Task RenameSymbol_VerbosityCompact_EmitsLocationsButNoText()
+    {
+        // Refactoring.cs:156-176: compact verbosity emits per-change line/column
+        // entries but NOT old/new text snippets. Verifies the verbosity dispatch.
+        var searchResult = await Service.SearchSymbolsAsync("_workspace", kind: "Field", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.RenameSymbolAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            newName: "_renamed",
+            preview: true,
+            verbosity: "compact");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["verbosity"]!.Value<string>().Should().Be("compact");
+        var changes = (data["changes"] as JArray)!;
+        changes.Should().NotBeEmpty();
+        // compact entries have filePath/changeCount/changes[]/truncated;
+        // each inner change has line/column only (no text snippets).
+        var first = changes[0]!;
+        first["filePath"].Should().NotBeNull();
+        var innerChanges = first["changes"] as JArray;
+        innerChanges.Should().NotBeNull("compact verbosity emits inner changes array");
+        if (innerChanges!.Count > 0)
+        {
+            innerChanges[0]!["line"].Should().NotBeNull();
+            innerChanges[0]!["column"].Should().NotBeNull();
+            innerChanges[0]!["oldText"].Should().BeNull("compact omits oldText");
+            innerChanges[0]!["newText"].Should().BeNull("compact omits newText");
+        }
+    }
+
+    [Fact]
+    public async Task RenameSymbol_VerbosityFull_EmitsTextSnippets()
+    {
+        // Refactoring.cs:178-203: full verbosity adds oldText/newText to each
+        // inner change entry. Locks the differentiator from compact.
+        var searchResult = await Service.SearchSymbolsAsync("_workspace", kind: "Field", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        var symbol = symbols![0];
+        var loc = symbol["location"]!;
+        var result = await Service.RenameSymbolAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            newName: "_renamed",
+            preview: true,
+            verbosity: "full");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["verbosity"]!.Value<string>().Should().Be("full");
+        var changes = (data["changes"] as JArray)!;
+        var firstFile = changes[0]!;
+        var innerChanges = (firstFile["changes"] as JArray)!;
+        innerChanges.Should().NotBeEmpty();
+        var firstChange = innerChanges[0]!;
+        firstChange["oldText"]!.Value<string>().Should().Contain("_workspace");
+        firstChange["newText"]!.Value<string>().Should().Contain("_renamed");
+    }
+
+    [Fact]
     public async Task ExtractInterface_OnNonTypePosition_ReturnsNotAType()
     {
         // Position the cursor on the MatchesGlobPattern method declaration — a method,
