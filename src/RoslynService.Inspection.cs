@@ -1011,24 +1011,34 @@ public partial class RoslynService
             })
             .ToList();
 
-        // Find factory methods in other types that return this type
+        // Find factory methods in other types that return this type. Re-resolve
+        // `type` in each project's augmented compilation: FindTypeByNameAsync
+        // returns the type from the BASE compilation, but allTypes (and their
+        // return types) come from the AUGMENTED compilation. When a project has
+        // source generators (implicit .NET SDK generators count), base != augmented
+        // and SymbolEqualityComparer.Default returns false for the "same" source
+        // type across compilations — silently breaking external-factory detection.
+        var typeMetadataName = type.ToDisplayString();
         var externalFactories = new List<object>();
         foreach (var project in _solution!.Projects)
         {
             var compilation = await GetProjectCompilationAsync(project);
             if (compilation == null) continue;
 
+            var typeInCompilation = compilation.GetTypeByMetadataName(typeMetadataName);
+            if (typeInCompilation == null) continue;
+
             var allTypes = compilation.GetSymbolsWithName(_ => true, SymbolFilter.Type).OfType<INamedTypeSymbol>();
             foreach (var t in allTypes)
             {
-                if (SymbolEqualityComparer.Default.Equals(t, type)) continue;
+                if (SymbolEqualityComparer.Default.Equals(t, typeInCompilation)) continue;
 
                 var factories = t.GetMembers()
                     .OfType<IMethodSymbol>()
                     .Where(m => m.IsStatic &&
                                m.DeclaredAccessibility == Accessibility.Public &&
                                (m.Name.StartsWith("Create") || m.Name.StartsWith("Build") || m.Name.StartsWith("New")) &&
-                               SymbolEqualityComparer.Default.Equals(m.ReturnType, type))
+                               SymbolEqualityComparer.Default.Equals(m.ReturnType, typeInCompilation))
                     .Take(5); // Limit to avoid too many
 
                 foreach (var f in factories)

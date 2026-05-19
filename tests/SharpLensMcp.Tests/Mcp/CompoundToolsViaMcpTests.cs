@@ -392,6 +392,54 @@ public class CompoundToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task GetInstantiationOptions_OnDisposableTarget_ImplementsIDisposableHintFires()
+    {
+        var data = await CallAndGetDataAsync("roslyn:get_instantiation_options", new
+        {
+            typeName = "DisposableTarget"
+        });
+        data["implementsIDisposable"]!.Value<bool>().Should().BeTrue();
+        data["hint"]!.Value<string>()!.Should().Contain("using",
+            "the IDisposable hint at Inspection.cs:1056 suggests `using` statement");
+    }
+
+    [Fact]
+    public async Task GetInstantiationOptions_OnFactoryTarget_ListsFactoryMethods()
+    {
+        // FactoryTarget has static Create() and Build(int) returning itself.
+        // Inspection.cs:997-1012 collects these.
+        var data = await CallAndGetDataAsync("roslyn:get_instantiation_options", new
+        {
+            typeName = "FactoryTarget"
+        });
+        var factories = (data["factoryMethods"] as JArray)!;
+        var names = factories.Select(f => f["name"]!.Value<string>()).ToList();
+        names.Should().Contain("Create");
+        names.Should().Contain("Build");
+    }
+
+    [Fact]
+    public async Task GetInstantiationOptions_OnExternalFactoryTarget_DetectsExternalFactoriesOnHostType()
+    {
+        // ExternalFactoryHost has CreateTarget/BuildTarget/NewTarget — all
+        // matching the Create*/Build*/New* prefix patterns at Inspection.cs:1030.
+        var data = await CallAndGetDataAsync("roslyn:get_instantiation_options", new
+        {
+            typeName = "ExternalFactoryTarget"
+        });
+        var externalFactories = (data["externalFactories"] as JArray)!;
+        var names = externalFactories.Select(f => f["name"]!.Value<string>()).ToList();
+        names.Should().Contain("CreateTarget", $"got: [{string.Join(",", names)}]");
+        names.Should().Contain("BuildTarget");
+        names.Should().Contain("NewTarget");
+        // Each entry must carry the host type.
+        foreach (var f in externalFactories)
+        {
+            f["containingType"]!.Value<string>()!.Should().Contain("ExternalFactoryHost");
+        }
+    }
+
+    [Fact]
     public async Task GetInstantiationOptions_OnRoslynService_ListsParameterlessConstructor()
     {
         var data = await CallAndGetDataAsync("roslyn:get_instantiation_options", new
