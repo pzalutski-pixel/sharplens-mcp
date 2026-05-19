@@ -499,6 +499,24 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task FindCircularDependencies_Namespace_NoCyclesInOurSolution()
+    {
+        var data = await CallAndGetDataAsync("roslyn:find_circular_dependencies", new
+        {
+            level = "namespace"
+        });
+        data["level"]!.Value<string>().Should().Be("namespace");
+        data["hasCycles"]!.Value<bool>().Should().BeFalse(
+            "the SharpLens solution has no namespace cycles");
+        (data["cycles"] as JArray)!.Count.Should().Be(0);
+        data["namespaceCount"]!.Value<int>().Should().BeGreaterThan(0,
+            "the solution has multiple namespaces (SharpLensMcp, SharpLensMcp.Tests, etc.)");
+        // graph must always be emitted for shape consistency with the project-level form
+        (data["graph"] as JObject).Should().NotBeNull(
+            "namespace-level response must include graph (Discovery.cs:316-317)");
+    }
+
+    [Fact]
     public async Task FindCircularDependencies_BadLevel_ReturnsInvalidParameter()
     {
         // Discovery.cs:233-240 explicitly rejects levels other than 'project' or

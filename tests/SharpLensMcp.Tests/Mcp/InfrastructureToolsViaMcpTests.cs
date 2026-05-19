@@ -257,6 +257,19 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
             "verified against src/SharpLensMcp.csproj");
         packageNames.Should().Contain("Microsoft.Build.Locator");
         packageNames.Should().Contain("Microsoft.SourceLink.GitHub");
+
+        // Lock privateAssets/excludeAssets parsing (Discovery.cs:358-359).
+        // SharpLensMcp.csproj sets PrivateAssets="all" on SourceLink.GitHub and
+        // PrivateAssets="all" + ExcludeAssets="runtime" on Microsoft.Build.Framework.
+        var sourceLink = packages.First(p =>
+            p["packageName"]!.Value<string>() == "Microsoft.SourceLink.GitHub");
+        sourceLink["privateAssets"]!.Value<string>()!.Should().BeOneOf("all", "All",
+            "PrivateAssets is parsed verbatim from the csproj");
+
+        var buildFramework = packages.First(p =>
+            p["packageName"]!.Value<string>() == "Microsoft.Build.Framework");
+        buildFramework["excludeAssets"]!.Value<string>().Should().Be("runtime");
+        buildFramework["privateAssets"]!.Value<string>()!.Should().BeOneOf("all", "All");
     }
 
     [Fact]
