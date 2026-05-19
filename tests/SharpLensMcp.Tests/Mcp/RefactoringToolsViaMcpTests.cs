@@ -293,6 +293,45 @@ public class RefactoringToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task GetCodeActionsAtPosition_BothSourcesOff_ReturnsEmptyActionsWithMessage()
+    {
+        // CodeActions.cs:66-83: when both includeCodeFixes and includeRefactorings
+        // are false, no actions can be surfaced. The empty-actions branch returns
+        // a distinct response shape with actions=[] + message field.
+        var data = await CallAndGetDataAsync("roslyn:get_code_actions_at_position", new
+        {
+            filePath = Fixture.RoslynServicePath,
+            line = 10,
+            column = 10,
+            includeCodeFixes = false,
+            includeRefactorings = false
+        });
+        (data["actions"] as JArray)!.Count.Should().Be(0);
+        data["message"]!.Value<string>()!.Should().Contain("No code actions available");
+    }
+
+    [Fact]
+    public async Task GetCodeActionsAtPosition_IncludeRefactoringsFalse_DropsSortUsingsAtUsingsBlock()
+    {
+        // At line 10 of RoslynService.cs (using block), the only surfaced action
+        // is the Sort Usings refactoring. With includeRefactorings=false, it must
+        // be dropped — actions empty. (No compiler errors in this code so the
+        // code-fix source contributes nothing either, but the gate-flag itself
+        // is what the impl filters on.)
+        var data = await CallAndGetDataAsync("roslyn:get_code_actions_at_position", new
+        {
+            filePath = Fixture.RoslynServicePath,
+            line = 10,
+            column = 10,
+            includeCodeFixes = true,
+            includeRefactorings = false
+        });
+        var actions = (data["actions"] as JArray)!;
+        actions.Any(a => a["title"]?.Value<string>() == "Sort Usings")
+            .Should().BeFalse("refactorings are excluded by includeRefactorings=false");
+    }
+
+    [Fact]
     public async Task ApplyCodeActionByTitle_NonExistentTitle_ReturnsSymbolNotFoundWithAvailableTitles()
     {
         var error = await CallAndGetErrorAsync(
