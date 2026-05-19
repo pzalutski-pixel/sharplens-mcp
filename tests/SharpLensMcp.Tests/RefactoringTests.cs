@@ -327,6 +327,35 @@ public class RefactoringTests : RoslynServiceTestBase
     // ChangeSignature tests live in ChangeSignatureTests.cs.
 
     [Fact]
+    public async Task ExtractInterface_OnEventBearingTarget_EmitsEventDeclaration()
+    {
+        // RoslynService.cs:664-668: IEventSymbol branch emits `event T Name;`.
+        // EventBearingTarget has a public event `Triggered` of type EventHandler.
+        var searchResult = await Service.SearchSymbolsAsync("EventBearingTarget", kind: "Class", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        var target = symbols![0];
+        var loc = target["location"]!;
+        var result = await Service.ExtractInterfaceAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            interfaceName: "IEventBearing",
+            includeMemberNames: null);
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        var code = data["interfaceCode"]!.Value<string>()!;
+        // The IEventSymbol branch at RoslynService.cs:666-668 emits `event T Name;`
+        // where T is the event type's ToDisplayString() (may be fully qualified).
+        code.Should().Contain("event ",
+            "the IEventSymbol branch must emit the `event` keyword");
+        code.Should().Contain("Triggered;",
+            "the event name with terminating semicolon must appear");
+        code.Should().NotContain("OnTriggered",
+            "the protected method OnTriggered must NOT leak into the interface");
+    }
+
+    [Fact]
     public async Task GenerateConstructor_IncludeProperties_PicksUpSettableProperties()
     {
         // Refactoring.cs:466-477: with includeProperties=true, regular get/set
