@@ -77,6 +77,82 @@ public class CodeGenToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task AddNullChecks_OnExpressionBodiedMethodWithRefParam_ReturnsAnalysisFailed()
+    {
+        // GetResponseData in RoslynService.cs is expression-bodied with a reference
+        // parameter (object? response). The nullable-params filter (CodeGeneration.cs:
+        // 402-414) includes it, so the count==0 early-return is skipped, and the
+        // body-null check (CodeGeneration.cs:434-444) fires with "Method has no body".
+        var lines = File.ReadAllLines(Fixture.RoslynServicePath);
+        var methodLine = Array.FindIndex(lines, l =>
+            l.Contains("GetResponseData(object? response)"));
+        methodLine.Should().BeGreaterThan(-1);
+
+        var error = await CallAndGetErrorAsync("roslyn:add_null_checks", new
+        {
+            filePath = Fixture.RoslynServicePath,
+            line = methodLine,
+            column = 30,
+            preview = true
+        }, codeContains: ErrorCodes.AnalysisFailed);
+        error["message"]!.Value<string>()!.Should().Contain("no body");
+    }
+
+    [Fact]
+    public async Task GenerateEqualityMembers_OnTypeWithNoFieldsOrProperties_ReturnsNoMembersMessage()
+    {
+        // CodeGeneration.cs:575-583 returns a distinct shape ({message, typeName})
+        // when the type has no instance fields or properties to compare. We need a
+        // type that contains methods only. The MatchesGlobPattern host class
+        // RoslynService — wait, RoslynService has fields. Looking for a clean
+        // empty case: a static class in the test assembly with no fields.
+        var (file, line, col) = await LocateSymbolAsync(
+            "TestHelpers", kind: "Class");
+
+        var data = await CallAndGetDataAsync("roslyn:generate_equality_members", new
+        {
+            filePath = file, line, column = col,
+            preview = true
+        });
+        data["typeName"]!.Value<string>().Should().Contain("TestHelpers");
+        data["message"]!.Value<string>()!.Should().Contain("No instance fields or properties",
+            "the empty-members branch returns a distinct message-bearing response");
+        // The with-members response fields must be absent on this branch.
+        data["preview"].Should().BeNull();
+        data["generatedCode"].Should().BeNull();
+        data["membersCompared"].Should().BeNull();
+    }
+
+    [Fact]
+    public async Task GetComplexityMetrics_OnLoadSolutionAsyncMethod_ReturnsMethodScopeResponse()
+    {
+        // CodeGeneration.cs:59-126: when line/column point to a method, scope="method"
+        // and the response carries name, containingType, metrics. Differs from the
+        // file-scope response shape (which has methods[] + fileTotals).
+        var (file, line, col) = await LocateSymbolAsync(
+            "LoadSolutionAsync", kind: "Method",
+            r => r["containingType"]?.Value<string>()?.EndsWith("RoslynService") == true);
+
+        var data = await CallAndGetDataAsync("roslyn:get_complexity_metrics", new
+        {
+            filePath = file,
+            line,
+            column = col
+        });
+        data["scope"]!.Value<string>().Should().Be("method");
+        data["name"]!.Value<string>().Should().Be("LoadSolutionAsync");
+        data["containingType"]!.Value<string>().Should().Be("RoslynService");
+        // metrics dict carries all 5 default-requested metrics (CodeGeneration.cs:54-56).
+        var metrics = data["metrics"]!;
+        metrics["cyclomatic"]!.Value<int>().Should().BeGreaterOrEqualTo(1);
+        metrics["nesting"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
+        metrics["loc"]!.Value<int>().Should().BeGreaterThan(0);
+        metrics["parameters"]!.Value<int>().Should().Be(1,
+            "LoadSolutionAsync takes one parameter (solutionPath)");
+        metrics["cognitive"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
+    }
+
+    [Fact]
     public async Task AddNullChecks_OnNonMethodPosition_ReturnsNotAMethod()
     {
         // Position cursor inside a class declaration but not on any method (line 0
