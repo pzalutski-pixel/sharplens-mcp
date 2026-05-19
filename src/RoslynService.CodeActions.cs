@@ -530,7 +530,7 @@ public partial class RoslynService
     // a CodeAction is a menu wrapper (CodeActionWithNestedActions) vs a leaf action that
     // can produce operations. Cached PropertyInfo per type to avoid repeated lookups.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, System.Reflection.PropertyInfo?> _nestedActionsPropCache = new();
-    private static System.Collections.Immutable.ImmutableArray<CodeAction> GetNestedActionsOrEmpty(CodeAction action)
+    internal static System.Collections.Immutable.ImmutableArray<CodeAction> GetNestedActionsOrEmpty(CodeAction action)
     {
         var prop = _nestedActionsPropCache.GetOrAdd(
             action.GetType(),
