@@ -180,6 +180,93 @@ public class CompoundToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task AnalyzeMethod_MethodNotFoundOnType_ReturnsSymbolNotFound()
+    {
+        // Compound.cs:367-372: type resolves but method name doesn't exist on it.
+        // Distinct branch from TypeNotFound (covered separately).
+        var error = await CallAndGetErrorAsync("roslyn:analyze_method", new
+        {
+            typeName = "RoslynService",
+            methodName = "DoesNotExist_12345"
+        }, codeContains: ErrorCodes.SymbolNotFound);
+        error["message"]!.Value<string>()!.Should().Contain("DoesNotExist_12345");
+    }
+
+    [Fact]
+    public async Task AnalyzeMethod_EmptyTypeName_ReturnsInvalidParameter()
+    {
+        // Compound.cs:349-354: whitespace-or-empty typeName/methodName.
+        var error = await CallAndGetErrorAsync("roslyn:analyze_method", new
+        {
+            typeName = "",
+            methodName = "LoadSolutionAsync"
+        }, codeContains: ErrorCodes.InvalidParameter);
+        error["message"]!.Value<string>()!.Should().Contain("typeName");
+    }
+
+    [Fact]
+    public async Task AnalyzeDataFlow_OnEmptyRegion_ReturnsAnalysisFailed()
+    {
+        // Compound.cs:62-70: line range that doesn't enclose any statements
+        // (e.g., a using-directive line) → AnalysisFailed with the "No
+        // statements found" message.
+        var error = await CallAndGetErrorAsync("roslyn:analyze_data_flow", new
+        {
+            filePath = Fixture.RoslynServicePath,
+            startLine = 0, // line 0 is a `using` directive
+            endLine = 0
+        }, codeContains: ErrorCodes.AnalysisFailed);
+        error["message"]!.Value<string>()!.Should().Contain("No statements found");
+    }
+
+    [Fact]
+    public async Task AnalyzeControlFlow_OnEmptyRegion_ReturnsAnalysisFailed()
+    {
+        // Compound.cs:172-179: same no-statements branch for control flow.
+        var error = await CallAndGetErrorAsync("roslyn:analyze_control_flow", new
+        {
+            filePath = Fixture.RoslynServicePath,
+            startLine = 0,
+            endLine = 0
+        }, codeContains: ErrorCodes.AnalysisFailed);
+        error["message"]!.Value<string>()!.Should().Contain("No statements found");
+    }
+
+    [Fact]
+    public async Task GetFileOverview_NonExistentFile_ReturnsFileNotInSolution()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:get_file_overview", new
+        {
+            filePath = "/does/not/exist/Nope.cs"
+        }, codeContains: ErrorCodes.FileNotInSolution);
+        error["message"]!.Value<string>()!.Should().Contain("Nope.cs");
+    }
+
+    [Fact]
+    public async Task AnalyzeDataFlow_NonExistentFile_ReturnsFileNotInSolution()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:analyze_data_flow", new
+        {
+            filePath = "/does/not/exist/Nope.cs",
+            startLine = 0,
+            endLine = 1
+        }, codeContains: ErrorCodes.FileNotInSolution);
+        error["message"]!.Value<string>()!.Should().Contain("Nope.cs");
+    }
+
+    [Fact]
+    public async Task AnalyzeControlFlow_NonExistentFile_ReturnsFileNotInSolution()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:analyze_control_flow", new
+        {
+            filePath = "/does/not/exist/Nope.cs",
+            startLine = 0,
+            endLine = 1
+        }, codeContains: ErrorCodes.FileNotInSolution);
+        error["message"]!.Value<string>()!.Should().Contain("Nope.cs");
+    }
+
+    [Fact]
     public async Task GetFileOverview_OnRoslynService_ReportsTypeDeclarationsIncludingRoslynService()
     {
         var data = await CallAndGetDataAsync("roslyn:get_file_overview", new

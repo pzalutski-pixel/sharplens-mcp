@@ -18,13 +18,18 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
-        var document = await GetDocumentAsync(filePath);
-        if (document == null)
+        Document document;
+        try
+        {
+            document = await GetDocumentAsync(filePath);
+        }
+        catch (FileNotFoundException)
         {
             return CreateErrorResponse(
                 ErrorCodes.FileNotInSolution,
-                $"File '{filePath}' not found in solution",
-                hint: "Check the file path or reload the solution"
+                $"File not found in solution: {filePath}",
+                hint: "Check the file path or reload the solution",
+                context: new { filePath }
             );
         }
 
@@ -130,13 +135,18 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
-        var document = await GetDocumentAsync(filePath);
-        if (document == null)
+        Document document;
+        try
+        {
+            document = await GetDocumentAsync(filePath);
+        }
+        catch (FileNotFoundException)
         {
             return CreateErrorResponse(
                 ErrorCodes.FileNotInSolution,
-                $"File '{filePath}' not found in solution",
-                hint: "Check the file path or reload the solution"
+                $"File not found in solution: {filePath}",
+                hint: "Check the file path or reload the solution",
+                context: new { filePath }
             );
         }
 
@@ -524,12 +534,18 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
-        var document = await GetDocumentAsync(filePath);
-        if (document == null)
+        Document document;
+        try
+        {
+            document = await GetDocumentAsync(filePath);
+        }
+        catch (FileNotFoundException)
         {
             return CreateErrorResponse(
                 ErrorCodes.FileNotInSolution,
-                $"File '{filePath}' not found in solution"
+                $"File not found in solution: {filePath}",
+                hint: "Check the file path or reload the solution",
+                context: new { filePath }
             );
         }
 
