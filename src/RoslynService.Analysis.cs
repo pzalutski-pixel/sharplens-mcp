@@ -336,7 +336,7 @@ public partial class RoslynService
         );
     }
 
-    private List<string> GetCommonFixSuggestions(string diagnosticId, string message)
+    internal List<string> GetCommonFixSuggestions(string diagnosticId, string message)
     {
         // Common fix suggestions for well-known diagnostic IDs
         return diagnosticId switch
