@@ -327,6 +327,77 @@ public class RefactoringTests : RoslynServiceTestBase
     // ChangeSignature tests live in ChangeSignatureTests.cs.
 
     [Fact]
+    public async Task GenerateConstructor_IncludeProperties_PicksUpSettableProperties()
+    {
+        // Refactoring.cs:466-477: with includeProperties=true, regular get/set
+        // properties (non-init-only, public setter) are added to the parameter
+        // list alongside fields. GenCtorWithProperties has two such properties.
+        var searchResult = await Service.SearchSymbolsAsync("GenCtorWithProperties", kind: "Class", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        var target = symbols![0];
+        var loc = target["location"]!;
+        var result = await Service.GenerateConstructorAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            includeProperties: true);
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["parameterCount"]!.Value<int>().Should().Be(2,
+            "Name + Age = 2 settable properties");
+        var props = (data["properties"] as JArray)!;
+        props.Select(p => p.Value<string>()).Should().BeEquivalentTo(new[] { "Name", "Age" });
+        var code = data["constructorCode"]!.Value<string>()!;
+        code.Should().Contain("public GenCtorWithProperties");
+        code.Should().Contain("Name = name");
+        code.Should().Contain("Age = age");
+    }
+
+    [Fact]
+    public async Task GenerateConstructor_InitializeToDefault_OnNullableField_EmitsNullCoalesce()
+    {
+        // Refactoring.cs:508-510: when initializeToDefault=true and a field is
+        // nullable-annotated, the assignment becomes `Field = param ?? default;`.
+        var searchResult = await Service.SearchSymbolsAsync("GenCtorWithNullableField", kind: "Class", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        var target = symbols![0];
+        var loc = target["location"]!;
+        var result = await Service.GenerateConstructorAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>(),
+            initializeToDefault: true);
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        var code = data["constructorCode"]!.Value<string>()!;
+        code.Should().Contain("OptionalName = optionalName ?? default",
+            "nullable field with initializeToDefault gets a null-coalesce to default");
+    }
+
+    [Fact]
+    public async Task GenerateConstructor_OnTypeWithNoFieldsOrProperties_ReturnsAnalysisFailed()
+    {
+        // Refactoring.cs:482-492: empty class → "No fields or properties found
+        // to initialize" AnalysisFailed branch.
+        var searchResult = await Service.SearchSymbolsAsync("GenCtorEmpty", kind: "Class", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        var target = symbols![0];
+        var loc = target["location"]!;
+        var result = await Service.GenerateConstructorAsync(
+            loc["filePath"]!.Value<string>()!,
+            loc["line"]!.Value<int>(),
+            loc["column"]!.Value<int>());
+
+        AssertError(result, ErrorCodes.AnalysisFailed);
+        var json = JObject.FromObject(result);
+        json["error"]!["Message"]!.Value<string>()!.Should().Contain("No fields or properties");
+        json["error"]!["Hint"]!.Value<string>()!.Should().Contain("includeProperties",
+            "the no-fields hint points the caller at includeProperties: true");
+    }
+
+    [Fact]
     public async Task ExtractMethod_OnFixtureSumBody_GeneratesExtractedMethod()
     {
         var searchResult = await Service.SearchSymbolsAsync("Sum", kind: "Method", maxResults: 50);
