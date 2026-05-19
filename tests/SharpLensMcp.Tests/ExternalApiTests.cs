@@ -177,4 +177,19 @@ public class ExternalApiTests : RoslynServiceTestBase
         members!.Any(m => m["name"]?.Value<string>() == "GetEnumerator")
             .Should().BeTrue("IEnumerable<T> exposes GetEnumerator");
     }
+
+    [Fact]
+    public async Task GetExternalTypeInfo_OnBclNestedType_ResolvesViaDottedNameFallback()
+    {
+        // Nested types in metadata use '+' (Outer+Inner). When the caller passes
+        // the natural C# dotted form (Outer.Inner), GetTypeByMetadataName returns
+        // null and FindTypeByDottedName walks namespaces + nested types to resolve
+        // it (ExternalApi.cs:144-179). System.Environment.SpecialFolder is a
+        // public BCL nested enum that exercises this fallback.
+        var result = await Service.GetExternalTypeInfoAsync("System.Environment.SpecialFolder");
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["typeName"]!.Value<string>()!.Should().Contain("SpecialFolder");
+        data["typeKind"]!.Value<string>().Should().Be("Enum");
+    }
 }
