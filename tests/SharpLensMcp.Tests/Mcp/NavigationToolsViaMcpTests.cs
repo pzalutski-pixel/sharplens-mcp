@@ -716,6 +716,177 @@ public class NavigationToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task GetTypeMembers_EmptyTypeName_ReturnsInvalidParameter()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:get_type_members", new
+        {
+            typeName = ""
+        }, codeContains: ErrorCodes.InvalidParameter);
+        error["message"]!.Value<string>()!.Should().Contain("typeName");
+    }
+
+    [Fact]
+    public async Task GetTypeMembers_UnknownType_ReturnsTypeNotFound()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:get_type_members", new
+        {
+            typeName = "DoesNotExist_12345"
+        }, codeContains: ErrorCodes.TypeNotFound);
+        error["message"]!.Value<string>()!.Should().Contain("DoesNotExist_12345");
+    }
+
+    [Fact]
+    public async Task GetTypeMembers_IncludeInheritedTrue_OnFixtureSquare_IncludesRectangleMembers()
+    {
+        // FixtureSquare adds Side; FixtureRectangle (base) adds Width/Height/Area.
+        var data = await CallAndGetDataAsync("roslyn:get_type_members", new
+        {
+            typeName = "FixtureSquare",
+            includeInherited = true
+        });
+        var names = (data["members"] as JArray)!
+            .Select(m => m["name"]!.Value<string>()!)
+            .ToList();
+        names.Should().Contain("Side");
+        names.Should().Contain("Width", "inherited from FixtureRectangle");
+        names.Should().Contain("Height");
+    }
+
+    [Fact]
+    public async Task GetTypeMembers_MemberKindMethod_FiltersToMethodsOnly()
+    {
+        var data = await CallAndGetDataAsync("roslyn:get_type_members", new
+        {
+            typeName = "RoslynService",
+            memberKind = "Method"
+        });
+        var members = (data["members"] as JArray)!;
+        members.Should().NotBeEmpty();
+        foreach (var m in members)
+        {
+            m["kind"]!.Value<string>().Should().Be("Method");
+        }
+    }
+
+    [Fact]
+    public async Task GetMethodSignature_UnknownType_ReturnsTypeNotFound()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:get_method_signature", new
+        {
+            typeName = "DoesNotExist_12345",
+            methodName = "DoesNotMatter"
+        }, codeContains: ErrorCodes.TypeNotFound);
+        error["message"]!.Value<string>()!.Should().Contain("DoesNotExist_12345");
+    }
+
+    [Fact]
+    public async Task GetMethodSignature_UnknownMethod_ReturnsSymbolNotFound()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:get_method_signature", new
+        {
+            typeName = "RoslynService",
+            methodName = "DoesNotExist_12345"
+        }, codeContains: ErrorCodes.SymbolNotFound);
+        error["message"]!.Value<string>()!.Should().Contain("DoesNotExist_12345");
+    }
+
+    [Fact]
+    public async Task GetMethodSignature_OverloadIndex_SelectsSpecificOverload()
+    {
+        // CreateErrorResponse on RoslynService has one overload; CreateSuccessResponse
+        // has one too. Locking overloadCount lets a regression that mis-counts overloads
+        // fail. Using overloadIndex=0 should be identical to default.
+        var data = await CallAndGetDataAsync("roslyn:get_method_signature", new
+        {
+            typeName = "RoslynService",
+            methodName = "CreateErrorResponse",
+            overloadIndex = 0
+        });
+        data["overloadCount"]!.Value<int>().Should().BeGreaterOrEqualTo(1);
+        data["selectedOverload"]!.Value<int>().Should().Be(0);
+        data["name"]!.Value<string>().Should().Be("CreateErrorResponse");
+    }
+
+    [Fact]
+    public async Task GetAttributes_EmptyName_ReturnsInvalidParameter()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:get_attributes", new
+        {
+            attributeName = ""
+        }, codeContains: ErrorCodes.InvalidParameter);
+        error["message"]!.Value<string>()!.Should().Contain("attributeName");
+    }
+
+    [Fact]
+    public async Task GetAttributes_ScopeProjectFilter_LimitsToOneProject()
+    {
+        // scope="project:SharpLensMcp" must drop [Fact] hits from SharpLensMcp.Tests.
+        // The main project has zero [Fact] decorations, so totalFound must be 0.
+        var data = await CallAndGetDataAsync("roslyn:get_attributes", new
+        {
+            attributeName = "Fact",
+            scope = "project:SharpLensMcp"
+        });
+        data["totalFound"]!.Value<int>().Should().Be(0,
+            "the main SharpLensMcp project has no [Fact] decorations");
+    }
+
+    [Fact]
+    public async Task GetDerivedTypes_EmptyBaseTypeName_ReturnsInvalidParameter()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:get_derived_types", new
+        {
+            baseTypeName = ""
+        }, codeContains: ErrorCodes.InvalidParameter);
+    }
+
+    [Fact]
+    public async Task GetDerivedTypes_UnknownBase_ReturnsTypeNotFound()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:get_derived_types", new
+        {
+            baseTypeName = "DoesNotExist_12345"
+        }, codeContains: ErrorCodes.TypeNotFound);
+    }
+
+    [Fact]
+    public async Task GetDerivedTypes_IncludeTransitiveFalse_OnRectangle_OnlyDirectDerivations()
+    {
+        // FixtureRectangle has FixtureSquare as direct subclass. With
+        // includeTransitive=false (Navigation.cs:538), the result still includes
+        // direct subclasses. SymbolFinder.FindDerivedClassesAsync(transitive: false)
+        // returns only immediate subclasses, which for FixtureRectangle is just
+        // FixtureSquare anyway.
+        var data = await CallAndGetDataAsync("roslyn:get_derived_types", new
+        {
+            baseTypeName = "FixtureRectangle",
+            includeTransitive = false
+        });
+        data["includeTransitive"]!.Value<bool>().Should().BeFalse();
+        var derived = (data["derivedTypes"] as JArray)!;
+        derived.Count.Should().Be(1);
+        derived[0]["name"]!.Value<string>().Should().Be("FixtureSquare");
+    }
+
+    [Fact]
+    public async Task GetBaseTypes_EmptyTypeName_ReturnsInvalidParameter()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:get_base_types", new
+        {
+            typeName = ""
+        }, codeContains: ErrorCodes.InvalidParameter);
+    }
+
+    [Fact]
+    public async Task GetBaseTypes_UnknownType_ReturnsTypeNotFound()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:get_base_types", new
+        {
+            typeName = "DoesNotExist_12345"
+        }, codeContains: ErrorCodes.TypeNotFound);
+    }
+
+    [Fact]
     public async Task GetExternalTypeInfo_UnknownType_ReturnsExactTypeNotFoundWithFqnHint()
     {
         var error = await CallAndGetErrorAsync(
