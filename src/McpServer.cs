@@ -1561,7 +1561,7 @@ Use get_source_generators first to discover available generated files.",
                     p.Required<string>("solutionPath")),
 
                 "roslyn:sync_documents" => await _roslynService.SyncDocumentsAsync(
-                    ParseStringArray(arguments?["filePaths"])),
+                    p.OptionalStringArray("filePaths")),
 
                 "roslyn:get_symbol_info" => await _roslynService.GetSymbolInfoAsync(
                     p.Required<string>("filePath"),
@@ -2052,17 +2052,6 @@ Use get_source_generators first to discover available generated files.",
             }
         }
         return methods;
-    }
-
-    private List<string>? ParseStringArray(JsonNode? arrayNode)
-    {
-        if (arrayNode is not JsonArray array)
-            return null;
-
-        return array
-            .Where(item => item != null)
-            .Select(item => item!.GetValue<string>())
-            .ToList();
     }
 
     private async Task LogAsync(string level, string message)

@@ -237,6 +237,43 @@ public class McpServerTests
     }
 
     [Fact]
+    public async Task HandleRequest_ToolsCall_SyncDocumentsWithNonArrayFilePaths_Returns32602()
+    {
+        // sync_documents takes filePaths as a JSON array of strings. A scalar
+        // value passed instead must surface as -32602 with the canonical "must
+        // be an array of strings" wording. The prior ParseStringArray helper
+        // silently treated non-array as null → sync_documents synced ALL files,
+        // hiding the caller's mistake. Now routed through p.OptionalStringArray
+        // which validates shape.
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"roslyn:sync_documents","arguments":{"filePaths":"not-an-array"}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        var error = response["error"]!.AsObject();
+        error["code"]!.GetValue<int>().Should().Be(-32602);
+        error["message"]!.GetValue<string>().Should().Contain("filePaths");
+        error["message"]!.GetValue<string>().Should().Contain("must be an array of strings");
+    }
+
+    [Fact]
+    public async Task HandleRequest_ToolsCall_SyncDocumentsWithNonStringElement_Returns32602()
+    {
+        // The element-level type check: filePaths must contain only strings.
+        // A number in the array (e.g., {"filePaths":[42]}) previously triggered
+        // an uncaught System.Text.Json.JsonException via ParseStringArray, which
+        // the outer catch wrapped as -32603 Internal error. After replacing the
+        // helper with p.OptionalStringArray, it surfaces as the structured
+        // -32602 with the canonical wording.
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"roslyn:sync_documents","arguments":{"filePaths":[42]}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        var error = response["error"]!.AsObject();
+        error["code"]!.GetValue<int>().Should().Be(-32602,
+            "non-string element must produce -32602, not -32603 Internal error");
+        error["message"]!.GetValue<string>().Should().Contain("filePaths");
+        error["message"]!.GetValue<string>().Should().Contain("must be an array of strings");
+    }
+
+    [Fact]
     public async Task HandleRequest_ToolsCall_MissingArgumentsObject_HealthCheckStillWorks()
     {
         // params.arguments is optional — for tools with no required params (like
