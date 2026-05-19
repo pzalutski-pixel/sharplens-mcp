@@ -39,8 +39,10 @@ public partial class RoslynService
         _useAbsolutePaths = Environment.GetEnvironmentVariable("SHARPLENS_ABSOLUTE_PATHS")?.ToLower() == "true";
     }
 
-    // Helper method for glob pattern matching (supports * and ? wildcards)
-    private static bool MatchesGlobPattern(string input, string pattern)
+    // Helper method for glob pattern matching (supports * and ? wildcards).
+    // Internal so unit tests can verify regex-special-character escaping
+    // independently of the callers (search_symbols, namespace filters, etc.).
+    internal static bool MatchesGlobPattern(string input, string pattern)
     {
         if (string.IsNullOrEmpty(pattern))
             return true;
@@ -548,7 +550,7 @@ public partial class RoslynService
 
     // Helper methods
 
-    private List<List<string>> DetectCycles(Dictionary<string, List<string>> graph)
+    internal List<List<string>> DetectCycles(Dictionary<string, List<string>> graph)
     {
         var cycles = new List<List<string>>();
         var visited = new HashSet<string>();
