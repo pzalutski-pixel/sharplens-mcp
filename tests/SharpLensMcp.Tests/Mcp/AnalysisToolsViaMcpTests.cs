@@ -254,6 +254,136 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task CheckTypeCompatibility_IntToInt_IsIdentity()
+    {
+        var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
+        {
+            sourceType = "System.Int32",
+            targetType = "System.Int32"
+        });
+        data["compatible"]!.Value<bool>().Should().BeTrue();
+        data["requiresCast"]!.Value<bool>().Should().BeFalse();
+        data["conversionKind"]!.Value<string>().Should().Be("Identity");
+    }
+
+    [Fact]
+    public async Task CheckTypeCompatibility_IntToLong_IsImplicitNumeric()
+    {
+        var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
+        {
+            sourceType = "System.Int32",
+            targetType = "System.Int64"
+        });
+        data["compatible"]!.Value<bool>().Should().BeTrue();
+        data["requiresCast"]!.Value<bool>().Should().BeFalse();
+        data["conversionKind"]!.Value<string>().Should().Be("ImplicitNumeric");
+        data["isNumericConversion"]!.Value<bool>().Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task CheckTypeCompatibility_IntToObject_IsBoxing()
+    {
+        var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
+        {
+            sourceType = "System.Int32",
+            targetType = "System.Object"
+        });
+        data["compatible"]!.Value<bool>().Should().BeTrue();
+        data["conversionKind"]!.Value<string>().Should().Be("Boxing");
+        data["isBoxing"]!.Value<bool>().Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task CheckTypeCompatibility_ObjectToInt_IsUnboxing()
+    {
+        var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
+        {
+            sourceType = "System.Object",
+            targetType = "System.Int32"
+        });
+        data["compatible"]!.Value<bool>().Should().BeTrue();
+        data["requiresCast"]!.Value<bool>().Should().BeTrue();
+        data["conversionKind"]!.Value<string>().Should().Be("Unboxing");
+        data["isUnboxing"]!.Value<bool>().Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task CheckTypeCompatibility_LongToInt_IsExplicitNumeric()
+    {
+        var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
+        {
+            sourceType = "System.Int64",
+            targetType = "System.Int32"
+        });
+        data["compatible"]!.Value<bool>().Should().BeTrue();
+        data["requiresCast"]!.Value<bool>().Should().BeTrue();
+        data["conversionKind"]!.Value<string>().Should().Be("ExplicitNumeric");
+        data["isNumericConversion"]!.Value<bool>().Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task CheckTypeCompatibility_UnknownSourceType_ReturnsTypeNotFound()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:check_type_compatibility", new
+        {
+            sourceType = "System.Does.Not.Exist",
+            targetType = "System.Object"
+        }, codeContains: ErrorCodes.TypeNotFound);
+        error["message"]!.Value<string>()!.Should().Contain("Source type");
+        error["message"]!.Value<string>()!.Should().Contain("System.Does.Not.Exist");
+    }
+
+    [Fact]
+    public async Task CheckTypeCompatibility_UnknownTargetType_ReturnsTypeNotFound()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:check_type_compatibility", new
+        {
+            sourceType = "System.Object",
+            targetType = "System.Does.Not.Exist"
+        }, codeContains: ErrorCodes.TypeNotFound);
+        error["message"]!.Value<string>()!.Should().Contain("Target type");
+        error["message"]!.Value<string>()!.Should().Contain("System.Does.Not.Exist");
+    }
+
+    [Fact]
+    public async Task ValidateCode_WithNonExistentContextFile_ReturnsFileNotInSolution()
+    {
+        var error = await CallAndGetErrorAsync("roslyn:validate_code", new
+        {
+            code = "var x = 1;",
+            contextFilePath = "/path/does/not/exist/Nope.cs",
+            standalone = false
+        }, codeContains: ErrorCodes.FileNotInSolution);
+        error["message"]!.Value<string>()!.Should().Contain("Nope.cs");
+    }
+
+    [Fact]
+    public async Task ValidateCode_WithValidContextFile_WrapsInContextNamespaceAndCompiles()
+    {
+        var data = await CallAndGetDataAsync("roslyn:validate_code", new
+        {
+            code = "var x = 1;",
+            contextFilePath = Fixture.RoslynServicePath,
+            standalone = false
+        });
+        data["compiles"]!.Value<bool>().Should().BeTrue();
+        data["errorCount"]!.Value<int>().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task ValidateCode_WithNoContextAndStandaloneFalse_WrapsInMinimalClassWithSystemUsings()
+    {
+        var data = await CallAndGetDataAsync("roslyn:validate_code", new
+        {
+            code = "Console.WriteLine(\"hi\");",
+            standalone = false
+        });
+        data["compiles"]!.Value<bool>().Should().BeTrue(
+            "the no-context wrap injects 'using System' so Console is resolvable");
+        data["errorCount"]!.Value<int>().Should().Be(0);
+    }
+
+    [Fact]
     public async Task GetOutgoingCalls_OnGetHealthCheck_IncludesGetProjectCompilationAsync()
     {
         var (file, line, col) = await LocateSymbolAsync(
