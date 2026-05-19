@@ -606,6 +606,74 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task GetDiagnostics_FilePathScope_RestrictsToThatFile()
+    {
+        // Analysis.cs:90-99: when filePath is set, only that file's diagnostics
+        // are returned. Pass RoslynService.cs and assert every diagnostic (if any)
+        // has a filePath ending in RoslynService.cs.
+        var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        {
+            filePath = Fixture.RoslynServicePath,
+            projectPath = (string?)null,
+            severity = (string?)null,
+            includeHidden = false,
+            runAnalyzers = false
+        });
+        var diagnostics = (data["diagnostics"] as JArray)!;
+        foreach (var d in diagnostics)
+        {
+            d["filePath"]!.Value<string>()!.Should().EndWith("RoslynService.cs",
+                "filePath scope must drop diagnostics from other files");
+        }
+    }
+
+    [Fact]
+    public async Task GetProjectStructure_SummaryOnlyFalse_ReturnsFullDetails()
+    {
+        // Analysis.cs:876+ (full mode) returns per-project: name, filePath,
+        // language, outputPath, targetFramework, documentCount, referenceCount,
+        // references[], projectReferences[], documents[]. summaryOnly=true skips
+        // most of this.
+        var data = await CallAndGetDataAsync("roslyn:get_project_structure", new
+        {
+            includeReferences = false,
+            includeDocuments = false,
+            summaryOnly = false
+        });
+        var projects = (data["projects"] as JArray)!;
+        projects.Should().NotBeEmpty();
+        foreach (var p in projects)
+        {
+            // Full-mode fields that are absent from summary mode.
+            p["filePath"]!.Value<string>()!.Should().EndWith(".csproj");
+            p["language"]!.Value<string>().Should().Be("C#");
+            p["referenceCount"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
+            p["projectReferences"].Should().NotBeNull();
+        }
+    }
+
+    [Fact]
+    public async Task GetProjectStructure_ProjectNamePatternFilter_LimitsResults()
+    {
+        // Analysis.cs:830-838: regex-style glob filter on project name.
+        var data = await CallAndGetDataAsync("roslyn:get_project_structure", new
+        {
+            projectNamePattern = "SharpLensMcp.Tests*",
+            summaryOnly = true
+        });
+        var projects = (data["projects"] as JArray)!;
+        projects.Should().NotBeEmpty();
+        foreach (var p in projects)
+        {
+            p["name"]!.Value<string>()!.Should().StartWith("SharpLensMcp.Tests",
+                "the projectNamePattern filter must drop projects not matching the prefix");
+        }
+        // The main SharpLensMcp project (without .Tests) must NOT appear.
+        projects.Select(p => p["name"]!.Value<string>()!)
+            .Should().NotContain("SharpLensMcp");
+    }
+
+    [Fact]
     public async Task GetMissingMembers_OnRoslynService_NoneMissing()
     {
         // RoslynService is a complete partial class. Resolve the MatchesGlobPattern
