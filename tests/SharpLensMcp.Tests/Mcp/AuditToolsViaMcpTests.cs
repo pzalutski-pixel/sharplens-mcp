@@ -42,13 +42,19 @@ public class AuditToolsViaMcpTests : McpTestBase
         var god = candidates.FirstOrDefault(c =>
             c["typeName"]?.Value<string>()?.EndsWith("GodObjectFixtureClass") == true);
         god.Should().NotBeNull("the engineered god-object fixture must appear in candidates");
-        god!["efferentCoupling"]!.Value<int>().Should().BeGreaterOrEqualTo(25,
-            "the fixture has 25 fields, each of a distinct GodObjectTypeNN type");
-        god["memberCount"]!.Value<int>().Should().BeGreaterOrEqualTo(25,
-            "the fixture has 25 fields");
-        god["score"]!.Value<double>().Should().BeGreaterThan(0);
-        god["afferentCoupling"]!.Value<int>().Should().BeGreaterOrEqualTo(0,
-            "afferentCoupling must always be emitted (impl Quality.cs:304)");
+        var efferent = god!["efferentCoupling"]!.Value<int>();
+        var members = god["memberCount"]!.Value<int>();
+        var afferent = god["afferentCoupling"]!.Value<int>();
+        efferent.Should().Be(25,
+            "the fixture has 25 fields with 25 distinct GodObjectTypeNN types");
+        members.Should().Be(25,
+            "the fixture has exactly 25 fields and no other explicit members");
+        afferent.Should().Be(0,
+            "nothing in the test project references GodObjectFixtureClass by type");
+        // Lock the scoring formula (Quality.cs:439): eff*0.4 + members*0.4 + aff*0.2,
+        // rounded to 2 decimals (Quality.cs:450). For 25/25/0 the expected score is 20.0.
+        var expectedScore = Math.Round(efferent * 0.4 + members * 0.4 + afferent * 0.2, 2);
+        god["score"]!.Value<double>().Should().Be(expectedScore);
         god["location"].Should().NotBeNull(
             "each candidate must surface its declaration location");
     }
