@@ -8,10 +8,13 @@ namespace SharpLensMcp.Tests.Mcp;
 // contract through the JSON-RPC layer. Independent of any specific tool's
 // implementation — verifies the dispatcher itself.
 //
-// Error message format (from JsonRpcParameters.cs):
-//   - Missing required: $"Missing required parameter '{name}' for tool '{_toolName}'"
-//   - Wrong type:       $"Parameter '{name}' for tool '{_toolName}' has wrong type: ..."
-//   - Unknown tool:     "Unknown tool: {name}"
+// Error message format (from src/JsonRpcParameters.cs):
+//   - Missing required scalar: $"Missing required parameter '{name}' for tool '{_toolName}'"
+//   - Missing required array:  $"Missing required array parameter '{name}' for tool '{_toolName}'"
+//   - Wrong type:              $"Parameter '{name}' for tool '{_toolName}' has wrong type: ..."
+//   - Non-array given to array: $"Parameter '{name}' for tool '{_toolName}' must be an array of strings"
+//   - Unknown tool:            "Unknown tool: {name}"
+//   - Missing tool name:       "Invalid params: missing tool name"
 public class DispatcherContractTests : McpTestBase
 {
     public DispatcherContractTests(McpServerFixture fixture) : base(fixture) { }
@@ -29,7 +32,7 @@ public class DispatcherContractTests : McpTestBase
     }
 
     [Fact]
-    public async Task ToolsCall_MissingRequiredInt_Returns32602()
+    public async Task ToolsCall_MissingRequiredInt_Returns32602WithStandardWording()
     {
         var msg = await CallExpectingJsonRpcErrorAsync(
             "roslyn:get_symbol_info",
@@ -37,6 +40,8 @@ public class DispatcherContractTests : McpTestBase
             expectedCode: -32602);
         msg.Should().Contain("line", "the first missing required int must surface");
         msg.Should().Contain("roslyn:get_symbol_info");
+        msg.Should().Contain("Missing required parameter",
+            "the int-missing branch must use the same wording as the string-missing branch (JsonRpcParameters.cs:26)");
     }
 
     [Fact]
@@ -63,32 +68,74 @@ public class DispatcherContractTests : McpTestBase
     }
 
     [Fact]
-    public async Task ToolsCall_MissingToolName_Returns32602WithMissingToolNameWording()
+    public async Task ToolsCall_MissingToolName_Returns32602WithInvalidParamsWording()
     {
         var msg = await CallExpectingJsonRpcErrorAsync(
             toolName: "",
             arguments: new { },
             expectedCode: -32602);
+        msg.Should().Contain("Invalid params",
+            "the dispatcher must use the standard 'Invalid params' prefix (McpServer.cs:1551)");
         msg.Should().Contain("missing tool name");
     }
 
     [Fact]
-    public async Task ToolsCall_StringArrayArgument_RoundTripsBothEntries()
+    public async Task ToolsCall_MissingRequiredStringArray_Returns32602WithArrayWording()
+    {
+        // get_type_members_batch's typeNames is RequiredStringArray (McpServer.cs:1878,
+        // JsonRpcParameters.cs:103-108). Missing the field must surface the array-
+        // specific wording — distinct from the scalar 'Missing required parameter' one.
+        var msg = await CallExpectingJsonRpcErrorAsync(
+            "roslyn:get_type_members_batch",
+            arguments: new { },
+            expectedCode: -32602);
+        msg.Should().Contain("Missing required array parameter",
+            "RequiredStringArray uses a distinct error wording from scalar Required");
+        msg.Should().Contain("typeNames");
+        msg.Should().Contain("roslyn:get_type_members_batch");
+    }
+
+    [Fact]
+    public async Task ToolsCall_OptionalStringArrayWithNonArrayValue_Returns32602WithArrayWording()
+    {
+        // semantic_query's "kinds" is OptionalStringArray (McpServer.cs:1603). Passing
+        // a scalar where an array is expected must surface "must be an array of strings"
+        // (JsonRpcParameters.cs:99-100), not the generic 'has wrong type' wording.
+        var msg = await CallExpectingJsonRpcErrorAsync(
+            "roslyn:semantic_query",
+            arguments: new { kinds = "Class" },
+            expectedCode: -32602);
+        msg.Should().Contain("kinds");
+        msg.Should().Contain("must be an array of strings",
+            "the OptionalStringArray branch must surface its own wording (JsonRpcParameters.cs:99-100)");
+        msg.Should().Contain("roslyn:semantic_query");
+    }
+
+    [Fact]
+    public async Task ToolsCall_StringArrayArgument_RoundTripsBothEntriesWithBatchMetadata()
     {
         var data = await CallAndGetDataAsync("roslyn:get_type_members_batch", new
         {
             typeNames = new[] { "RoslynService", "McpServer" }
         });
-        var results = data["results"] as JArray;
-        results!.Count.Should().Be(2);
-        // Both requested type names must survive the JSON-RPC round-trip into the tool.
-        var typeNames = results.Select(r => r["typeName"]?.Value<string>() ?? "").ToList();
+        // Lock the batch-tool metadata (TypeDiscovery.cs:169-171) — totalRequested,
+        // successCount, errorCount must match the request shape.
+        data["totalRequested"]!.Value<int>().Should().Be(2);
+        data["successCount"]!.Value<int>().Should().Be(2,
+            "both requested type names must resolve in the SharpLensMcp solution");
+        data["errorCount"]!.Value<int>().Should().Be(0);
+
+        var results = (data["results"] as JArray)!;
+        results.Count.Should().Be(2);
+        // Tightened from `r["typeName"]?.Value<string>() ?? ""` — a missing field
+        // now NREs instead of silently being replaced by empty string.
+        var typeNames = results.Select(r => r["typeName"]!.Value<string>()!).ToList();
         typeNames.Should().Contain(n => n.EndsWith("RoslynService"));
         typeNames.Should().Contain(n => n.EndsWith("McpServer"));
     }
 
     [Fact]
-    public async Task ToolsCall_ObjectArrayArgument_RoundTripsBothEntries()
+    public async Task ToolsCall_ObjectArrayArgument_RoundTripsBothEntriesWithBatchMetadata()
     {
         var data = await CallAndGetDataAsync("roslyn:get_method_source_batch", new
         {
@@ -98,19 +145,16 @@ public class DispatcherContractTests : McpTestBase
                 new { typeName = "RoslynService", methodName = "GetHealthCheckAsync" }
             }
         });
-        // NotBeNull-first defeats the null-conditional silent-pass — if these fields
-        // were renamed/removed, the bare `?.Value<int>().Should().Be(N)` chain would
-        // skip the assertion instead of failing.
-        data["totalRequested"].Should().NotBeNull();
+        // Lock the batch-tool metadata (Inspection.cs:1489-1491). NotBeNull-first is
+        // redundant after the `!` bang — the bang throws on missing, so the next
+        // assertion is the actual contract lock.
         data["totalRequested"]!.Value<int>().Should().Be(2);
-        data["successCount"].Should().NotBeNull();
         data["successCount"]!.Value<int>().Should().Be(2);
-        data["errorCount"].Should().NotBeNull();
         data["errorCount"]!.Value<int>().Should().Be(0);
 
-        // Each result's metadata must reflect the exact requested method.
-        var results = data["results"] as JArray;
-        var requested = results!.Select(r => r["methodName"]?.Value<string>()).ToList();
+        // Each result envelope reflects the exact requested (typeName, methodName).
+        var results = (data["results"] as JArray)!;
+        var requested = results.Select(r => r["methodName"]!.Value<string>()!).ToList();
         requested.Should().BeEquivalentTo(new[] { "LoadSolutionAsync", "GetHealthCheckAsync" });
     }
 
@@ -125,14 +169,14 @@ public class DispatcherContractTests : McpTestBase
             includeHidden = false,
             runAnalyzers = false
         });
-        data["analyzersRan"].Should().NotBeNull();
-        data["analyzersRan"]!.Value<bool>().Should().BeFalse();
-        data["analyzerCount"].Should().NotBeNull();
-        data["analyzerCount"]!.Value<int>().Should().Be(0);
+        data["analyzersRan"]!.Value<bool>().Should().BeFalse(
+            "runAnalyzers=false must propagate to analyzersRan=false");
+        data["analyzerCount"]!.Value<int>().Should().Be(0,
+            "with analyzers skipped, the count must be zero");
     }
 
     [Fact]
-    public async Task ToolsCall_BooleanArgumentTrue_PropagatesToTool()
+    public async Task ToolsCall_BooleanArgumentTrue_PropagatesToToolAndRunsAnalyzers()
     {
         var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
         {
@@ -142,13 +186,14 @@ public class DispatcherContractTests : McpTestBase
             includeHidden = false,
             runAnalyzers = true
         });
-        // Contract: runAnalyzers=true means analyzersRan and analyzerCount must agree.
-        //  - If analyzersRan is true, at least one analyzer was invoked (count > 0).
-        //  - If analyzersRan is false, no analyzers were available (count == 0).
-        var ran = data["analyzersRan"]!.Value<bool>();
-        var count = data["analyzerCount"]!.Value<int>();
-        if (ran) count.Should().BeGreaterThan(0, "analyzersRan=true requires count > 0");
-        else count.Should().Be(0, "analyzersRan=false requires count == 0");
+        // The SharpLens solution loads SharpLensMcp.Tests.TestAnalyzers, so analyzers
+        // ARE available. Lock the affirmative contract instead of branching on the
+        // returned values — the prior `if (ran) ... else ...` form was a smoke pattern
+        // that let either outcome pass.
+        data["analyzersRan"]!.Value<bool>().Should().BeTrue(
+            "runAnalyzers=true must actually load and run analyzers in this solution");
+        data["analyzerCount"]!.Value<int>().Should().BeGreaterThan(0,
+            "the SharpLens solution has at least one analyzer reference (TestAnalyzers)");
     }
 
     [Fact]
@@ -158,20 +203,19 @@ public class DispatcherContractTests : McpTestBase
         {
             query = "Async"
         });
-        // The default maxResults is 50 (per McpServer.cs:1571). Without specifying
-        // maxResults the response must include the pagination metadata block AND
-        // at least some results (the SharpLens solution has many *Async methods).
-        var results = data["results"] as JArray;
-        results.Should().NotBeNullOrEmpty();
-        results!.Count.Should().BeGreaterThan(10,
-            "the solution has dozens of *Async methods within the default 50-result cap");
+        // Default maxResults=50, default offset=0 (per McpServer.cs:1598, 1600).
+        var results = (data["results"] as JArray)!;
+        results.Count.Should().BeGreaterThan(10,
+            "the SharpLens solution has dozens of *Async methods within the default 50-result cap");
+        results.Count.Should().BeLessOrEqualTo(50,
+            "the default maxResults=50 must cap the returned list");
 
-        var pagination = data["pagination"]!;
-        pagination.Should().NotBeNull();
-        // pagination always has nextOffset (may be null when no more); offset is at the
-        // top level of data per Navigation.cs SearchSymbolsAsync.
-        data["offset"].Should().NotBeNull("response must include offset field");
+        // Top-level pagination metadata (Navigation.cs:686-694). NotBeNull-first on
+        // every accessor defeats the null-conditional silent-pass.
         data["offset"]!.Value<int>().Should().Be(0, "default offset is 0");
+        data["hasMore"].Should().NotBeNull("response must include hasMore field");
+        data["pagination"]!["nextOffset"].Should().NotBeNull(
+            "pagination block must always include nextOffset (value may be null when no more)");
     }
 
     [Fact]
@@ -180,7 +224,6 @@ public class DispatcherContractTests : McpTestBase
         // Explicit envelope-shape test: the harness implicitly verifies this on every
         // call, but a dedicated named test surfaces regressions clearly.
         var inner = await CallToolAsync("roslyn:health_check");
-        inner["success"].Should().NotBeNull("response must include success field");
         inner["success"]!.Value<bool>().Should().BeTrue(
             "health_check must succeed at the inner contract layer");
         inner["data"].Should().NotBeNull(
