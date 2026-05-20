@@ -7,12 +7,12 @@
     "url": "https://github.com/pzalutski-pixel/sharplens-mcp",
     "source": "github"
   },
-  "version": "1.5.4",
+  "version": "1.5.3",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "sharplens-mcp",
-      "version": "1.5.4",
+      "version": "1.5.3",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
@@ -40,7 +40,7 @@
     {
       "registryType": "nuget",
       "identifier": "SharpLensMcp",
-      "version": "1.5.4",
+      "version": "1.5.3",
       "runtimeHint": "dotnet tool run",
       "transport": {
         "type": "stdio"
