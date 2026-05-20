@@ -426,10 +426,14 @@ public partial class RoslynService
             generatorResults.Add(new
             {
                 projectName = project.Name,
-                generators = generators.Select(g => new
+                generators = generators.Select(g =>
                 {
-                    typeName = g.GetType().FullName,
-                    assemblyName = g.GetType().Assembly.GetName().Name
+                    var underlying = UnwrapGeneratorType(g);
+                    return new
+                    {
+                        typeName = underlying.FullName,
+                        assemblyName = underlying.Assembly.GetName().Name
+                    };
                 }).ToList(),
                 generatedFiles
             });
@@ -441,6 +445,22 @@ public partial class RoslynService
             totalCount: generatorResults.Count,
             returnedCount: generatorResults.Count
         );
+    }
+
+    // Roslyn wraps every IIncrementalGenerator in an internal IncrementalGeneratorWrapper
+    // when surfaced through ISourceGenerator. Reporting the wrapper's type name to callers
+    // makes every project's generators look identical. Reach the inner generator via the
+    // wrapper's "Generator" property when present; fall back to the runtime type otherwise.
+    private static Type UnwrapGeneratorType(ISourceGenerator generator)
+    {
+        var t = generator.GetType();
+        var prop = t.GetProperty("Generator",
+            System.Reflection.BindingFlags.Instance |
+            System.Reflection.BindingFlags.Public |
+            System.Reflection.BindingFlags.NonPublic);
+        if (prop == null) return t;
+        var inner = prop.GetValue(generator);
+        return inner?.GetType() ?? t;
     }
 
     public async Task<object> GetGeneratedCodeAsync(string projectName, string generatedFileName)
