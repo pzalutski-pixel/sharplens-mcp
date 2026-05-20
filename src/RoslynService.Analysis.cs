@@ -1108,7 +1108,7 @@ public partial class RoslynService
         );
     }
 
-    public async Task<object> FormatDocumentBatchAsync(string? projectName, bool includeTests = true, bool preview = true)
+    public async Task<object> FormatDocumentBatchAsync(string? projectName, bool includeTests = true, bool preview = true, string? filePattern = null)
     {
         EnsureSolutionLoaded();
 
@@ -1122,11 +1122,17 @@ public partial class RoslynService
 
         foreach (var project in projectsToProcess)
         {
-            // Filter out test projects if includeTests is false
             if (!includeTests && project.Name.Contains("Test", StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            foreach (var document in project.Documents)
+            var documents = project.Documents;
+            if (!string.IsNullOrEmpty(filePattern))
+            {
+                documents = documents.Where(d =>
+                    d.FilePath != null && MatchesGlobPattern(Path.GetFileName(d.FilePath), filePattern));
+            }
+
+            foreach (var document in documents)
             {
                 if (document.FilePath == null) continue;
                 totalFiles++;

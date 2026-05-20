@@ -499,6 +499,7 @@ FILTERS: All specified filters are combined with AND logic. Omit a filter to ski
                     {
                         projectName = new { type = "string", description = "Optional: Project name to format. If omitted, formats all projects in solution." },
                         includeTests = new { type = "boolean", description = "Include test projects (default: true). Set to false to skip projects with 'Test' in the name." },
+                        filePattern = new { type = "string", description = "Optional: Glob pattern to filter files (e.g., '*.cs', 'Services/*.cs', '*Repository.cs'). Matches against file names, not full paths." },
                         preview = new { type = "boolean", description = "Preview mode (default: true). Set to false to apply changes to disk. ALWAYS preview first!" }
                     },
                     required = new string[] { }
@@ -1651,7 +1652,8 @@ Use get_source_generators first to discover available generated files.",
                 "roslyn:format_document_batch" => await _roslynService.FormatDocumentBatchAsync(
                     p.Optional<string>("projectName"),
                     p.Optional("includeTests", true),
-                    p.Optional("preview", true)),
+                    p.Optional("preview", true),
+                    p.Optional<string>("filePattern")),
 
                 "roslyn:get_method_overloads" => await _roslynService.GetMethodOverloadsAsync(
                     p.Required<string>("filePath"),
