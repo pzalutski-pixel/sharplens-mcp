@@ -4,49 +4,42 @@
 
 ### Added
 - `get_external_type_info` — inspect NuGet/BCL/external-assembly types: members, signatures, XML doc summaries
-- `get_call_graph` — multi-hop transitive callers/callees with `maxDepth` (1-10), `maxNodes` cap, and cycle detection
-- `find_untested_code` — public/internal surface not transitively reached by any xUnit/NUnit/MSTest test method, sorted by cyclomatic complexity
-- `find_god_objects` — over-coupled types via efferent + afferent coupling + member-count thresholds
-- `get_project_health` — composite audit dashboard: diagnostics + unused + coupling + coverage per project
+- `get_call_graph` — multi-hop callers/callees with depth/node caps and cycle detection
+- `find_untested_code` — public surface not reached by any xUnit/NUnit/MSTest test method
+- `find_god_objects` — over-coupled types via efferent + afferent coupling and member count
+- `get_project_health` — composite audit dashboard: diagnostics + unused + coupling + coverage
 
 ### Changed
 - Tool count: 62 → 67
-- `get_diagnostics` now runs configured `DiagnosticAnalyzer`s by default (StyleCop, Roslynator, NetAnalyzers, custom; editorconfig-resolved severities). Set `runAnalyzers: false` for compiler-only output
-- `find_references` reports `cast` kind in addition to `read`/`write`/`invocation`/`typeof`/`nameof`/`attribute` and accepts an optional `kind` filter
-- `McpServer.HandleToolCallAsync` dispatcher refactored to a typed `JsonRpcParameters` helper. Bad params now produce `-32602 Invalid params` per JSON-RPC spec
-- All `dynamic` dispatch eliminated from `src/`; replaced with centralized reflection helpers and typed records
-- `RoslynService` exposes an internal `LoadFromWorkspaceForTesting` seam, enabling in-memory `AdhocWorkspace` tests (~5ms) for tools that don't need cross-file references
-- `roslyn:health_check` response now wraps its payload in the standard `{success, data, meta}` envelope. Callers must read `data.status` instead of `status`
-- `roslyn:generate_constructor` response now carries `appliesEditsAutomatically: false` to make its generation-only semantics explicit
-- Added `Microsoft.CodeAnalysis.CSharp.Features` (5.0.0) so C#-specific refactorings (inline temporary, expression-body, invert-if, ~60 more) actually load
-- Every tool has an end-to-end MCP-layer integration test in addition to its direct-method test, content-locked against deterministic fixtures
-- Test suite hardened: 127 → 543 tests. Eliminated every silent-pass pattern (`data["X"]?.Value<T>()...` short-circuits when the field is missing); the audit pass surfaced both impl bugs (see Fixed below) and MCP-layer response-shape mismatches (`organize_usings_batch`/`format_document_batch` `fileCount`, three field-name bugs in `find_references`/`find_implementations`/`find_overrides`)
-- `GetCommonFixSuggestions` and `GetNestedActionsOrEmpty` exposed as `internal` so the per-CS-ID suggestion contract and nested-menu descent helper can be locked by direct unit tests
+- `get_diagnostics` runs configured `DiagnosticAnalyzer`s by default (StyleCop, Roslynator, NetAnalyzers, custom). Pass `runAnalyzers: false` for compiler-only output
+- `find_references` reports a `cast` kind and accepts an optional `kind` filter
+- `health_check` response now uses the standard `{success, data, meta}` envelope. Callers must read `data.status` instead of `status`
+- `generate_constructor` response carries `appliesEditsAutomatically: false` to make its generation-only semantics explicit
+- Bad JSON-RPC params return `-32602 Invalid params` (per spec), not a generic error
+- Added `Microsoft.CodeAnalysis.CSharp.Features` so C#-specific refactorings load (inline temporary, expression-body, invert-if, ~60 more)
+- Test count: 127 → 543; every tool has an end-to-end MCP-layer integration test against a deterministic fixture
 
 ### Fixed
-- Records misclassified as `Class`; `typeKind` and `kind:` filter now report `Record` / `RecordStruct` correctly
-- `find_references.kind` was hardcoded to `"read"`; now reflects actual usage with full write detection (assignment LHS, `++`/`--`, `out`/`ref`)
-- `change_signature` returned `applied: true` while editing nothing and only matched `MethodDeclarationSyntax`; now applies via `SolutionEditor` to the declaration and every call site, supports methods/constructors/local functions, and updates named-argument labels on rename
-- `extract_method` claimed `preview: false` would apply edits but never did; now fully implemented via `SolutionEditor` with snapshot/restore test coverage
-- `apply_code_fix` left stale entries in the document/compilation caches after `preview: false`; follow-up `get_diagnostics` saw the pre-fix document and reported the just-fixed diagnostic as still present. Solution swap and cache clears are now hoisted to a single post-write step
-- `get_source_generators` reported `IncrementalGeneratorWrapper` for every entry (Roslyn's internal wrapper hides `IIncrementalGenerator`'s real type). Response now unwraps via reflection on the wrapper's `Generator` property and surfaces the actual generator typeName/assembly
-- `get_instantiation_options` returned an empty `externalFactories` list for projects with source generators (`SymbolEqualityComparer.Default` returns false across base vs augmented compilations). Target type is now re-resolved per compilation before the comparison
-- `analyze_data_flow`, `analyze_control_flow`, and `get_file_overview` had dead `if (document == null)` branches after `GetDocumentAsync` (which throws, never returns null); unknown file paths produced an unstructured rethrow instead of `FileNotInSolution`. Each call site now wraps `GetDocumentAsync` in `try/catch`
-- `rename_symbol` accepted invalid C# identifiers like `123invalid`; now returns `INVALID_PARAMETER`
-- JSON-RPC notification handling was non-compliant: only `method.StartsWith("notifications/")` was treated as a notification. Per spec §4.3, any request without `id` is a notification — `{"jsonrpc":"2.0","method":"initialize"}` was incorrectly answered with `{"id":null,...}`
-- `HandleRequestAsync` returned an error response (id: null) for any exception during dispatch, including exceptions that escaped a notification handler. Outer catch now distinguishes parse-failure, request-with-exception, and notification-with-exception
-- `find_attribute_usages` and `find_reflection_usage` lied about `totalCount` when `maxResults` was hit; both now track an unbounded counter
-- `search_symbols.totalCount` was capped at `maxResults + 100`; paginated callers now see the true match count
-- `AnalyzeDataFlow` / `AnalyzeControlFlow` threw "statements not within the same statement list" on regions spanning a `BlockSyntax`; fixed with sibling-aware resolution
-- Relative paths from `FormatPath` didn't round-trip through `GetDocumentAsync`; now resolves solution-relative paths against the solution directory
-- `FindTypeByName` returned symbols `SymbolFinder` didn't recognize on generator-using projects; now prefers the base compilation, falling back to augmented only for purely generated types
-- `find_untested_code` matched test attributes by simple name (so user-defined `MyApp.Attributes.FactAttribute` looked like xUnit's `[Fact]`); now matches `(namespace, simple name)` tuples
-- `find_untested_code` ignored the `includeProperties` parameter; now honored across both the BFS and candidate-collection passes
-- `find_god_objects` over-counted efferent coupling — a loose `IdentifierNameSyntax` pass included `nameof()` args, using-directive types, and generic constraints, plus traversed into types declared in referenced source projects. Tightened to object-creation/typeof/cast/var-decl/invocation-receiver and to the target project's own types
-- `get_call_graph` cycle detection used dynamic dispatch on anonymous-typed edges; replaced with typed `Dictionary<int, List<int>>` adjacency
-- `get_code_actions_at_position` and `apply_code_action_by_title` returned empty action lists for every position. The provider loader used reflection with a parameterless-public-constructor filter, which filtered out every MEF-exported `[ImportingConstructor]` provider. Replaced with `System.Composition` MEF discovery across the Roslyn Workspaces + Features assemblies (80+ refactoring providers + 15 fix providers now load); the workspace's `MefHostServices` is wired to the same assembly set so the providers' runtime language-service lookups (e.g. `IExtractMethodService`) resolve
-- `McpServer` had a private `ParseStringArray` helper with the same non-string-element bug as `JsonRpcParameters.OptionalStringArray`; helper deleted and `sync_documents.filePaths` routed through the typed accessor
-- `JsonRpcParameters.OptionalStringArray` silently dropped non-string elements from a JSON array; mixed-type arrays now produce `-32602 Invalid params`
+- `change_signature` no longer reports `applied: true` while editing nothing; it now updates the declaration and every call site, including constructors, local functions, and named arguments
+- `extract_method` actually applies edits on `preview: false`
+- `apply_code_fix` post-apply `get_diagnostics` no longer reports the just-fixed diagnostic as still present (stale-cache bug)
+- `generate_equality_members`, `organize_usings_batch`, and `format_document_batch` now invalidate the compilation cache after writing to disk; subsequent compilation reads served pre-edit content otherwise
+- `get_code_actions_at_position` and `apply_code_action_by_title` return real Roslyn refactorings instead of empty lists
+- `get_source_generators` surfaces the underlying generator type instead of `IncrementalGeneratorWrapper`
+- `get_instantiation_options` returns external factories on projects with source generators
+- `analyze_data_flow`, `analyze_control_flow`, and `get_file_overview` return a structured `FileNotInSolution` error for unknown paths instead of an unstructured rethrow
+- `analyze_data_flow` / `analyze_control_flow` work on regions that span block boundaries
+- `find_attribute_usages` and `find_reflection_usage` report accurate `totalCount` when `maxResults` is hit
+- `search_symbols` pagination reports the true match count (no `+100` cap)
+- `find_god_objects` no longer over-counts efferent coupling via `nameof()`, using-directives, or types from referenced projects
+- `find_untested_code` matches test attributes by `(namespace, name)` so look-alikes in user namespaces aren't treated as test methods; honors `includeProperties`
+- `find_references.kind` reports actual usage (read/write/invocation/typeof/nameof/attribute/cast), not hardcoded `read`
+- Records report `Record` / `RecordStruct` in `typeKind` and `kind:` filters instead of `Class`
+- `rename_symbol` rejects invalid C# identifiers with `INVALID_PARAMETER`
+- JSON-RPC notifications produce no response (per spec §4.3) — no more `{"id": null, ...}` answers to `initialize` or other no-id requests
+- Relative paths from tool responses round-trip back through subsequent calls
+- `FindTypeByName` returns symbols `SymbolFinder` recognizes on generator-using projects
+- `sync_documents.filePaths` rejects non-string array elements with `-32602 Invalid params`
 
 ## [1.5.2] - 2026-04-17
 

@@ -18,7 +18,26 @@
     <PackageTags>mcp;roslyn;csharp;dotnet;code-analysis;ai;semantic-analysis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
-v1.5.3: Added 5 audit/discovery tools (get_external_type_info, get_call_graph, find_untested_code, find_god_objects, get_project_health). get_diagnostics now runs configured analyzers (StyleCop, Roslynator, NetAnalyzers, custom) by default; runAnalyzers:false for old behavior. find_references reports cast kind plus optional server-side kind filter. extract_method actually applies on preview:false (was a no-op). Fixed apply_code_fix stale-cache, get_source_generators reporting IncrementalGeneratorWrapper instead of the underlying generator, get_instantiation_options cross-compilation symbol mismatch, three dead error branches in analyze_data_flow/analyze_control_flow/get_file_overview, find_god_objects over-counting via referenced projects, JSON-RPC notifications producing illegal id:null responses, find_attribute_usages/find_reflection_usage lying about totalCount, search_symbols totalCount cap, AnalyzeDataFlow span-block error, and 6 more. Eliminated all dynamic dispatch. Test count 127 to 543, every silent-pass null-conditional pattern removed, MCP-layer integration tests for every tool.
+v1.5.3
+Added:
+- get_external_type_info
+- get_call_graph
+- find_untested_code
+- find_god_objects
+- get_project_health
+Changed:
+- get_diagnostics runs DiagnosticAnalyzers by default
+- find_references reports cast kind + filter
+- health_check uses standard {success,data,meta} envelope
+- change_signature, extract_method, apply_code_fix apply on preview:false
+Fixed:
+- get_source_generators surfaces real generator type
+- get_instantiation_options externalFactories on generator projects
+- get_code_actions_at_position returns real refactorings
+- search_symbols pagination, find_god_objects coupling
+- JSON-RPC notification compliance
+- 15 more (see CHANGELOG.md)
+Tests: 127 → 543
 v1.5.2: Run source generators so tools see generator-produced code (#7). Fixes phantom CS0117, missed references, wrong unused-code results for projects with generators.
 v1.5.1: Fixed notifications/initialized breaking MCP client connections (#6).
 v1.5.0: Added 7 discovery tools: attribute usages, DI registrations, reflection detection, circular dependencies, NuGet dependencies, source generators, generated code viewer.
