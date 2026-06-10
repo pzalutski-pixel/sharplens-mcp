@@ -1,0 +1,101 @@
+name: Feature
+description: A capability or change to build. Fill this so it can be picked up and worked without further context.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the change so someone (or an agent) can implement it cold.
+        Be concrete about where it lives and how to confirm it's done.
+        Do not include scheduling, priority, or effort — those are decided when work is picked up, not here.
+
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One sentence — what the change is.
+      placeholder: "Add a get_documentation tool that expands <inheritdoc> references."
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Problem / motivation
+      description: The need this addresses, stated independently of the solution. Why it matters; what's limited today.
+      placeholder: |
+        XML doc comments using <inheritdoc cref="..."/> point at symbols in other files by
+        namespace/type name, so an agent reading a file can't follow them. Tools return the
+        tag verbatim today, losing the inherited documentation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: approach
+    attributes:
+      label: Proposed approach
+      description: The technical direction. Enough that an implementer doesn't have to invent the design.
+      placeholder: |
+        Resolve cref targets via DocumentationCommentId.GetFirstSymbolForDeclarationId(cref, compilation);
+        bare <inheritdoc/> resolves via the overridden/implemented base member.
+        Recurse with a cycle guard; merge inherited elements the local doc doesn't define.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Where this lives (code pointers)
+      description: Concrete files / classes / methods involved, and relevant existing components to reuse or preserve. This is what makes the issue pickable.
+      placeholder: |
+        Tool implementations: src/RoslynService.*.cs partials (one per concern).
+        Tool definitions + dispatcher: src/McpServer.cs.
+        Reuse: GetProjectCompilationAsync (generator-augmented compilation),
+          FindTypeByNameAsync (name-based type resolution), GetSymbolLocation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: A checklist that defines "done". Each item objectively checkable.
+      placeholder: |
+        - [ ] New tool returns expanded docs for a member carrying only <inheritdoc/>.
+        - [ ] cref targets in other files resolve; cycles terminate with a marker.
+        - [ ] Response uses the standard {success, data, meta} envelope.
+        - [ ] Existing tool responses unchanged.
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: How to verify
+      description: Where the tests are and the exact command to run them, plus any contract to match.
+      placeholder: |
+        Tests: tests/SharpLensMcp.Tests (xUnit; in-memory AdhocWorkspace fixtures preferred,
+          plus a ViaMcp test in tests/SharpLensMcp.Tests/Mcp for the wire contract).
+        Run: dotnet test
+        Contract: the {success, data, meta} response envelope the existing tests assert.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope boundaries / dependencies
+      description: What is explicitly out of scope, and anything this is gated on (e.g., a dependency not yet present).
+      placeholder: |
+        Out: rendering docs to markdown/HTML.
+        Gated: nothing — Roslyn APIs used are already referenced.
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      description: Anything else — related issues/discussions, prior art, constraints to respect.
+    validations:
+      required: false

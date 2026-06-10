@@ -1,0 +1,83 @@
+name: Bug
+description: Something behaves incorrectly. Fill this so the defect can be reproduced.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The goal is a defect we can reproduce. A minimal reproducible example is the most valuable thing you can provide.
+
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One sentence — what's wrong.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact, ordered, deterministic steps.
+      placeholder: |
+        1. Load solution X with load_solution.
+        2. Call <tool> with <arguments>.
+        3. Observe the response.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: input
+    id: repro-example
+    attributes:
+      label: Minimal reproducible example
+      description: Link to a small repo/branch (or attach a snippet) that triggers the issue. The single highest-value field.
+      placeholder: "https://github.com/you/minimal-repro"
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: The conditions needed to reproduce.
+      placeholder: |
+        SharpLens version:
+        Install method (dotnet tool install / npx sharplens-mcp):
+        OS + exact version + arch (e.g. Windows 11 23H2 x64):
+        .NET SDKs installed (`dotnet --list-sdks`):
+        MCP client + launch config (command + args):
+        Analyzed solution: .sln or .slnx, project count, target frameworks, source generators in use:
+    validations:
+      required: true
+
+  - type: textarea
+    id: tool-io
+    attributes:
+      label: Tool request and response
+      description: The exact MCP tool call and the response you received.
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Logs, related issues, anything else.
+    validations:
+      required: false
