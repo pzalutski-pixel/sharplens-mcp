@@ -98,7 +98,7 @@ public class RoslynServiceHelpersTests
 
         var cycles = service.DetectCycles(graph);
         cycles.Should().HaveCount(1);
-        // Per the impl (RoslynService.cs:586-589) the cycle is reported as
+        // Per the impl the cycle is reported as
         // [first-node, ..., back-edge-target, first-node-repeated]. For A→B→A
         // starting from A, the output is [A, B, A].
         cycles[0].Should().Equal("A", "B", "A");

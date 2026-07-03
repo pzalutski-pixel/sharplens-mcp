@@ -10,23 +10,60 @@ namespace SharpLensMcp.Tests;
 public class InfrastructureTests : RoslynServiceTestBase
 {
     [Fact]
-    public async Task GetHealthCheck_ReturnsSolutionInfoWithProjectCountAndDiagnosticTotals()
+    public async Task GetHealthCheck_WithIncludeDiagnostics_ReturnsSolutionInfoWithProjectCountAndDiagnosticTotals()
     {
-        var result = await Service.GetHealthCheckAsync();
+        var result = await Service.GetHealthCheckAsync(includeDiagnostics: true);
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["status"]?.Value<string>().Should().Be("Ready");
-        data["solution"]?["loaded"]?.Value<bool>().Should().BeTrue();
-        data["solution"]?["path"]?.Value<string>().Should().EndWith("SharpLensMcp.sln");
-        // The solution sub-object also reports projectCount.
-        data["solution"]?["projectCount"]?.Value<int>().Should().Be(3,
+        data["status"].Should().NotBeNull();
+        data["status"]!.Value<string>().Should().Be("Ready");
+        var solution = data["solution"];
+        solution.Should().NotBeNull();
+        solution!["loaded"].Should().NotBeNull();
+        solution["loaded"]!.Value<bool>().Should().BeTrue();
+        solution["path"].Should().NotBeNull();
+        solution["path"]!.Value<string>().Should().EndWith("SharpLensMcp.sln");
+        // The solution sub-object reports the project count under `projects`, and the
+        // sampled diagnostic counts under `errors`/`warnings` — all nested, NOT at the
+        // top level. The old top-level `errorCount`/`warningCount` and `projectCount`
+        // reads never existed and silently passed.
+        solution["projects"].Should().NotBeNull();
+        solution["projects"]!.Value<int>().Should().Be(3,
             "the SharpLensMcp solution has 3 csproj projects");
-        // health_check samples the first 5 projects for diagnostic counts (RoslynService.cs:488).
-        // The solution should be clean — zero errors AND zero warnings on the sample.
-        data["errorCount"]?.Value<int>().Should().Be(0,
-            "the sampled projects must compile cleanly");
-        data["warningCount"]?.Value<int>().Should().Be(0);
+        // includeDiagnostics=true compiles and samples the first 5 projects, so the
+        // sweep must run and populate integer error/warning counts. The exact values
+        // are NOT a stable lock: MSBuildWorkspace's in-process compilation carries
+        // metadata-resolution noise that differs from `dotnet build`. The strict
+        // clean-build invariant (0 errors) is pinned deterministically by the
+        // get_diagnostics and SolutionHealthInvariant tests instead.
+        solution["diagnosticsIncluded"].Should().NotBeNull();
+        solution["diagnosticsIncluded"]!.Value<bool>().Should().BeTrue();
+        solution["errors"]!.Type.Should().Be(JTokenType.Integer,
+            "includeDiagnostics=true must populate an integer error count");
+        solution["warnings"]!.Type.Should().Be(JTokenType.Integer,
+            "includeDiagnostics=true must populate an integer warning count");
+    }
+
+    [Fact]
+    public async Task GetHealthCheck_DefaultOmitsDiagnostics_ReturnsCountsWithNullDiagnosticTotals()
+    {
+        // The default is O(1): no compilation sweep, so errors/warnings are null and
+        // diagnosticsIncluded is false, while the load-state and counts still report.
+        var result = await Service.GetHealthCheckAsync();
+
+        AssertSuccess(result);
+        var solution = GetData(result)["solution"]!;
+        solution["loaded"]!.Value<bool>().Should().BeTrue();
+        solution["projects"]!.Value<int>().Should().Be(3,
+            "project/document counts are O(1) and must report on the cheap path");
+        solution["diagnosticsIncluded"].Should().NotBeNull();
+        solution["diagnosticsIncluded"]!.Value<bool>().Should().BeFalse(
+            "the default path must not run the diagnostics sweep");
+        solution["errors"]!.Type.Should().Be(JTokenType.Null,
+            "errors must be null when diagnostics are not computed");
+        solution["warnings"]!.Type.Should().Be(JTokenType.Null,
+            "warnings must be null when diagnostics are not computed");
     }
 
     [Fact]
@@ -39,13 +76,16 @@ public class InfrastructureTests : RoslynServiceTestBase
         var data = GetData(result);
         // The SharpLensMcp solution contains exactly three csproj projects:
         // SharpLensMcp, SharpLensMcp.Tests, SharpLensMcp.Tests.TestAnalyzers.
-        data["projectCount"]?.Value<int>().Should().Be(3);
+        data["projectCount"].Should().NotBeNull();
+        data["projectCount"]!.Value<int>().Should().Be(3);
         // documentCount aggregates source documents across the three projects — at least
         // the count of files we maintain in src/ + tests/ (well over 30 combined).
-        data["documentCount"]?.Value<int>().Should().BeGreaterThan(20,
+        data["documentCount"].Should().NotBeNull();
+        data["documentCount"]!.Value<int>().Should().BeGreaterThan(20,
             "the solution declares many source documents across its three projects");
         // The response also round-trips the loaded solutionPath.
-        data["solutionPath"]?.Value<string>().Should().EndWith("SharpLensMcp.sln");
+        data["solutionPath"].Should().NotBeNull();
+        data["solutionPath"]!.Value<string>().Should().EndWith("SharpLensMcp.sln");
     }
 
     [Fact]
@@ -77,8 +117,10 @@ public class InfrastructureTests : RoslynServiceTestBase
         // First project shape — name + language locked. Plus the full mode must emit
         // the documents AND references arrays (opposite of summaryOnly).
         var firstProject = projects[0];
-        firstProject["name"]?.Value<string>().Should().Be("SharpLensMcp");
-        firstProject["language"]?.Value<string>().Should().Be("C#");
+        firstProject["name"].Should().NotBeNull();
+        firstProject["name"]!.Value<string>().Should().Be("SharpLensMcp");
+        firstProject["language"].Should().NotBeNull();
+        firstProject["language"]!.Value<string>().Should().Be("C#");
         firstProject["documents"].Should().NotBeNull(
             "includeDocuments=true must emit the documents array");
         firstProject["references"].Should().NotBeNull(
@@ -87,6 +129,27 @@ public class InfrastructureTests : RoslynServiceTestBase
             "SharpLensMcp has multiple .cs files");
         (firstProject["references"] as JArray)!.Count.Should().BeGreaterThan(0,
             "SharpLensMcp has multiple metadata references (Roslyn packages, BCL)");
+    }
+
+    [Fact]
+    public async Task GetProjectStructure_ReportsRealTargetFrameworkPerProject()
+    {
+        var result = await Service.GetProjectStructureAsync(
+            includeReferences: false,
+            includeDocuments: false);
+
+        AssertSuccess(result);
+        var projects = (GetData(result)["projects"] as JArray)!;
+        var tfmByName = projects.ToDictionary(
+            p => p["name"]!.Value<string>()!,
+            p => p["targetFramework"]?.Value<string>());
+
+        // Two projects with DIFFERENT real TFMs prove the value comes from each
+        // project's own csproj, not a solution-wide constant or the CPU platform.
+        tfmByName["SharpLensMcp"].Should().Be("net8.0");
+        tfmByName["SharpLensMcp.Tests.TestAnalyzers"].Should().Be("netstandard2.0");
+        tfmByName.Values.Should().NotContain("AnyCpu",
+            "CompilationOptions.Platform is a CPU platform, not a target framework");
     }
 
     [Fact]
@@ -103,14 +166,18 @@ public class InfrastructureTests : RoslynServiceTestBase
         projects.Should().NotBeNullOrEmpty();
         projects!.Count.Should().Be(3, "the solution has three csproj projects");
 
-        // Summary entries carry name + documentCount + projectReferenceCount + language only,
-        // per Analysis.cs:867-873. They must NOT carry the full `documents` or `references` arrays.
+        // Summary entries carry name + documentCount + projectReferenceCount + language only.
+        // They must NOT carry the full `documents` or `references` arrays.
         foreach (var project in projects)
         {
-            project["name"]?.Value<string>().Should().NotBeNullOrEmpty();
-            project["language"]?.Value<string>().Should().Be("C#");
-            project["documentCount"]?.Type.Should().Be(JTokenType.Integer);
-            project["projectReferenceCount"]?.Type.Should().Be(JTokenType.Integer);
+            project["name"].Should().NotBeNull();
+            project["name"]!.Value<string>().Should().NotBeNullOrEmpty();
+            project["language"].Should().NotBeNull();
+            project["language"]!.Value<string>().Should().Be("C#");
+            project["documentCount"].Should().NotBeNull();
+            project["documentCount"]!.Type.Should().Be(JTokenType.Integer);
+            project["projectReferenceCount"].Should().NotBeNull();
+            project["projectReferenceCount"]!.Type.Should().Be(JTokenType.Integer);
             project["documents"].Should().BeNull("summaryOnly must omit the documents array");
             project["references"].Should().BeNull("summaryOnly must omit the references array");
         }
@@ -134,7 +201,8 @@ public class InfrastructureTests : RoslynServiceTestBase
             .Should().Contain("SharpLensMcp",
                 "SharpLensMcp.Tests project-references SharpLensMcp");
 
-        data["hasCycles"]?.Value<bool>().Should().BeFalse(
+        data["hasCycles"].Should().NotBeNull();
+        data["hasCycles"]!.Value<bool>().Should().BeFalse(
             "the SharpLensMcp solution has no circular project references");
     }
 
@@ -147,8 +215,10 @@ public class InfrastructureTests : RoslynServiceTestBase
         var data = GetData(result);
         // The response field is `graph` (not `mermaid`); previous test asserted on a
         // non-existent field via `?.` short-circuit, so it silently passed forever.
-        data["format"]?.Value<string>().Should().Be("mermaid");
-        data["graph"]?.Value<string>().Should().Contain("graph TD");
+        data["format"].Should().NotBeNull();
+        data["format"]!.Value<string>().Should().Be("mermaid");
+        data["graph"].Should().NotBeNull();
+        data["graph"]!.Value<string>().Should().Contain("graph TD");
     }
 
     [Fact]
@@ -188,7 +258,7 @@ public class InfrastructureTests : RoslynServiceTestBase
         // missing from disk and none are unknown, so:
         //  - added must be 0 (nothing new appears via the existing-document path)
         //  - removed must be 0 (every file still exists on disk)
-        //  - updated must be > 0 (every existing doc is rewritten with on-disk text per RoslynService.cs:359-366)
+        //  - updated must be > 0 (every existing doc is rewritten with on-disk text)
         //  - totalSynced must equal updated + added + removed
         var updated = data["updated"]!.Value<int>();
         var added = data["added"]!.Value<int>();
@@ -196,7 +266,8 @@ public class InfrastructureTests : RoslynServiceTestBase
         added.Should().Be(0, "sync-all over an in-sync solution adds no new documents");
         removed.Should().Be(0, "sync-all over a solution with all files present removes nothing");
         updated.Should().BeGreaterThan(0, "every existing doc gets rewritten with disk text");
-        data["totalSynced"]?.Value<int>().Should().Be(updated + added + removed);
+        data["totalSynced"].Should().NotBeNull();
+        data["totalSynced"]!.Value<int>().Should().Be(updated + added + removed);
     }
 
     [Fact]
@@ -208,10 +279,14 @@ public class InfrastructureTests : RoslynServiceTestBase
         var data = GetData(result);
         // The updated count + the updatedFiles list must agree, and the named file
         // must appear in the list.
-        data["totalSynced"]?.Value<int>().Should().Be(1);
-        data["updated"]?.Value<int>().Should().Be(1);
-        data["added"]?.Value<int>().Should().Be(0);
-        data["removed"]?.Value<int>().Should().Be(0);
+        data["totalSynced"].Should().NotBeNull();
+        data["totalSynced"]!.Value<int>().Should().Be(1);
+        data["updated"].Should().NotBeNull();
+        data["updated"]!.Value<int>().Should().Be(1);
+        data["added"].Should().NotBeNull();
+        data["added"]!.Value<int>().Should().Be(0);
+        data["removed"].Should().NotBeNull();
+        data["removed"]!.Value<int>().Should().Be(0);
         var updatedFiles = data["updatedFiles"] as JArray;
         updatedFiles.Should().NotBeNullOrEmpty();
         updatedFiles!.Any(f => f.Value<string>()?.EndsWith("RoslynService.cs") == true)
@@ -228,10 +303,14 @@ public class InfrastructureTests : RoslynServiceTestBase
         AssertSuccess(result);
         var data = GetData(result);
         // Nothing to sync for non-existent file not in solution
-        data["totalSynced"]?.Value<int>().Should().Be(0);
-        data["updated"]?.Value<int>().Should().Be(0);
-        data["added"]?.Value<int>().Should().Be(0);
-        data["removed"]?.Value<int>().Should().Be(0);
+        data["totalSynced"].Should().NotBeNull();
+        data["totalSynced"]!.Value<int>().Should().Be(0);
+        data["updated"].Should().NotBeNull();
+        data["updated"]!.Value<int>().Should().Be(0);
+        data["added"].Should().NotBeNull();
+        data["added"]!.Value<int>().Should().Be(0);
+        data["removed"].Should().NotBeNull();
+        data["removed"]!.Value<int>().Should().Be(0);
     }
 
     [Fact]
@@ -239,7 +318,7 @@ public class InfrastructureTests : RoslynServiceTestBase
     {
         // Pattern "SharpLensMcp.Tests" matches the test project AND the analyzers
         // project (which starts with the same prefix); pure "SharpLensMcp" matches
-        // only the main project because the pattern is anchored ^…$ (Analysis.cs:849).
+        // only the main project because the pattern is anchored ^…$.
         var result = await Service.GetProjectStructureAsync(
             includeReferences: false,
             includeDocuments: false,
@@ -250,7 +329,8 @@ public class InfrastructureTests : RoslynServiceTestBase
         var projects = (GetData(result)["projects"] as JArray)!;
         projects.Count.Should().Be(1,
             "anchored pattern 'SharpLensMcp' matches exactly the main project");
-        projects[0]["name"]?.Value<string>().Should().Be("SharpLensMcp");
+        projects[0]["name"].Should().NotBeNull();
+        projects[0]["name"]!.Value<string>().Should().Be("SharpLensMcp");
     }
 
     [Fact]
@@ -277,7 +357,7 @@ public class InfrastructureTests : RoslynServiceTestBase
     public async Task GetProjectStructure_WithMaxProjects_CapsResults()
     {
         // maxProjects=1 must return exactly one project, even though the solution
-        // has three (Analysis.cs:857-860).
+        // has three.
         var result = await Service.GetProjectStructureAsync(
             includeReferences: false,
             includeDocuments: false,
@@ -292,7 +372,7 @@ public class InfrastructureTests : RoslynServiceTestBase
     [Fact]
     public async Task DependencyGraph_WithNullFormat_DefaultsToJsonDictionary()
     {
-        // Inspection.cs:634 routes anything that isn't "mermaid" through the json
+        // The impl routes anything that isn't "mermaid" through the json
         // (dictionary) branch. Calling with format=null must therefore behave like
         // format="json" — emit dependencies + hasCycles + cycles, NOT a graph string.
         var result = await Service.GetDependencyGraphAsync(format: null);
@@ -303,6 +383,7 @@ public class InfrastructureTests : RoslynServiceTestBase
             "null format defaults to the dictionary branch");
         data["graph"].Should().BeNull(
             "the mermaid `graph` string must not appear in the default response");
-        data["hasCycles"]?.Type.Should().Be(JTokenType.Boolean);
+        data["hasCycles"].Should().NotBeNull();
+        data["hasCycles"]!.Type.Should().Be(JTokenType.Boolean);
     }
 }

@@ -5,18 +5,10 @@ using Xunit;
 namespace SharpLensMcp.Tests.Mcp;
 
 // MCP-layer tests for the Analysis category. Every assertion locks a specific
-// field from the impl's documented response shape:
-//  - get_diagnostics:           Analysis.cs:49-57
-//  - analyze_data_flow:         Compound.cs:97-114
-//  - analyze_control_flow:      Compound.cs:232-242
-//  - analyze_change_impact:     Inspection.cs:1244-1256
-//  - check_type_compatibility:  Validation.cs:247-260
-//  - get_outgoing_calls:        Inspection.cs:942-948
-//  - find_unused_code:          Inspection.cs:405-421
-//  - validate_code:             Validation.cs:126-134
-//  - get_complexity_metrics:    CodeGeneration.cs:169-177
-//  - find_circular_dependencies:Discovery.cs:256-258
-//  - get_missing_members:       Inspection.cs:789-796
+// field from the impl's documented response shape, covering: get_diagnostics,
+// analyze_data_flow, analyze_control_flow, analyze_change_impact,
+// check_type_compatibility, get_outgoing_calls, find_unused_code, validate_code,
+// get_complexity_metrics, find_circular_dependencies, get_missing_members.
 //
 // Tightening rule for this file: every accessor uses `!.Value<T>()` (NRE on
 // missing) rather than `?.Value<T>()` (silent-pass via short-circuit).
@@ -27,7 +19,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetDiagnostics_FullSolutionRunAnalyzersFalse_ReportsCompilerOnly()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        var data = await CallAndGetDataAsync("get_diagnostics", new
         {
             filePath = (string?)null,
             projectPath = (string?)null,
@@ -56,7 +48,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetDiagnostics_FullSolutionRunAnalyzersTrue_ActuallyRunsAnalyzers()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        var data = await CallAndGetDataAsync("get_diagnostics", new
         {
             filePath = (string?)null,
             projectPath = (string?)null,
@@ -77,7 +69,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetDiagnostics_SeverityWarningFilter_OnlyWarnings()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        var data = await CallAndGetDataAsync("get_diagnostics", new
         {
             filePath = (string?)null,
             projectPath = (string?)null,
@@ -98,7 +90,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     public async Task GetDiagnostics_ProjectPathFilter_RestrictsToThatProject()
     {
         var projectPath = Path.Combine(Fixture.SolutionDir, "src", "SharpLensMcp.csproj");
-        var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        var data = await CallAndGetDataAsync("get_diagnostics", new
         {
             filePath = (string?)null,
             projectPath,
@@ -117,9 +109,9 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
-    public async Task GetDiagnostics_SeverityErrorFilter_OnlyErrorsAndCountMatches()
+    public async Task GetDiagnostics_SeverityFilter_NarrowsPageButCountsAreFilterIndependent()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        var filtered = await CallAndGetDataAsync("get_diagnostics", new
         {
             filePath = (string?)null,
             projectPath = (string?)null,
@@ -127,14 +119,29 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             includeHidden = false,
             runAnalyzers = false
         });
-        var diagnostics = (data["diagnostics"] as JArray)!;
+        var unfiltered = await CallAndGetDataAsync("get_diagnostics", new
+        {
+            filePath = (string?)null,
+            projectPath = (string?)null,
+            severity = (string?)null,
+            includeHidden = false,
+            runAnalyzers = false
+        });
+
+        var diagnostics = (filtered["diagnostics"] as JArray)!;
         foreach (var d in diagnostics)
         {
             d["severity"]!.Value<string>().Should().Be("Error",
-                "severity filter must drop non-Error entries");
+                "severity filter must drop non-Error entries from the page");
         }
-        data["warningCount"]!.Value<int>().Should().Be(0);
-        data["errorCount"]!.Value<int>().Should().Be(diagnostics.Count);
+
+        // The health counts reflect the FULL diagnostic set regardless of the page
+        // filter — they must match the unfiltered call. The old behavior zeroed
+        // warningCount under a severity:Error filter.
+        filtered["errorCount"]!.Value<int>().Should().Be(unfiltered["errorCount"]!.Value<int>(),
+            "errorCount counts the full set, independent of the severity filter");
+        filtered["warningCount"]!.Value<int>().Should().Be(unfiltered["warningCount"]!.Value<int>(),
+            "warningCount must not collapse to 0 just because the page is filtered to errors");
     }
 
     [Fact]
@@ -150,7 +157,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
         firstStmt.Should().BeGreaterThan(-1);
         lastStmt.Should().BeGreaterThan(firstStmt);
 
-        var data = await CallAndGetDataAsync("roslyn:analyze_data_flow", new
+        var data = await CallAndGetDataAsync("analyze_data_flow", new
         {
             filePath = file,
             startLine = firstStmt,
@@ -179,7 +186,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
         var firstStmt = Array.FindIndex(lines, l => l.Contains("var partial"));
         var lastStmt = Array.FindIndex(lines, l => l.Contains("return total"));
 
-        var data = await CallAndGetDataAsync("roslyn:analyze_control_flow", new
+        var data = await CallAndGetDataAsync("analyze_control_flow", new
         {
             filePath = file,
             startLine = firstStmt,
@@ -200,13 +207,13 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     {
         var (file, line, col) = await LocateSymbolAsync(
             "CreateSuccessResponse", kind: "Method");
-        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        var data = await CallAndGetDataAsync("analyze_change_impact", new
         {
             filePath = file, line, column = col,
             changeType = "rename",
             newValue = "CreateSuccess"
         });
-        // Rename change: per Inspection.cs:1180-1183, severity is always "info"
+        // Rename change: severity is always "info"
         // and breakingChanges is never incremented — these are the load-bearing
         // invariants of the rename classifier.
         data["safe"]!.Value<bool>().Should().BeTrue("rename is non-breaking per the impact classifier");
@@ -221,7 +228,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             loc["severity"]!.Value<string>().Should().Be("info",
                 "every rename impact must classify as info");
             loc["impact"]!.Value<string>().Should().Be("Reference will need to be updated",
-                "Inspection.cs:1181 sets this exact text for rename");
+                "the impl sets this exact text for rename");
         }
         data["totalReferences"]!.Value<int>().Should().BeGreaterOrEqualTo(1);
     }
@@ -231,7 +238,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     {
         var (file, line, col) = await LocateSymbolAsync("CreateSuccessResponse", kind: "Method",
             r => r["containingType"]?.Value<string>()?.Contains("RoslynService") == true);
-        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        var data = await CallAndGetDataAsync("analyze_change_impact", new
         {
             filePath = file, line, column = col,
             changeType = "changetype",
@@ -252,7 +259,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     {
         var (file, line, col) = await LocateSymbolAsync("CreateSuccessResponse", kind: "Method",
             r => r["containingType"]?.Value<string>()?.Contains("RoslynService") == true);
-        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        var data = await CallAndGetDataAsync("analyze_change_impact", new
         {
             filePath = file, line, column = col,
             changeType = "addparameter",
@@ -272,7 +279,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     {
         var (file, line, col) = await LocateSymbolAsync("CreateSuccessResponse", kind: "Method",
             r => r["containingType"]?.Value<string>()?.Contains("RoslynService") == true);
-        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        var data = await CallAndGetDataAsync("analyze_change_impact", new
         {
             filePath = file, line, column = col,
             changeType = "removeparameter",
@@ -291,7 +298,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     {
         var (file, line, col) = await LocateSymbolAsync("CreateSuccessResponse", kind: "Method",
             r => r["containingType"]?.Value<string>()?.Contains("RoslynService") == true);
-        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        var data = await CallAndGetDataAsync("analyze_change_impact", new
         {
             filePath = file, line, column = col,
             changeType = "delete"
@@ -308,10 +315,10 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     public async Task AnalyzeChangeImpact_ChangeAccessibility_OnPrivateField_ProducesWarnings()
     {
         // Non-public symbol → impact="Accessibility change may affect visibility",
-        // severity="warning", warnings++ (Inspection.cs:1214-1219). The _workspace
+        // severity="warning", warnings++. The _workspace
         // field is private with references confined to RoslynService partials.
         var (file, line, col) = await LocateSymbolAsync("_workspace", kind: "Field");
-        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        var data = await CallAndGetDataAsync("analyze_change_impact", new
         {
             filePath = file, line, column = col,
             changeType = "changeaccessibility",
@@ -330,7 +337,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     {
         var (file, line, col) = await LocateSymbolAsync("CreateSuccessResponse", kind: "Method",
             r => r["containingType"]?.Value<string>()?.Contains("RoslynService") == true);
-        var data = await CallAndGetDataAsync("roslyn:analyze_change_impact", new
+        var data = await CallAndGetDataAsync("analyze_change_impact", new
         {
             filePath = file, line, column = col,
             changeType = "somethingUnknown",
@@ -349,9 +356,9 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     {
         // Set maxNodes very low to force truncation. LoadSolutionAsync is a
         // method with many callees; with maxNodes=2 the BFS halts past the
-        // first level. Locks truncatedByNodes (Inspection.cs:1614).
+        // first level. Locks truncatedByNodes.
         var (file, line, col) = await LocateSymbolAsync("LoadSolutionAsync", kind: "Method");
-        var data = await CallAndGetDataAsync("roslyn:get_call_graph", new
+        var data = await CallAndGetDataAsync("get_call_graph", new
         {
             filePath = file, line, column = col,
             direction = "callees",
@@ -365,7 +372,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task CheckTypeCompatibility_StringToObject_IsImplicitReference()
     {
-        var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
+        var data = await CallAndGetDataAsync("check_type_compatibility", new
         {
             sourceType = "System.String",
             targetType = "System.Object"
@@ -379,7 +386,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task CheckTypeCompatibility_IntToString_NoneConversion()
     {
-        var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
+        var data = await CallAndGetDataAsync("check_type_compatibility", new
         {
             sourceType = "System.Int32",
             targetType = "System.String"
@@ -392,7 +399,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task CheckTypeCompatibility_IntToInt_IsIdentity()
     {
-        var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
+        var data = await CallAndGetDataAsync("check_type_compatibility", new
         {
             sourceType = "System.Int32",
             targetType = "System.Int32"
@@ -405,7 +412,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task CheckTypeCompatibility_IntToLong_IsImplicitNumeric()
     {
-        var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
+        var data = await CallAndGetDataAsync("check_type_compatibility", new
         {
             sourceType = "System.Int32",
             targetType = "System.Int64"
@@ -419,7 +426,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task CheckTypeCompatibility_IntToObject_IsBoxing()
     {
-        var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
+        var data = await CallAndGetDataAsync("check_type_compatibility", new
         {
             sourceType = "System.Int32",
             targetType = "System.Object"
@@ -432,7 +439,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task CheckTypeCompatibility_ObjectToInt_IsUnboxing()
     {
-        var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
+        var data = await CallAndGetDataAsync("check_type_compatibility", new
         {
             sourceType = "System.Object",
             targetType = "System.Int32"
@@ -446,7 +453,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task CheckTypeCompatibility_LongToInt_IsExplicitNumeric()
     {
-        var data = await CallAndGetDataAsync("roslyn:check_type_compatibility", new
+        var data = await CallAndGetDataAsync("check_type_compatibility", new
         {
             sourceType = "System.Int64",
             targetType = "System.Int32"
@@ -460,7 +467,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task CheckTypeCompatibility_UnknownSourceType_ReturnsTypeNotFound()
     {
-        var error = await CallAndGetErrorAsync("roslyn:check_type_compatibility", new
+        var error = await CallAndGetErrorAsync("check_type_compatibility", new
         {
             sourceType = "System.Does.Not.Exist",
             targetType = "System.Object"
@@ -472,7 +479,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task CheckTypeCompatibility_UnknownTargetType_ReturnsTypeNotFound()
     {
-        var error = await CallAndGetErrorAsync("roslyn:check_type_compatibility", new
+        var error = await CallAndGetErrorAsync("check_type_compatibility", new
         {
             sourceType = "System.Object",
             targetType = "System.Does.Not.Exist"
@@ -484,7 +491,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task ValidateCode_WithNonExistentContextFile_ReturnsFileNotInSolution()
     {
-        var error = await CallAndGetErrorAsync("roslyn:validate_code", new
+        var error = await CallAndGetErrorAsync("validate_code", new
         {
             code = "var x = 1;",
             contextFilePath = "/path/does/not/exist/Nope.cs",
@@ -496,7 +503,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task ValidateCode_WithValidContextFile_WrapsInContextNamespaceAndCompiles()
     {
-        var data = await CallAndGetDataAsync("roslyn:validate_code", new
+        var data = await CallAndGetDataAsync("validate_code", new
         {
             code = "var x = 1;",
             contextFilePath = Fixture.RoslynServicePath,
@@ -509,7 +516,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task ValidateCode_WithNoContextAndStandaloneFalse_WrapsInMinimalClassWithSystemUsings()
     {
-        var data = await CallAndGetDataAsync("roslyn:validate_code", new
+        var data = await CallAndGetDataAsync("validate_code", new
         {
             code = "Console.WriteLine(\"hi\");",
             standalone = false
@@ -522,18 +529,22 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetOutgoingCalls_OnGetHealthCheck_IncludesGetProjectCompilationAsync()
     {
+        // Target the declaration position itself — get_outgoing_calls walks up to
+        // the enclosing MethodDeclarationSyntax, so the identifier works directly.
+        // (The previous line+1 offset pointed past the end of the brace line and
+        // only worked because out-of-range positions used to overflow silently.)
         var (file, line, col) = await LocateSymbolAsync(
             "GetHealthCheckAsync", kind: "Method");
-        var data = await CallAndGetDataAsync("roslyn:get_outgoing_calls", new
+        var data = await CallAndGetDataAsync("get_outgoing_calls", new
         {
             filePath = file,
-            line = line + 1,
+            line,
             column = col
         });
         var calls = (data["calls"] as JArray)!;
         calls.Should().NotBeEmpty();
         // GetHealthCheckAsync's body calls GetProjectCompilationAsync.
-        // The tool's shortName field is "{ContainingType}.{Method}" per Inspection.cs:897.
+        // The tool's shortName field is "{ContainingType}.{Method}".
         // The predicate `?.` chain returning false on null is safe — `.Any` returns false
         // if no entry matches, and the outer .Should().BeTrue() fails.
         calls.Any(c =>
@@ -544,7 +555,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task FindUnusedCode_DefaultArgs_EveryEntryHasFullShape()
     {
-        var data = await CallAndGetDataAsync("roslyn:find_unused_code", new
+        var data = await CallAndGetDataAsync("find_unused_code", new
         {
             projectName = (string?)null,
             includePrivate = true,
@@ -557,7 +568,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
 
         // Every returned entry must conform to the full UnusedSymbolEntry shape so
         // a field rename in the data class would fail this test. Includes the
-        // containingType and column fields the impl emits (Inspection.cs:410-420)
+        // containingType and column fields the impl emits
         // that the previous test ignored.
         foreach (var entry in unused)
         {
@@ -574,9 +585,41 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task FindUnusedCode_MethodFilter_EveryEntryIsAMethod()
+    {
+        // The per-kind narrowing must hold through the dispatcher: a Method filter
+        // reports only methods, never properties/fields/types. (Exact per-kind values
+        // are locked in-process by UnusedCodeKindFilterTests; this guards the wire path.)
+        var data = await CallAndGetDataAsync("find_unused_code", new
+        {
+            projectName = (string?)null,
+            includePrivate = true,
+            includeInternal = true,
+            symbolKindFilter = "Method",
+            maxResults = 50
+        });
+        foreach (var entry in (data["unusedSymbols"] as JArray)!)
+        {
+            entry["kind"]!.Value<string>().Should().Be("Method",
+                "the Method filter must surface only methods, never properties/fields/types");
+        }
+    }
+
+    [Fact]
+    public async Task FindUnusedCode_UnknownFilter_DispatcherReturnsInvalidParameter()
+    {
+        // §5a through the dispatcher: an unrecognized symbolKindFilter is rejected, not
+        // silently reported as a clean (zero-unused) codebase.
+        var error = await CallAndGetErrorAsync("find_unused_code",
+            new { symbolKindFilter = "Banana" }, ErrorCodes.InvalidParameter);
+        error["message"]!.Value<string>().Should().Contain("Banana",
+            "the rejection echoes the bad filter value");
+    }
+
+    [Fact]
     public async Task ValidateCode_ValidStandaloneCode_CompilesWithNoErrors()
     {
-        var data = await CallAndGetDataAsync("roslyn:validate_code", new
+        var data = await CallAndGetDataAsync("validate_code", new
         {
             code = "public class Test { public void Foo() { } }",
             standalone = true
@@ -589,7 +632,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task ValidateCode_BrokenCode_ReportsCompilerErrorIds()
     {
-        var data = await CallAndGetDataAsync("roslyn:validate_code", new
+        var data = await CallAndGetDataAsync("validate_code", new
         {
             code = "public class Test { public void Foo() { !!! invalid syntax } }",
             standalone = true
@@ -605,7 +648,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetComplexityMetrics_OnRoslynServiceFile_FindsLoadSolutionAsyncWithCyclomatic()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_complexity_metrics", new
+        var data = await CallAndGetDataAsync("get_complexity_metrics", new
         {
             filePath = Fixture.RoslynServicePath
         });
@@ -617,14 +660,34 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             m["name"]?.Value<string>() == "LoadSolutionAsync");
         loadSolution.Should().NotBeNull(
             "LoadSolutionAsync must appear in the per-method breakdown");
-        loadSolution!["metrics"]!["cyclomatic"]!.Value<int>().Should().BeGreaterOrEqualTo(1,
-            "every method has cyclomatic complexity >= 1");
+        loadSolution!["metrics"]!["cyclomatic"].Should().NotBeNull(
+            "each method entry carries its metrics; exact metric values are locked on a "
+            + "deterministic fixture in GetComplexityMetrics_OnBranchyFixtureMethod_ReturnsExactCyclomatic");
+    }
+
+    [Fact]
+    public async Task GetComplexityMetrics_OnBranchyFixtureMethod_ReturnsExactCyclomatic()
+    {
+        // ComplexityTarget.Branchy has four ifs + one loop = five decision points, so its
+        // cyclomatic is exactly 6 — a fixed value the live-source tests above cannot lock.
+        var (file, line, col) = await LocateSymbolAsync("Branchy", "Method",
+            r => r["containingType"]?.Value<string>()?.EndsWith("ComplexityTarget") == true);
+        var data = await CallAndGetDataAsync("get_complexity_metrics", new
+        {
+            filePath = file,
+            line,
+            column = col
+        });
+        data["scope"]!.Value<string>().Should().Be("method");
+        data["name"]!.Value<string>().Should().Be("Branchy");
+        data["metrics"]!["cyclomatic"]!.Value<int>().Should().Be(6,
+            "base 1 + four ifs + one loop = 6 independent paths");
     }
 
     [Fact]
     public async Task FindCircularDependencies_Project_NoCyclesInOurSolution()
     {
-        var data = await CallAndGetDataAsync("roslyn:find_circular_dependencies", new
+        var data = await CallAndGetDataAsync("find_circular_dependencies", new
         {
             level = (string?)null
         });
@@ -637,7 +700,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task FindCircularDependencies_Namespace_NoCyclesInOurSolution()
     {
-        var data = await CallAndGetDataAsync("roslyn:find_circular_dependencies", new
+        var data = await CallAndGetDataAsync("find_circular_dependencies", new
         {
             level = "namespace"
         });
@@ -649,16 +712,16 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             "the solution has multiple namespaces (SharpLensMcp, SharpLensMcp.Tests, etc.)");
         // graph must always be emitted for shape consistency with the project-level form
         (data["graph"] as JObject).Should().NotBeNull(
-            "namespace-level response must include graph (Discovery.cs:316-317)");
+            "namespace-level response must include graph");
     }
 
     [Fact]
     public async Task FindCircularDependencies_BadLevel_ReturnsInvalidParameter()
     {
-        // Discovery.cs:233-240 explicitly rejects levels other than 'project' or
+        // The impl explicitly rejects levels other than 'project' or
         // 'namespace'. Without this test, a regression that silently treated unknown
         // values as 'namespace' (the prior behavior) would go unnoticed.
-        var error = await CallAndGetErrorAsync("roslyn:find_circular_dependencies",
+        var error = await CallAndGetErrorAsync("find_circular_dependencies",
             new { level = "garbage" },
             codeContains: ErrorCodes.InvalidParameter);
         error["message"]!.Value<string>().Should().Contain("project",
@@ -669,7 +732,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetDiagnostics_SeverityInfoFilter_OnlyInfoEntries()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        var data = await CallAndGetDataAsync("get_diagnostics", new
         {
             filePath = (string?)null,
             projectPath = (string?)null,
@@ -687,10 +750,22 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             d["severity"]!.Value<string>().Should().Be("Info",
                 "the severity=Info filter must drop every non-Info entry");
         }
+        // Counts reflect the full set, not the Info-filtered page — compare to an
+        // unfiltered call: the severity filter must not change them.
+        var unfiltered = await CallAndGetDataAsync("get_diagnostics", new
+        {
+            filePath = (string?)null,
+            projectPath = (string?)null,
+            severity = (string?)null,
+            includeHidden = false,
+            runAnalyzers = false
+        });
+        data["errorCount"]!.Value<int>().Should().Be(unfiltered["errorCount"]!.Value<int>(),
+            "errorCount counts the full set, independent of the severity:Info filter");
+        data["warningCount"]!.Value<int>().Should().Be(unfiltered["warningCount"]!.Value<int>(),
+            "warningCount counts the full set, independent of the severity:Info filter");
         data["errorCount"]!.Value<int>().Should().Be(0,
-            "with severity=Info, errorCount must be 0");
-        data["warningCount"]!.Value<int>().Should().Be(0,
-            "with severity=Info, warningCount must be 0");
+            "the loaded solution is clean — zero compiler errors regardless of the filter");
     }
 
     [Fact]
@@ -699,7 +774,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
         // includeHidden controls whether Severity=Hidden diagnostics surface. Setting
         // it to true must produce a superset (or equal set) of the includeHidden=false
         // call.
-        var withoutHidden = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        var withoutHidden = await CallAndGetDataAsync("get_diagnostics", new
         {
             filePath = (string?)null,
             projectPath = (string?)null,
@@ -707,7 +782,7 @@ public class AnalysisToolsViaMcpTests : McpTestBase
             includeHidden = false,
             runAnalyzers = false
         });
-        var withHidden = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        var withHidden = await CallAndGetDataAsync("get_diagnostics", new
         {
             filePath = (string?)null,
             projectPath = (string?)null,
@@ -744,10 +819,10 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetDiagnostics_FilePathScope_RestrictsToThatFile()
     {
-        // Analysis.cs:90-99: when filePath is set, only that file's diagnostics
+        // When filePath is set, only that file's diagnostics
         // are returned. Pass RoslynService.cs and assert every diagnostic (if any)
         // has a filePath ending in RoslynService.cs.
-        var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        var data = await CallAndGetDataAsync("get_diagnostics", new
         {
             filePath = Fixture.RoslynServicePath,
             projectPath = (string?)null,
@@ -766,11 +841,11 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetProjectStructure_SummaryOnlyFalse_ReturnsFullDetails()
     {
-        // Analysis.cs:876+ (full mode) returns per-project: name, filePath,
+        // Full mode returns per-project: name, filePath,
         // language, outputPath, targetFramework, documentCount, referenceCount,
         // references[], projectReferences[], documents[]. summaryOnly=true skips
         // most of this.
-        var data = await CallAndGetDataAsync("roslyn:get_project_structure", new
+        var data = await CallAndGetDataAsync("get_project_structure", new
         {
             includeReferences = false,
             includeDocuments = false,
@@ -791,8 +866,8 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetProjectStructure_ProjectNamePatternFilter_LimitsResults()
     {
-        // Analysis.cs:830-838: regex-style glob filter on project name.
-        var data = await CallAndGetDataAsync("roslyn:get_project_structure", new
+        // Regex-style glob filter on project name.
+        var data = await CallAndGetDataAsync("get_project_structure", new
         {
             projectNamePattern = "SharpLensMcp.Tests*",
             summaryOnly = true
@@ -812,18 +887,21 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetMissingMembers_OnRoslynService_NoneMissing()
     {
-        // RoslynService is a complete partial class. Resolve the MatchesGlobPattern
-        // method body dynamically so the test pins to its real position even when
-        // the file is edited.
+        // RoslynService is a complete partial class. Pin the position to the
+        // MatchesGlobPattern declaration identifier itself — get_missing_members
+        // walks up to the enclosing TypeDeclarationSyntax from any position, and
+        // the identifier's exact (line, column) survives file edits, unlike the
+        // previous body-offset arithmetic that landed on a blank line.
         var lines = File.ReadAllLines(Fixture.RoslynServicePath);
-        var methodLine = Array.FindIndex(lines, l => l.Contains("MatchesGlobPattern"));
+        var methodLine = Array.FindIndex(lines, l => l.Contains("bool MatchesGlobPattern"));
         methodLine.Should().BeGreaterThan(-1);
+        var methodColumn = lines[methodLine].IndexOf("MatchesGlobPattern", StringComparison.Ordinal);
 
-        var data = await CallAndGetDataAsync("roslyn:get_missing_members", new
+        var data = await CallAndGetDataAsync("get_missing_members", new
         {
             filePath = Fixture.RoslynServicePath,
-            line = methodLine + 4,   // inside the method body
-            column = 10
+            line = methodLine,
+            column = methodColumn
         });
         data["typeName"]!.Value<string>()!.Should().EndWith("RoslynService");
         data["isAbstract"]!.Value<bool>().Should().BeFalse();

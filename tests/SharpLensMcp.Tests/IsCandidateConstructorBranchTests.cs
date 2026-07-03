@@ -4,8 +4,8 @@ using Xunit;
 
 namespace SharpLensMcp.Tests;
 
-// In-memory test for the IsCandidate Constructor branch at Quality.cs:206-208.
-// The Ordinary || Constructor permit-list at line 206-207 is what lets explicit
+// In-memory test for the IsCandidate Constructor branch.
+// The Ordinary || Constructor permit-list is what lets explicit
 // public ctors surface in find_untested_code's uncovered list — a regression
 // here would silently drop ctors from the report.
 public class IsCandidateConstructorBranchTests
@@ -46,7 +46,7 @@ namespace Production
             return name.Contains("CtorTarget.CtorTarget()") || name.EndsWith(".CtorTarget()");
         });
         ctorEntry.Should().NotBeNull(
-            "the public CtorTarget() constructor must surface as uncovered — IsCandidate's `m.MethodKind == MethodKind.Constructor` branch (Quality.cs:206-207) is what permits it");
+            "the public CtorTarget() constructor must surface as uncovered — IsCandidate's `m.MethodKind == MethodKind.Constructor` branch is what permits it");
         ctorEntry!["kind"]!.Value<string>().Should().Be("Method",
             "constructors are IMethodSymbol → ISymbol.Kind == Method");
         ctorEntry["accessibility"]!.Value<string>().Should().Be("Public");

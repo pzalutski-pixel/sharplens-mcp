@@ -9,6 +9,12 @@ namespace SharpLensMcp;
 // a structured -32602 response.
 internal readonly struct JsonRpcParameters
 {
+    // Parameter-access probe for the schema⇄dispatcher parity test: when set,
+    // every accessor records the parameter name it was asked for, and Required
+    // accessors return defaults instead of throwing so one probe call records a
+    // dispatch arm's COMPLETE read-set. Null in production — behavior unchanged.
+    internal static readonly AsyncLocal<HashSet<string>?> ProbeLog = new();
+
     private readonly JsonObject? _args;
     private readonly string _toolName;
 
@@ -18,12 +24,20 @@ internal readonly struct JsonRpcParameters
         _toolName = toolName;
     }
 
+    // The tool these arguments belong to, so nested-array parsers can name it in
+    // their -32602 messages the same way the scalar accessors here do.
+    public string ToolName => _toolName;
+
     public T Required<T>(string name)
     {
+        ProbeLog.Value?.Add(name);
         var node = _args?[name];
         if (node == null)
+        {
+            if (ProbeLog.Value != null) return default!;
             throw new JsonRpcInvalidParamsException(
                 $"Missing required parameter '{name}' for tool '{_toolName}'");
+        }
         try
         {
             return node.GetValue<T>();
@@ -37,6 +51,7 @@ internal readonly struct JsonRpcParameters
 
     public T? Optional<T>(string name) where T : class
     {
+        ProbeLog.Value?.Add(name);
         var node = _args?[name];
         if (node == null) return null;
         try
@@ -52,6 +67,7 @@ internal readonly struct JsonRpcParameters
 
     public T? OptionalStruct<T>(string name) where T : struct
     {
+        ProbeLog.Value?.Add(name);
         var node = _args?[name];
         if (node == null) return null;
         try
@@ -67,6 +83,7 @@ internal readonly struct JsonRpcParameters
 
     public T Optional<T>(string name, T fallback) where T : struct
     {
+        ProbeLog.Value?.Add(name);
         var node = _args?[name];
         if (node == null) return fallback;
         try
@@ -87,6 +104,7 @@ internal readonly struct JsonRpcParameters
 
     public List<string>? OptionalStringArray(string name)
     {
+        ProbeLog.Value?.Add(name);
         var node = _args?[name];
         if (node == null) return null;
         if (node is not JsonArray arr)
@@ -117,11 +135,17 @@ internal readonly struct JsonRpcParameters
 
     public List<string> RequiredStringArray(string name)
     {
-        return OptionalStringArray(name)
-            ?? throw new JsonRpcInvalidParamsException(
-                $"Missing required array parameter '{name}' for tool '{_toolName}'");
+        var result = OptionalStringArray(name);
+        if (result != null) return result;
+        if (ProbeLog.Value != null) return new List<string>();
+        throw new JsonRpcInvalidParamsException(
+            $"Missing required array parameter '{name}' for tool '{_toolName}'");
     }
 
     // Raw access for callers that need to parse complex shapes (e.g., array of objects).
-    public JsonNode? Raw(string name) => _args?[name];
+    public JsonNode? Raw(string name)
+    {
+        ProbeLog.Value?.Add(name);
+        return _args?[name];
+    }
 }

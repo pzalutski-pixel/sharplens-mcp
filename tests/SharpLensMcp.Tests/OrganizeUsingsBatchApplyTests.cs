@@ -25,43 +25,59 @@ public class OrganizeUsingsBatchApplyTests : IAsyncLifetime
 
         _service = new RoslynService();
         var result = await _service.LoadSolutionAsync(_solutionPath);
-        JObject.FromObject(result)["success"]?.Value<bool>().Should().BeTrue();
+        var loadJson = JObject.FromObject(result);
+        loadJson["success"].Should().NotBeNull();
+        loadJson["success"]!.Value<bool>().Should().BeTrue();
     }
 
     public Task DisposeAsync()
     {
-        if (_originalFixtureContent != null && _fixturePath != null && File.Exists(_fixturePath))
+        // Always restore the fixture to its committed content — recreating it even
+        // if a test deleted it — and assert the restore physically landed, so a
+        // swallowed write can't leave the tree dirty for the next serialized test.
+        if (_originalFixtureContent != null && _fixturePath != null)
         {
             File.WriteAllText(_fixturePath, _originalFixtureContent);
+            File.ReadAllText(_fixturePath).Should().Be(_originalFixtureContent,
+                "the fixture must be restored to its committed content after the test");
         }
         return Task.CompletedTask;
     }
 
     [Fact]
-    public async Task Apply_OnTestProject_SortsUsingsOnDisk()
+    public async Task Apply_OnTestProject_RemovesRedundantAndSortsUsingsOnDisk()
     {
-        // Apply across the whole tests project. The fixture has unsorted usings
-        // (Microsoft first, then mixed System.*). After apply, System.* must
-        // appear BEFORE Microsoft.* per Analysis.cs:981-984.
+        // Apply across the tests project, which has ImplicitUsings enabled — so
+        // the compiler marks the fixture's `using System;` and
+        // `using System.Collections.Generic;` CS8019-redundant and the tool must
+        // REMOVE them, while the genuinely needed System.Text (not implicit) and
+        // Microsoft.CodeAnalysis survive, sorted System-first.
         var result = await _service.OrganizeUsingsBatchAsync(
             projectName: "SharpLensMcp.Tests",
             filePattern: "UnsortedUsingsFixture.cs",
             preview: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
         var data = json["data"]!;
-        data["preview"]?.Value<bool>().Should().BeFalse();
-        data["filesWithChanges"]?.Value<int>().Should().BeGreaterOrEqualTo(1,
+        data["preview"].Should().NotBeNull();
+        data["preview"]!.Value<bool>().Should().BeFalse();
+        data["filesWithChanges"].Should().NotBeNull();
+        data["filesWithChanges"]!.Value<int>().Should().BeGreaterOrEqualTo(1,
             "the fixture file's unsorted usings must show up as changes");
 
-        // Verify on disk: System.* now appears before Microsoft.*.
         var diskContent = File.ReadAllText(_fixturePath);
-        var systemIdx = diskContent.IndexOf("using System;");
+        diskContent.Should().NotContain("using System;",
+            "ImplicitUsings already provides System — the compiler flags the explicit directive CS8019 and the tool removes it");
+        diskContent.Should().NotContain("using System.Collections.Generic;",
+            "ImplicitUsings already provides System.Collections.Generic");
+
+        var systemTextIdx = diskContent.IndexOf("using System.Text;");
         var microsoftIdx = diskContent.IndexOf("using Microsoft.CodeAnalysis;");
-        systemIdx.Should().BeGreaterThan(-1);
-        microsoftIdx.Should().BeGreaterThan(-1);
-        systemIdx.Should().BeLessThan(microsoftIdx,
-            "System-prefixed usings sort to bucket 0; Microsoft to bucket 1");
+        systemTextIdx.Should().BeGreaterThan(-1, "System.Text is not implicit and is used by the fixture");
+        microsoftIdx.Should().BeGreaterThan(-1, "Microsoft.CodeAnalysis is used by the fixture");
+        systemTextIdx.Should().BeLessThan(microsoftIdx,
+            "System root namespaces sort before other plain usings");
     }
 }

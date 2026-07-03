@@ -122,9 +122,18 @@ public class Target
         diagnostics.Any(d => d["id"]?.Value<string>() == "TEST0002").Should().BeFalse();
 
         data["errorCount"]!.Value<int>().Should().Be(diagnostics.Count,
-            "with severity=Error, errorCount must equal the array length");
-        data["warningCount"]!.Value<int>().Should().Be(0,
-            "with severity=Error, warningCount must be 0");
+            "every error is on the page under severity=Error, so errorCount equals its length");
+
+        // The health counts reflect the FULL set, not the filtered page, so they
+        // match an unfiltered call. warningCount must NOT collapse to 0.
+        var unfiltered = JObject.FromObject(await service.GetDiagnosticsAsync(
+            filePath: null, projectPath: null, severity: null, includeHidden: false, runAnalyzers: true))["data"]!;
+        data["errorCount"]!.Value<int>().Should().Be(unfiltered["errorCount"]!.Value<int>(),
+            "errorCount counts the full set, independent of the severity filter");
+        data["warningCount"]!.Value<int>().Should().Be(unfiltered["warningCount"]!.Value<int>(),
+            "warningCount counts the full set — a severity:Error filter must not zero it");
+        data["warningCount"]!.Value<int>().Should().BeGreaterThan(0,
+            "the fixture has warnings, which the full-set count must reflect");
     }
 
     [Fact]
@@ -151,8 +160,13 @@ public class Target
         diagnostics.Any(d => d["id"]?.Value<string>() == "TEST0002").Should().BeFalse(
             "Info-severity TEST0002 must not appear");
 
-        data["errorCount"]!.Value<int>().Should().Be(0,
-            "with severity=Warning, errorCount must be 0");
+        // errorCount counts the full set — a severity:Warning filter must not zero it.
+        var unfiltered = JObject.FromObject(await service.GetDiagnosticsAsync(
+            filePath: null, projectPath: null, severity: null, includeHidden: false, runAnalyzers: true))["data"]!;
+        data["errorCount"]!.Value<int>().Should().Be(unfiltered["errorCount"]!.Value<int>(),
+            "errorCount counts the full set, independent of the severity filter");
+        data["errorCount"]!.Value<int>().Should().BeGreaterThan(0,
+            "the fixture has a compiler error, which the full-set count must reflect");
     }
 
     [Fact]
@@ -179,8 +193,17 @@ public class Target
         diagnostics.Any(d => d["id"]?.Value<string>() == "TEST0001").Should().BeFalse(
             "Warning-severity TEST0001 must not appear");
 
-        data["errorCount"]!.Value<int>().Should().Be(0);
-        data["warningCount"]!.Value<int>().Should().Be(0);
+        // Counts reflect the full set, not the Info-filtered page.
+        var unfiltered = JObject.FromObject(await service.GetDiagnosticsAsync(
+            filePath: null, projectPath: null, severity: null, includeHidden: false, runAnalyzers: true))["data"]!;
+        data["errorCount"]!.Value<int>().Should().Be(unfiltered["errorCount"]!.Value<int>(),
+            "errorCount counts the full set, independent of the severity:Info filter");
+        data["warningCount"]!.Value<int>().Should().Be(unfiltered["warningCount"]!.Value<int>(),
+            "warningCount counts the full set, independent of the severity:Info filter");
+        data["errorCount"]!.Value<int>().Should().BeGreaterThan(0,
+            "the fixture has a compiler error, which the full-set count must reflect");
+        data["warningCount"]!.Value<int>().Should().BeGreaterThan(0,
+            "the fixture has warnings, which the full-set count must reflect");
     }
 
     [Fact]

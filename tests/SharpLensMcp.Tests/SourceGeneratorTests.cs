@@ -57,6 +57,30 @@ public class SourceGeneratorTests : RoslynServiceTestBase
     }
 
     [Fact]
+    public async Task GetSourceGenerators_ReportsElapsedMsPerGenerator()
+    {
+        // "Which generator makes my build slow": every generator entry carries
+        // the wall-clock its run cost, from GeneratorDriver.GetTimingInfo on a
+        // dedicated timing run with the same driver configuration the server
+        // compiles with.
+        var result = await Service.GetSourceGeneratorsAsync(projectName: TestProjectName);
+        AssertSuccess(result);
+        var projects = (GetData(result)["projects"] as JArray)!;
+        var testProject = projects.First(p => p["projectName"]!.Value<string>() == TestProjectName);
+
+        var generators = (testProject["generators"] as JArray)!;
+        generators.Should().NotBeEmpty("the [JsonSerializable] fixture activates the JSON source generator");
+        foreach (var generator in generators)
+        {
+            generator["elapsedMs"]!.Type.Should().NotBe(JTokenType.Null,
+                $"every generator must report its timing; '{generator["typeName"]}' did not");
+            generator["elapsedMs"]!.Value<double>().Should().BeGreaterThanOrEqualTo(0);
+        }
+        generators.Select(g => g["typeName"]!.Value<string>()).Should().Contain(
+            t => t!.Contains("Json"), "the JSON source generator must be among the timed entries");
+    }
+
+    [Fact]
     public async Task GetSourceGenerators_GeneratorsArray_LocksJsonSourceGeneratorTypeName()
     {
         // The fixture's [JsonSerializable] attribute on FixtureJsonContext is what
@@ -154,17 +178,17 @@ public class SourceGeneratorTests : RoslynServiceTestBase
     public async Task GetTypeOverview_OnFixtureRecord_ClassifiesAsRecord()
     {
         // The previous version of this test asserted match["typeKind"] == "Record" on
-        // a search_symbols result, but the search_symbols entry shape (Navigation.cs:661-674)
+        // a search_symbols result, but the search_symbols entry shape
         // doesn't include a typeKind field — only `kind` ("NamedType" for all types).
         // The `?.Value<string>().Should().Be(...)` chain silently passed because the
         // null-conditional short-circuits when the field is missing. Switched to
-        // get_type_overview which DOES emit typeKind (Compound.cs:313).
+        // get_type_overview which DOES emit typeKind.
         var result = await Service.GetTypeOverviewAsync("FixtureRecord");
         AssertSuccess(result);
         var data = GetData(result);
         data["typeName"].Should().NotBeNull();
         data["typeName"]!.Value<string>().Should().Contain("FixtureRecord");
-        // GetTypeKindString in RoslynService.cs:59 classifies records as Record (not Class).
+        // GetTypeKindString classifies records as Record (not Class).
         data["typeKind"].Should().NotBeNull();
         data["typeKind"]!.Value<string>().Should().Be("Record", "positional records must be classified as Record, not Class");
     }

@@ -26,7 +26,7 @@ public class UntestedCodeTests : RoslynServiceTestBase
         // Locks the response-envelope metadata. NotBeNull-first defeats the
         // null-conditional silent-pass on every accessor.
         data["productionProject"]!.Value<string>().Should().Be("SharpLensMcp.Tests",
-            "the impl must pick the project requested by projectName (Quality.cs:137)");
+            "the impl must pick the project requested by projectName");
         data["testMethodCount"]!.Value<int>().Should().BeGreaterThan(0,
             "the test project has many [Fact] methods — IsTestMethod must match at least one");
         data["reachableSymbolCount"]!.Value<int>().Should().BeGreaterThan(
@@ -34,7 +34,7 @@ public class UntestedCodeTests : RoslynServiceTestBase
             "BFS-from-tests must reach AT LEAST one production symbol beyond the test methods themselves (CoveredByTest etc.)");
 
         // testProjectsScanned tracks every project where IsTestMethod found a hit
-        // (Quality.cs:90, 108). The fixture's [Fact] methods live in SharpLensMcp.Tests,
+        // The fixture's [Fact] methods live in SharpLensMcp.Tests,
         // so the set must include that name.
         var scanned = (data["testProjectsScanned"] as JArray)!;
         scanned.Select(s => s.Value<string>()).Should().Contain("SharpLensMcp.Tests",
@@ -61,13 +61,13 @@ public class UntestedCodeTests : RoslynServiceTestBase
         names.Should().NotContain(n => n.Contains("CoverageTarget.ChainedFromTest"),
             "ChainedFromTest is the entry called by ChainedFromTest_Test");
 
-        // Test methods themselves must NOT appear (Quality.cs:158 filters IsTestMethod).
+        // Test methods themselves must NOT appear (the impl filters IsTestMethod).
         names.Should().NotContain(n => n.Contains("CoverageTargetTests.CoveredByTest_Test"),
             "test methods are excluded from the production-surface uncovered list");
         names.Should().NotContain(n => n.Contains("CoverageTargetTests.ChainedFromTest_Test"),
             "test methods are excluded from the production-surface uncovered list");
 
-        // Per-entry shape on NeverCalled (Quality.cs:62-70). Without this lock,
+        // Per-entry shape on NeverCalled. Without this lock,
         // a regression that drops kind/accessibility/complexity/location/reason
         // would still pass every name-only assertion above.
         var neverCalled = uncovered.First(s =>
@@ -79,6 +79,42 @@ public class UntestedCodeTests : RoslynServiceTestBase
         neverCalled["location"].Should().NotBeNull(
             "every uncovered entry must surface its declaration location");
         neverCalled["reason"]!.Value<string>().Should().Be("Not reachable from any test method",
-            "the impl's documented reason string at Quality.cs:69 must round-trip verbatim");
+            "the impl's documented reason string must round-trip verbatim");
+    }
+
+    [Fact]
+    public async Task FindUntestedCode_SeedsOverridesInterfacesAndCollectsMethodGroupsAndBareReads()
+    {
+        var result = await Service.FindUntestedCodeAsync(
+            projectName: "SharpLensMcp.Tests",
+            includeProperties: true,
+            includeInternal: false,
+            maxResults: 500);
+        AssertSuccess(result);
+
+        var uncovered = (GetData(result)["uncoveredSymbols"] as JArray)!;
+        var names = uncovered.Select(s => s["fullName"]!.Value<string>()!).ToList();
+
+        // A11: the cyclomatic estimate counts && and the ternary operator —
+        // 1 + if + && + ?: = 4. Before, && was omitted and this read 3.
+        var complex = uncovered.First(s =>
+            s["fullName"]!.Value<string>()!.Contains("CoverageTarget.NeverCalledComplex"));
+        complex["complexity"]!.Value<int>().Should().Be(4,
+            "the && operator and the ternary are each an independent path");
+
+        // A10: a base virtual exercised only through a reached override, and an
+        // interface member exercised only through its reached implementation, must
+        // both be seeded reachable rather than reported untested.
+        names.Should().NotContain(n => n.Contains("CoverageBase.VirtualComputed"),
+            "the base virtual is reached through the derived override that a test exercises");
+        names.Should().NotContain(n => n.Contains("ICoverageContract.ContractMethod"),
+            "the interface member is reached through the implementation a test exercises");
+
+        // A12: a method-group reference and a bare unqualified property read carry
+        // no invocation/member-access node, but the collector must still mark them.
+        names.Should().NotContain(n => n.Contains("CoverageImplementor.MethodGroupTarget"),
+            "the method group passed as a delegate is a real reference");
+        names.Should().NotContain(n => n.Contains("CoverageImplementor.PublicSeed"),
+            "the bare unqualified property read is a real reference");
     }
 }

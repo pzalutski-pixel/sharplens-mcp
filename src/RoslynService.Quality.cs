@@ -35,14 +35,20 @@ public partial class RoslynService
         string? projectName = null,
         bool includeProperties = true,
         bool includeInternal = false,
-        int maxResults = 50)
+        int maxResults = 50,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
+        if (projectName != null && !_solution!.Projects.Any(
+                p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase)))
+        {
+            return ProjectNotFoundError(projectName);
+        }
 
         UntestedCodeData data;
         try
         {
-            data = await FindUntestedCodeDataAsync(projectName, includeProperties, includeInternal, maxResults);
+            data = await FindUntestedCodeDataAsync(projectName, includeProperties, includeInternal, maxResults, cancellationToken);
         }
         catch (ArgumentException ex)
         {
@@ -83,19 +89,26 @@ public partial class RoslynService
         string? projectName,
         bool includeProperties,
         bool includeInternal,
-        int maxResults)
+        int maxResults,
+        CancellationToken cancellationToken = default)
     {
         // Step 1: enumerate test methods across the whole solution.
         var testMethods = new List<IMethodSymbol>();
         var testProjectsScanned = new HashSet<string>(StringComparer.Ordinal);
         foreach (var project in _solution!.Projects)
         {
-            var compilation = await GetProjectCompilationAsync(project);
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
 
             var found = 0;
             foreach (var type in GetAllNamedTypes(compilation))
             {
+                // This project's own source types only: GetAllNamedTypes includes every
+                // referenced assembly, so without the filter a test method declared in a
+                // referenced test project is counted again here, and the BCL is scanned
+                // for test attributes it cannot carry.
+                if (!SymbolEqualityComparer.Default.Equals(type.ContainingAssembly, compilation.Assembly)) continue;
+
                 foreach (var method in type.GetMembers().OfType<IMethodSymbol>())
                 {
                     if (IsTestMethod(method))
@@ -108,26 +121,36 @@ public partial class RoslynService
             if (found > 0) testProjectsScanned.Add(project.Name);
         }
 
-        // Step 2: BFS the reachable set from every test method.
+        // Step 2: BFS the reachable set from every test method. `walked` gates
+        // body traversal; `reachable` is the answer set and additionally carries
+        // the override/interface declarations a reached method dispatches through.
         var reachable = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+        var walked = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
         var queue = new Queue<IMethodSymbol>();
-        foreach (var tm in testMethods)
+
+        // A reached method also exercises the base methods it overrides and the
+        // interface members it implements: those declarations are invoked through
+        // this method's dispatch, so seed them reachable (a base virtual called
+        // via `base.X()` is still enqueued for its own body through the normal
+        // callee pass). Without this, a base virtual reached only via an override,
+        // or an interface member reached only via its implementation, reads as
+        // untested. find_tests shares this seeding so the two tools agree on what
+        // a test covers.
+        void MarkReached(IMethodSymbol method)
         {
-            if (reachable.Add(tm.OriginalDefinition)) queue.Enqueue(tm);
+            reachable.Add(method.OriginalDefinition);
+            SeedRelatedDeclarations(method, reachable);
+            if (walked.Add(method.OriginalDefinition)) queue.Enqueue(method);
         }
+
+        foreach (var tm in testMethods) MarkReached(tm);
         while (queue.Count > 0)
         {
             var current = queue.Dequeue();
-            foreach (var callee in await CollectReferencedSymbolsAsync(current))
+            foreach (var callee in await CollectReferencedSymbolsAsync(current, cancellationToken))
             {
-                if (callee is IMethodSymbol mc && reachable.Add(mc.OriginalDefinition))
-                {
-                    queue.Enqueue(mc);
-                }
-                else
-                {
-                    reachable.Add(callee.OriginalDefinition);
-                }
+                if (callee is IMethodSymbol mc) MarkReached(mc);
+                else reachable.Add(callee.OriginalDefinition);
             }
         }
 
@@ -141,7 +164,7 @@ public partial class RoslynService
             throw new ArgumentException($"Project not found: {projectName}");
         }
 
-        var targetCompilation = await GetProjectCompilationAsync(targetProject);
+        var targetCompilation = await GetProjectCompilationAsync(targetProject, cancellationToken);
         if (targetCompilation == null)
         {
             throw new ArgumentException($"Could not get compilation for project '{targetProject.Name}'");
@@ -150,6 +173,9 @@ public partial class RoslynService
         var uncovered = new List<(ISymbol symbol, int complexity)>();
         foreach (var type in GetAllNamedTypes(targetCompilation))
         {
+            // Cheap assembly check first so the BCL types in the merged global
+            // namespace never reach the per-type file-path comparison.
+            if (!SymbolEqualityComparer.Default.Equals(type.ContainingAssembly, targetCompilation.Assembly)) continue;
             if (!IsInTargetProject(type, targetProject)) continue;
             foreach (var member in type.GetMembers())
             {
@@ -158,12 +184,21 @@ public partial class RoslynService
                 if (member is IMethodSymbol m && IsTestMethod(m)) continue;
                 if (reachable.Contains(member.OriginalDefinition)) continue;
 
-                var complexity = member is IMethodSymbol ms ? await EstimateCyclomaticAsync(ms) : 1;
+                var complexity = member is IMethodSymbol ms ? await EstimateCyclomaticAsync(ms, cancellationToken) : 1;
                 uncovered.Add((member, complexity));
             }
         }
 
-        uncovered.Sort((a, b) => b.complexity.CompareTo(a.complexity));
+        // Descending by complexity, then by display name as a stable tie-break so the
+        // set kept at the maxResults boundary is deterministic for equal-complexity
+        // members (List.Sort is not stable on its own).
+        uncovered.Sort((a, b) =>
+        {
+            var byComplexity = b.complexity.CompareTo(a.complexity);
+            return byComplexity != 0
+                ? byComplexity
+                : string.CompareOrdinal(a.symbol.ToDisplayString(), b.symbol.ToDisplayString());
+        });
         var totalCount = uncovered.Count;
         var capped = uncovered.Take(maxResults).Select(u => new UncoveredSymbolEntry(
             FullName: u.symbol.ToDisplayString(),
@@ -222,22 +257,49 @@ public partial class RoslynService
             string.Equals(d.FilePath, path, PathComparison));
     }
 
-    // Conservative cyclomatic estimate from declaration syntax: 1 + count of branching nodes.
-    private async Task<int> EstimateCyclomaticAsync(IMethodSymbol method)
+    // Conservative cyclomatic estimate from declaration syntax. Delegates to the
+    // shared CalculateCyclomaticComplexity so this estimate and get_complexity_metrics
+    // never diverge (the same method must yield the same number from both tools).
+    private async Task<int> EstimateCyclomaticAsync(IMethodSymbol method, CancellationToken cancellationToken = default)
     {
         var declRef = method.DeclaringSyntaxReferences.FirstOrDefault();
         if (declRef == null) return 1;
-        var syntax = await declRef.GetSyntaxAsync();
-        var branches = syntax.DescendantNodes().Count(n =>
-            n is IfStatementSyntax
-            || n is WhileStatementSyntax
-            || n is ForStatementSyntax
-            || n is ForEachStatementSyntax
-            || n is CaseSwitchLabelSyntax
-            || n is CasePatternSwitchLabelSyntax
-            || n is ConditionalExpressionSyntax
-            || n is CatchClauseSyntax);
-        return 1 + branches;
+        var syntax = await declRef.GetSyntaxAsync(cancellationToken);
+        return CalculateCyclomaticComplexity(syntax);
+    }
+
+    // Seeds the declarations a reached method dispatches through: every base
+    // method in its override chain and every interface member it implements
+    // (explicitly or implicitly). Shared by find_untested_code and find_tests so
+    // both treat a base virtual reached only via an override — or an interface
+    // member reached only via its implementation — as exercised by the test that
+    // reaches the override. Only adds to the reachable set; body traversal of the
+    // seeded declarations happens through the normal callee pass when they are
+    // themselves invoked (e.g. via `base.X()`).
+    private static void SeedRelatedDeclarations(IMethodSymbol method, HashSet<ISymbol> reachable)
+    {
+        for (var baseMethod = method.OverriddenMethod; baseMethod != null; baseMethod = baseMethod.OverriddenMethod)
+        {
+            reachable.Add(baseMethod.OriginalDefinition);
+        }
+        foreach (var impl in method.ExplicitInterfaceImplementations)
+        {
+            reachable.Add(impl.OriginalDefinition);
+        }
+        var containingType = method.ContainingType;
+        if (containingType == null) return;
+        foreach (var iface in containingType.AllInterfaces)
+        {
+            foreach (var ifaceMember in iface.GetMembers())
+            {
+                if (ifaceMember is not IMethodSymbol and not IPropertySymbol) continue;
+                if (SymbolEqualityComparer.Default.Equals(
+                        containingType.FindImplementationForInterfaceMember(ifaceMember), method))
+                {
+                    reachable.Add(ifaceMember.OriginalDefinition);
+                }
+            }
+        }
     }
 
     // Collects every method/property/field symbol the given method's body references.
@@ -248,32 +310,40 @@ public partial class RoslynService
     // the workspace's default model, which on generator-using projects has DIFFERENT symbol
     // identity than our augmented compilation — SymbolEqualityComparer.Default returns false
     // across compilations, breaking the reachable-set membership check downstream.
-    private async Task<IEnumerable<ISymbol>> CollectReferencedSymbolsAsync(IMethodSymbol method)
+    private async Task<IEnumerable<ISymbol>> CollectReferencedSymbolsAsync(
+        IMethodSymbol method, CancellationToken cancellationToken = default)
     {
         var result = new List<ISymbol>();
         foreach (var declRef in method.DeclaringSyntaxReferences)
         {
-            var syntax = await declRef.GetSyntaxAsync();
+            var syntax = await declRef.GetSyntaxAsync(cancellationToken);
             var document = _solution!.GetDocument(declRef.SyntaxTree);
             if (document == null) continue;
 
-            var compilation = await GetProjectCompilationAsync(document.Project);
+            var compilation = await GetProjectCompilationAsync(document.Project, cancellationToken);
             if (compilation == null) continue;
             var semanticModel = compilation.GetSemanticModel(declRef.SyntaxTree);
 
             foreach (var inv in syntax.DescendantNodes().OfType<InvocationExpressionSyntax>())
             {
-                var sym = semanticModel.GetSymbolInfo(inv).Symbol;
+                var sym = semanticModel.GetSymbolInfo(inv, cancellationToken).Symbol;
                 if (sym != null) result.Add(sym.OriginalDefinition);
             }
-            foreach (var mem in syntax.DescendantNodes().OfType<MemberAccessExpressionSyntax>())
+            // Every simple name that binds to a method, property, or field — this
+            // subsumes member accesses (the `.Name` part) and additionally captures
+            // method-group references (delegate passing) and bare unqualified
+            // property/field reads, which carry no invocation or member-access node.
+            foreach (var name in syntax.DescendantNodes().OfType<SimpleNameSyntax>())
             {
-                var sym = semanticModel.GetSymbolInfo(mem).Symbol;
-                if (sym != null) result.Add(sym.OriginalDefinition);
+                if (semanticModel.GetSymbolInfo(name, cancellationToken).Symbol is
+                    (IMethodSymbol or IPropertySymbol or IFieldSymbol) and { } sym)
+                {
+                    result.Add(sym.OriginalDefinition);
+                }
             }
             foreach (var oc in syntax.DescendantNodes().OfType<ObjectCreationExpressionSyntax>())
             {
-                var sym = semanticModel.GetSymbolInfo(oc).Symbol;
+                var sym = semanticModel.GetSymbolInfo(oc, cancellationToken).Symbol;
                 if (sym != null) result.Add(sym.OriginalDefinition);
             }
         }
@@ -286,10 +356,16 @@ public partial class RoslynService
         string? projectName = null,
         int minEfferentCoupling = 20,
         int minMembers = 20,
-        int maxResults = 20)
+        int maxResults = 20,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
-        var data = await FindGodObjectsDataAsync(projectName, minEfferentCoupling, minMembers, maxResults);
+        if (projectName != null && !_solution!.Projects.Any(
+                p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase)))
+        {
+            return ProjectNotFoundError(projectName);
+        }
+        var data = await FindGodObjectsDataAsync(projectName, minEfferentCoupling, minMembers, maxResults, cancellationToken);
         return CreateSuccessResponse(
             data: new
             {
@@ -321,7 +397,8 @@ public partial class RoslynService
         string? projectName,
         int minEfferentCoupling,
         int minMembers,
-        int maxResults)
+        int maxResults,
+        CancellationToken cancellationToken = default)
     {
         var projectsToScan = string.IsNullOrEmpty(projectName)
             ? _solution!.Projects
@@ -338,7 +415,7 @@ public partial class RoslynService
         var allTypes = new List<INamedTypeSymbol>();
         foreach (var project in projectsToScan)
         {
-            var compilation = await GetProjectCompilationAsync(project);
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
             foreach (var type in GetAllNamedTypes(compilation))
             {
@@ -348,78 +425,15 @@ public partial class RoslynService
             }
         }
 
-        // Step 2: per type, compute efferent (outbound) set in one pass; afferent (inbound)
-        // by inversion. Storing OriginalDefinition keeps cross-compilation comparisons stable.
-        var efferent = new Dictionary<INamedTypeSymbol, HashSet<INamedTypeSymbol>>(SymbolEqualityComparer.Default);
-        foreach (var type in allTypes)
-        {
-            efferent[(INamedTypeSymbol)type.OriginalDefinition] =
-                new HashSet<INamedTypeSymbol>(SymbolEqualityComparer.Default);
-        }
-
-        foreach (var type in allTypes)
-        {
-            var key = (INamedTypeSymbol)type.OriginalDefinition;
-            var outboundSet = efferent[key];
-
-            foreach (var member in type.GetMembers())
-            {
-                CollectTypeDependencies(member, outboundSet, key);
-            }
-
-            // Inspect bodies for usages. Precise pass only: only count types appearing in
-            // semantically meaningful positions — object creation, typeof, cast targets,
-            // method-call receivers, and local-variable type declarations. The previous
-            // loose pass (every IdentifierNameSyntax that resolves to a type) inflated
-            // counts by including nameof() args, generic type parameters in constraints,
-            // and using-directive-brought-into-scope types that the class doesn't really
-            // "depend on" in a coupling sense.
-            foreach (var declRef in type.DeclaringSyntaxReferences)
-            {
-                var syntax = await declRef.GetSyntaxAsync();
-                var document = _solution!.GetDocument(declRef.SyntaxTree);
-                if (document == null) continue;
-                var compilation = await GetProjectCompilationAsync(document.Project);
-                if (compilation == null) continue;
-                var semanticModel = compilation.GetSemanticModel(declRef.SyntaxTree);
-
-                foreach (var node in syntax.DescendantNodes())
-                {
-                    switch (node)
-                    {
-                        case ObjectCreationExpressionSyntax oc:
-                            AddTypeFromSymbol(semanticModel.GetTypeInfo(oc).Type, outboundSet, key);
-                            break;
-                        case ImplicitObjectCreationExpressionSyntax ioc:
-                            AddTypeFromSymbol(semanticModel.GetTypeInfo(ioc).Type, outboundSet, key);
-                            break;
-                        case TypeOfExpressionSyntax t:
-                            AddTypeFromSymbol(semanticModel.GetTypeInfo(t.Type).Type, outboundSet, key);
-                            break;
-                        case CastExpressionSyntax cast:
-                            AddTypeFromSymbol(semanticModel.GetTypeInfo(cast.Type).Type, outboundSet, key);
-                            break;
-                        case VariableDeclarationSyntax vd when vd.Type is not null:
-                            AddTypeFromSymbol(semanticModel.GetTypeInfo(vd.Type).Type, outboundSet, key);
-                            break;
-                        case InvocationExpressionSyntax inv:
-                            // The receiver's type is a real dependency (we're calling its members).
-                            if (semanticModel.GetSymbolInfo(inv).Symbol is IMethodSymbol calledMethod
-                                && calledMethod.ContainingType is INamedTypeSymbol ct)
-                            {
-                                AddTypeFromSymbol(ct, outboundSet, key);
-                            }
-                            break;
-                    }
-                }
-            }
-        }
+        // Step 2: per type, compute the efferent (outbound) edge set in one pass;
+        // afferent (inbound) by inversion.
+        var efferent = await CollectTypeDependencyEdgesAsync(allTypes, includeMetadataTargets: false, cancellationToken);
 
         // Step 3: invert for afferent counts.
         var afferentCount = new Dictionary<INamedTypeSymbol, int>(SymbolEqualityComparer.Default);
         foreach (var (source, outboundSet) in efferent)
         {
-            foreach (var target in outboundSet)
+            foreach (var target in outboundSet.Keys)
             {
                 afferentCount[target] = afferentCount.GetValueOrDefault(target) + 1;
             }
@@ -440,7 +454,15 @@ public partial class RoslynService
             allCandidates.Add((type, eff, aff, memberCount, score));
         }
 
-        allCandidates.Sort((a, b) => b.score.CompareTo(a.score));
+        // Descending by score, then by type name as a stable tie-break so the set kept
+        // at the maxResults boundary is deterministic for equal-score types.
+        allCandidates.Sort((a, b) =>
+        {
+            var byScore = b.score.CompareTo(a.score);
+            return byScore != 0
+                ? byScore
+                : string.CompareOrdinal(a.type.ToDisplayString(), b.type.ToDisplayString());
+        });
         var totalCount = allCandidates.Count;
         var capped = allCandidates.Take(maxResults).Select(c => new GodObjectCandidate(
             TypeName: c.type.ToDisplayString(),
@@ -453,46 +475,189 @@ public partial class RoslynService
         return new GodObjectsData(totalCount, capped);
     }
 
-    private static void CollectTypeDependencies(ISymbol member, HashSet<INamedTypeSymbol> outbound, INamedTypeSymbol owner)
+    // Shared per-type outbound-dependency collector: signature dependencies
+    // (return/parameter/property/field/event types — no usable syntax location)
+    // plus the precise body pass, which only counts types in semantically
+    // meaningful positions — object creation, typeof, cast targets,
+    // method-call receivers, and local-variable type declarations. A loose
+    // pass (every IdentifierNameSyntax that resolves to a type) would inflate
+    // counts with nameof() args, constraint type parameters, and merely
+    // in-scope types. Each (source, target) edge keeps ONE representative
+    // location: the first body usage seen, null for signature-only edges.
+    // Consumers: find_god_objects (counts) and check_architecture (edges).
+    internal async Task<Dictionary<INamedTypeSymbol, Dictionary<INamedTypeSymbol, Location?>>>
+        CollectTypeDependencyEdgesAsync(List<INamedTypeSymbol> allTypes, bool includeMetadataTargets,
+            CancellationToken cancellationToken)
+    {
+        var edges = new Dictionary<INamedTypeSymbol, Dictionary<INamedTypeSymbol, Location?>>(
+            SymbolEqualityComparer.Default);
+        foreach (var type in allTypes)
+        {
+            edges[(INamedTypeSymbol)type.OriginalDefinition] =
+                new Dictionary<INamedTypeSymbol, Location?>(SymbolEqualityComparer.Default);
+        }
+
+        foreach (var type in allTypes)
+        {
+            var key = (INamedTypeSymbol)type.OriginalDefinition;
+            var outbound = edges[key];
+
+            // Inheritance is a type-to-type edge too. Gated to check_architecture so
+            // find_god_objects' coupling count (signature + body usages only) is unchanged.
+            // The implicit roots (object / ValueType / Enum / Delegate) are NOT edges:
+            // every type inherits one, so recording them would make a rule like
+            // {deny:'System*'} fire for every type. An EXPLICIT base/interface is a real edge.
+            if (includeMetadataTargets)
+            {
+                var inheritanceLocation = type.Locations.FirstOrDefault(l => l.IsInSource);
+                if (type.BaseType is { } baseType
+                    && baseType.SpecialType is not (SpecialType.System_Object
+                        or SpecialType.System_ValueType or SpecialType.System_Enum
+                        or SpecialType.System_Delegate or SpecialType.System_MulticastDelegate))
+                    AddType(baseType, outbound, key, includeMetadataTargets, inheritanceLocation);
+                foreach (var iface in type.Interfaces)
+                    AddType(iface, outbound, key, includeMetadataTargets, inheritanceLocation);
+            }
+
+            foreach (var member in type.GetMembers())
+            {
+                CollectTypeDependencies(member, outbound, key, includeMetadataTargets);
+            }
+
+            foreach (var declRef in type.DeclaringSyntaxReferences)
+            {
+                var syntax = await declRef.GetSyntaxAsync(cancellationToken);
+                var document = _solution!.GetDocument(declRef.SyntaxTree);
+                if (document == null) continue;
+                var compilation = await GetProjectCompilationAsync(document.Project, cancellationToken);
+                if (compilation == null) continue;
+                var semanticModel = compilation.GetSemanticModel(declRef.SyntaxTree);
+
+                foreach (var node in syntax.DescendantNodes())
+                {
+                    switch (node)
+                    {
+                        case ObjectCreationExpressionSyntax oc:
+                            AddTypeFromSymbol(semanticModel.GetTypeInfo(oc).Type, outbound, key, includeMetadataTargets, node.GetLocation());
+                            break;
+                        case ImplicitObjectCreationExpressionSyntax ioc:
+                            AddTypeFromSymbol(semanticModel.GetTypeInfo(ioc).Type, outbound, key, includeMetadataTargets, node.GetLocation());
+                            break;
+                        case TypeOfExpressionSyntax t:
+                            AddTypeFromSymbol(semanticModel.GetTypeInfo(t.Type).Type, outbound, key, includeMetadataTargets, node.GetLocation());
+                            break;
+                        case CastExpressionSyntax cast:
+                            AddTypeFromSymbol(semanticModel.GetTypeInfo(cast.Type).Type, outbound, key, includeMetadataTargets, node.GetLocation());
+                            break;
+                        case VariableDeclarationSyntax vd when vd.Type is not null:
+                            AddTypeFromSymbol(semanticModel.GetTypeInfo(vd.Type).Type, outbound, key, includeMetadataTargets, node.GetLocation());
+                            break;
+                        case InvocationExpressionSyntax inv:
+                            // The coupling target is the RECEIVER's type — the type you
+                            // actually depend on — not the (possibly base, or static
+                            // extension-host) type that merely declares the method. For a
+                            // genuinely static call the declaring ContainingType is right.
+                            if (semanticModel.GetSymbolInfo(inv, cancellationToken).Symbol is IMethodSymbol calledMethod)
+                            {
+                                INamedTypeSymbol? edgeTarget = null;
+                                if (inv.Expression is MemberAccessExpressionSyntax memberAccess
+                                    && (!calledMethod.IsStatic || calledMethod.IsExtensionMethod || calledMethod.ReducedFrom != null))
+                                {
+                                    edgeTarget = semanticModel.GetTypeInfo(memberAccess.Expression, cancellationToken).Type as INamedTypeSymbol;
+                                }
+                                edgeTarget ??= calledMethod.ContainingType;
+                                if (edgeTarget != null)
+                                {
+                                    AddTypeFromSymbol(edgeTarget, outbound, key, includeMetadataTargets, node.GetLocation());
+                                }
+                            }
+                            break;
+                    }
+                }
+            }
+        }
+
+        return edges;
+    }
+
+    private static void CollectTypeDependencies(
+        ISymbol member, Dictionary<INamedTypeSymbol, Location?> outbound, INamedTypeSymbol owner,
+        bool includeMetadataTargets)
     {
         switch (member)
         {
             case IMethodSymbol m:
-                AddType(m.ReturnType, outbound, owner);
-                foreach (var p in m.Parameters) AddType(p.Type, outbound, owner);
+                AddType(m.ReturnType, outbound, owner, includeMetadataTargets);
+                foreach (var p in m.Parameters) AddType(p.Type, outbound, owner, includeMetadataTargets);
                 break;
             case IPropertySymbol prop:
-                AddType(prop.Type, outbound, owner);
+                AddType(prop.Type, outbound, owner, includeMetadataTargets);
                 break;
             case IFieldSymbol field:
-                AddType(field.Type, outbound, owner);
+                AddType(field.Type, outbound, owner, includeMetadataTargets);
                 break;
             case IEventSymbol evt:
-                AddType(evt.Type, outbound, owner);
+                AddType(evt.Type, outbound, owner, includeMetadataTargets);
                 break;
         }
     }
 
-    private static void AddType(ITypeSymbol type, HashSet<INamedTypeSymbol> outbound, INamedTypeSymbol owner)
+    // Records the edge; a later body usage upgrades a location-less
+    // (signature-only) edge to one with a representative location. With
+    // includeMetadataTargets, edges to referenced/metadata types are kept too (for
+    // check_architecture's rules against package/BCL namespaces); otherwise only
+    // in-solution source types count (find_god_objects' intra-codebase coupling).
+    private static void AddType(
+        ITypeSymbol type, Dictionary<INamedTypeSymbol, Location?> outbound, INamedTypeSymbol owner,
+        bool includeMetadataTargets, Location? location = null)
     {
-        if (type is INamedTypeSymbol nts && IsSourceType(nts))
+        if (type is INamedTypeSymbol nts)
         {
-            var def = (INamedTypeSymbol)nts.OriginalDefinition;
-            if (!SymbolEqualityComparer.Default.Equals(def, owner))
-                outbound.Add(def);
+            if (includeMetadataTargets || IsSourceType(nts))
+            {
+                var def = (INamedTypeSymbol)nts.OriginalDefinition;
+                if (!SymbolEqualityComparer.Default.Equals(def, owner)
+                    && (!outbound.TryGetValue(def, out var existing) || (existing == null && location != null)))
+                {
+                    outbound[def] = location;
+                }
+            }
+            // Generic type arguments are dependencies too (List<Foo> depends on Foo).
+            // Gated to check_architecture so find_god_objects' coupling count is unchanged.
+            if (includeMetadataTargets && nts.IsGenericType)
+            {
+                foreach (var arg in nts.TypeArguments)
+                {
+                    AddType(arg, outbound, owner, includeMetadataTargets, location);
+                }
+            }
+        }
+        else if (includeMetadataTargets && type is IArrayTypeSymbol arr)
+        {
+            AddType(arr.ElementType, outbound, owner, includeMetadataTargets, location);
         }
     }
 
     // Adds a TypeInfo-derived ITypeSymbol (which may be null when semantic resolution fails)
-    // to the outbound set with the same source-type + non-self filtering as AddType.
-    private static void AddTypeFromSymbol(ITypeSymbol? type, HashSet<INamedTypeSymbol> outbound, INamedTypeSymbol owner)
+    // to the outbound set with the same filtering as AddType.
+    private static void AddTypeFromSymbol(
+        ITypeSymbol? type, Dictionary<INamedTypeSymbol, Location?> outbound, INamedTypeSymbol owner,
+        bool includeMetadataTargets, Location? location)
     {
         if (type == null) return;
-        AddType(type, outbound, owner);
+        AddType(type, outbound, owner, includeMetadataTargets, location);
     }
 
     private static bool IsSourceType(INamedTypeSymbol type) =>
         type.Locations.Any(l => l.IsInSource);
+
+    // The canonical unknown-projectName error: a consistent INVALID_PARAMETER that
+    // lists the valid project names, shared by every project-scoped tool.
+    internal object ProjectNotFoundError(string projectName) => CreateErrorResponse(
+        ErrorCodes.InvalidParameter,
+        $"Project not found: {projectName}",
+        hint: $"Available projects: {string.Join(", ", _solution!.Projects.Select(p => p.Name))}",
+        context: new { projectName });
 
     // Composite per-project audit: aggregates diagnostics, unused-code, coupling, and
     // coverage signals via the typed *DataAsync helpers (no dynamic, no reflection).
@@ -501,7 +666,8 @@ public partial class RoslynService
     public async Task<object> GetProjectHealthAsync(
         string projectName,
         bool includeAnalyzers = true,
-        int topN = 5)
+        int topN = 5,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -509,11 +675,7 @@ public partial class RoslynService
             p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase));
         if (project == null)
         {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"Project not found: {projectName}",
-                hint: "Use get_project_structure to list project names",
-                context: new { projectName });
+            return ProjectNotFoundError(projectName);
         }
 
         var diag = await GetDiagnosticsDataAsync(
@@ -521,7 +683,8 @@ public partial class RoslynService
             projectPath: project.FilePath,
             severity: null,
             includeHidden: false,
-            runAnalyzers: includeAnalyzers);
+            runAnalyzers: includeAnalyzers,
+            cancellationToken: cancellationToken);
 
         var topDiagsByCount = diag.Diagnostics
             .GroupBy(d => d.Id)
@@ -535,7 +698,8 @@ public partial class RoslynService
             includePrivate: false,
             includeInternal: false,
             symbolKindFilter: null,
-            maxResults: topN);
+            maxResults: topN,
+            cancellationToken: cancellationToken);
 
         var unusedByKind = unused.Symbols
             .GroupBy(s => s.Kind)
@@ -547,7 +711,8 @@ public partial class RoslynService
             projectName: project.Name,
             minEfferentCoupling: 20,
             minMembers: 20,
-            maxResults: topN);
+            maxResults: topN,
+            cancellationToken: cancellationToken);
 
         UntestedCodeData? untested = null;
         try
@@ -556,7 +721,8 @@ public partial class RoslynService
                 projectName: project.Name,
                 includeProperties: false,
                 includeInternal: false,
-                maxResults: topN);
+                maxResults: topN,
+                cancellationToken: cancellationToken);
         }
         catch (ArgumentException)
         {
@@ -566,7 +732,14 @@ public partial class RoslynService
         var untestedCount = untested?.TotalCount ?? 0;
         var untestedHotspots = untested?.Symbols ?? new List<UncoveredSymbolEntry>();
 
-        var summary = $"{diag.ErrorCount} errors, {diag.WarningCount} warnings, {god.TotalCount} god-object candidates, {untestedCount} uncovered public methods, {unused.TotalCount} unused symbols";
+        var asyncIssues = await FindAsyncIssuesDataAsync(project.Name, cancellationToken);
+        var asyncByCategory = asyncIssues
+            .GroupBy(i => i.Category)
+            .OrderByDescending(g => g.Count())
+            .Select(g => new { category = g.Key, count = g.Count() })
+            .ToList();
+
+        var summary = $"{diag.ErrorCount} errors, {diag.WarningCount} warnings, {god.TotalCount} god-object candidates, {untestedCount} uncovered public methods, {unused.TotalCount} unused symbols, {asyncIssues.Count} async issues";
 
         return CreateSuccessResponse(
             data: new
@@ -608,6 +781,11 @@ public partial class RoslynService
                         accessibility = s.Accessibility,
                         location = s.Location
                     }).ToList()
+                },
+                asyncHygiene = new
+                {
+                    count = asyncIssues.Count,
+                    byCategory = asyncByCategory
                 },
                 summary
             },

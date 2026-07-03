@@ -24,6 +24,18 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Golden snapshot of the tools/list wire response. The golden test compares
+         the live response byte-for-byte against this asset, guarding the tool
+         registry against accidental schema drift. -->
+    <None Include="Mcp\ToolsListGolden.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Disables cross-collection parallelism so no two whole-solution MSBuild
+         loads (or a fixture mutation) ever overlap. Determinism foundation for
+         the suite: the global solution-health canary and the on-disk
+         fixture-mutators would otherwise race and false-fail. -->
+    <None Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\SharpLensMcp.csproj" />
     <!-- Reference the test-analyzer project as a regular project ref (not as
          an analyzer attached to the build). The test attaches it to AdhocWorkspaces

@@ -4,8 +4,8 @@ using Xunit;
 
 namespace SharpLensMcp.Tests;
 
-// In-memory tests for the EstimateCyclomaticAsync formula (1 + branches) at
-// Quality.cs:226-241 AND the descending sort at Quality.cs:166. Builds a
+// In-memory tests for the EstimateCyclomaticAsync formula (1 + branches) AND
+// the descending sort find_untested_code applies. Builds a
 // fixture with three methods of deterministic and distinct branch counts,
 // runs find_untested_code (no test methods → all production methods are
 // uncovered), and asserts:
@@ -106,7 +106,7 @@ namespace Production
             .ToList();
         targets.Should().HaveCount(3, "all three production methods must surface as uncovered");
         var complexities = targets.Select(t => t.complexity).ToList();
-        complexities.Should().BeInDescendingOrder("Quality.cs:166 sorts uncovered by complexity descending");
+        complexities.Should().BeInDescendingOrder("uncovered results are sorted by complexity descending");
         complexities[0].Should().Be(7);
         complexities[1].Should().Be(4);
         complexities[2].Should().Be(1);

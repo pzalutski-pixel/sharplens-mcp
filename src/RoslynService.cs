@@ -24,17 +24,26 @@ public partial class RoslynService
     private Solution? _solution;
     private readonly Dictionary<string, Document> _documentCache = new();
     internal readonly ConcurrentDictionary<ProjectId, Compilation> _compilationCache = new();
-    private readonly int _maxDiagnostics;
+    private int _maxDiagnostics;
     private readonly int _timeoutSeconds;
     private readonly bool _useAbsolutePaths;
 
     private DateTime? _solutionLoadedAt;
 
+    // Single source for the semantic-cache flag, read by both the cache gate and the
+    // health_check configuration report so the reported state can't drift from the
+    // enforced one. On unless SHARPLENS_ENABLE_SEMANTIC_CACHE (legacy
+    // ROSLYN_ENABLE_SEMANTIC_CACHE) is explicitly "false".
+    private static bool SemanticCacheEnabled =>
+        EnvironmentConfig.Get("SHARPLENS_ENABLE_SEMANTIC_CACHE", "ROSLYN_ENABLE_SEMANTIC_CACHE") != "false";
+
     public RoslynService()
     {
-        _maxDiagnostics = int.TryParse(Environment.GetEnvironmentVariable("ROSLYN_MAX_DIAGNOSTICS"), out var maxDiag)
+        _maxDiagnostics = int.TryParse(EnvironmentConfig.Get("SHARPLENS_MAX_DIAGNOSTICS", "ROSLYN_MAX_DIAGNOSTICS"), out var maxDiag)
             ? maxDiag : 100;
-        _timeoutSeconds = int.TryParse(Environment.GetEnvironmentVariable("ROSLYN_TIMEOUT_SECONDS"), out var timeout)
+        // Guard > 0 to match McpServer.ReadConfiguredToolCallTimeout, so the value
+        // health_check reports can't diverge from the timeout actually enforced.
+        _timeoutSeconds = int.TryParse(EnvironmentConfig.Get("SHARPLENS_TIMEOUT_SECONDS", "ROSLYN_TIMEOUT_SECONDS"), out var timeout) && timeout > 0
             ? timeout : 30;
         _useAbsolutePaths = Environment.GetEnvironmentVariable("SHARPLENS_ABSOLUTE_PATHS")?.ToLower() == "true";
     }
@@ -72,21 +81,27 @@ public partial class RoslynService
     /// Creates a standardized success response with metadata.
     /// </summary>
     private object CreateSuccessResponse(object data, string[]? suggestedNextTools = null,
-        int? totalCount = null, int? returnedCount = null, string? verbosity = null)
+        int? totalCount = null, int? returnedCount = null, string? verbosity = null,
+        bool? truncated = null)
     {
-        return new
-        {
-            success = true,
-            data,
-            meta = new ResponseMetadata
+        // Truncated normally derives from the counts (returned a prefix of a larger
+        // set). Tools whose result is complete-but-bounded by a depth/node cap rather
+        // than a list prefix — get_call_graph, get_outgoing_calls — can't express that
+        // through the counts (their array is whole, so totalCount==returnedCount), so
+        // they pass `truncated` explicitly; it is OR-combined with the count signal.
+        return new ToolSuccessResponse(
+            success: true,
+            data: data,
+            meta: new ResponseMetadata
             {
                 TotalCount = totalCount,
                 ReturnedCount = returnedCount,
-                Truncated = totalCount.HasValue && returnedCount.HasValue && returnedCount < totalCount,
+                Truncated = (totalCount.HasValue && returnedCount.HasValue && returnedCount < totalCount)
+                    || truncated == true,
                 SuggestedNextTools = suggestedNextTools,
                 Verbosity = verbosity
             }
-        };
+        );
     }
 
     /// <summary>
@@ -94,38 +109,46 @@ public partial class RoslynService
     /// </summary>
     private object CreateErrorResponse(string code, string message, string? hint = null, object? context = null)
     {
-        return new
-        {
-            success = false,
-            error = new RoslynError
+        return new ToolErrorResponse(
+            success: false,
+            error: new RoslynError
             {
                 Code = code,
                 Message = message,
                 Hint = hint,
                 Context = context
-            }
-        };
+            });
     }
 
     // Single typed boundary for reading back a tool-response object created by
-    // CreateSuccessResponse / CreateErrorResponse. Tool responses are anonymous
-    // typed (one shape for success: {success, data, meta}; one for error:
-    // {success, error}) — the anonymous types can't be named, so callers
-    // previously did `result as dynamic` to read .success. That spread late-bound
-    // member access through 13 sites. These helpers centralize the reflection in
-    // one place so internal callers can use typed access.
-    private static bool IsSuccessResponse(object? response)
+    // CreateSuccessResponse / CreateErrorResponse. Both are named records now
+    // (ToolSuccessResponse / ToolErrorResponse), so internal callers read them by
+    // typed pattern match. The reflection fallback covers any tool that still
+    // returns a hand-built anonymous {success, ...} envelope.
+    private static bool IsSuccessResponse(object? response) => response switch
     {
-        if (response == null) return false;
-        var prop = response.GetType().GetProperty("success");
-        return prop?.GetValue(response) is bool b && b;
-    }
+        ToolSuccessResponse s => s.success,
+        ToolErrorResponse => false,
+        null => false,
+        _ => response.GetType().GetProperty("success")?.GetValue(response) is bool b && b
+    };
 
-    private static object? GetResponseData(object? response)
-        => response?.GetType().GetProperty("data")?.GetValue(response);
+    private static object? GetResponseData(object? response) => response switch
+    {
+        ToolSuccessResponse s => s.data,
+        ToolErrorResponse => null,
+        _ => response?.GetType().GetProperty("data")?.GetValue(response)
+    };
 
-    private static object? GetResponseError(object? response)
-        => response?.GetType().GetProperty("error")?.GetValue(response);
+    private static object? GetResponseError(object? response) => response switch
+    {
+        ToolErrorResponse e => e.error,
+        ToolSuccessResponse => null,
+        _ => response?.GetType().GetProperty("error")?.GetValue(response)
+    };
+
+    private static string? GetResponseErrorCode(object? response)
+        => (GetResponseError(response) as RoslynError)?.Code;
 
     /// <summary>
     /// Formats a file path as relative or absolute based on configuration.
@@ -175,63 +198,130 @@ public partial class RoslynService
 
     /// <summary>
     /// Finds a type by name, trying multiple resolution strategies.
-    /// Supports fully-qualified names, simple names, and Godot namespace prefixing.
+    /// Supports fully-qualified names, simple names, and partial matches.
+    /// A name matching several distinct types yields an AMBIGUOUS_TYPE error
+    /// (second tuple element) listing fully-qualified candidates — silently
+    /// picking one would hand downstream refactorings the wrong type.
     /// </summary>
-    private async Task<INamedTypeSymbol?> FindTypeByNameAsync(string typeName)
+    private async Task<(INamedTypeSymbol? type, object? ambiguityError)> FindTypeByNameAsync(
+        string typeName, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        // Prefer base compilation so SymbolFinder (FindDerivedClasses, FindImplementations,
+        // Prefer base compilations so SymbolFinder (FindDerivedClasses, FindImplementations,
         // FindReferences) recognizes the returned symbol. The augmented compilation from
         // GetProjectCompilationAsync has different symbol identity that SymbolFinder won't
-        // resolve. Fall back to the augmented compilation only when the base doesn't have
+        // resolve. Fall back to augmented compilations only when no base compilation has
         // the type (e.g., it's purely source-generated).
+        var baseCompilations = new List<Compilation>();
         foreach (var project in _solution!.Projects)
         {
-            var baseCompilation = await project.GetCompilationAsync();
-            var found = baseCompilation != null ? FindTypeIn(baseCompilation, typeName) : null;
-            if (found != null) return found;
-
-            var augmented = await GetProjectCompilationAsync(project);
-            found = augmented != null ? FindTypeIn(augmented, typeName) : null;
-            if (found != null) return found;
+            var compilation = await project.GetCompilationAsync(cancellationToken);
+            if (compilation != null) baseCompilations.Add(compilation);
         }
 
-        return null;
+        var resolved = ResolveTypeAcross(baseCompilations, typeName);
+        if (resolved.type != null || resolved.ambiguityError != null) return resolved;
+
+        var augmentedCompilations = new List<Compilation>();
+        foreach (var project in _solution!.Projects)
+        {
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
+            if (compilation != null) augmentedCompilations.Add(compilation);
+        }
+
+        return ResolveTypeAcross(augmentedCompilations, typeName);
     }
 
-    private static INamedTypeSymbol? FindTypeIn(Compilation compilation, string typeName)
+    private (INamedTypeSymbol? type, object? ambiguityError) ResolveTypeAcross(
+        List<Compilation> compilations, string typeName)
     {
-        // Strategy 1: Fully-qualified metadata name
-        var type = compilation.GetTypeByMetadataName(typeName);
-        if (type != null) return type;
+        // Strategy 1: fully-qualified metadata name. Genuine ambiguity is two
+        // different SOURCE assemblies DECLARING the FQN — not the same
+        // referenced/BCL type surfacing under different facade assemblies across
+        // target frameworks (e.g. System.String via System.Private.CoreLib vs a
+        // netstandard facade). So only count matches the compilation declares in
+        // its own source; if several distinct source assemblies do, it is ambiguous.
+        var metadataMatches = new List<(INamedTypeSymbol type, Compilation compilation)>();
+        foreach (var compilation in compilations)
+        {
+            if (compilation.GetTypeByMetadataName(typeName) is { } exact) metadataMatches.Add((exact, compilation));
+        }
+        if (metadataMatches.Count > 0)
+        {
+            var sourceDeclarations = metadataMatches
+                .Where(m => SymbolEqualityComparer.Default.Equals(m.type.ContainingAssembly, m.compilation.Assembly)
+                         && m.type.Locations.Any(l => l.IsInSource))
+                .Select(m => m.type)
+                .GroupBy(t => t.ContainingAssembly?.Name ?? "", StringComparer.Ordinal)
+                .Select(g => g.First())
+                .ToList();
+            if (sourceDeclarations.Count > 1) return (null, AmbiguousTypeError(typeName, sourceDeclarations));
+            return (sourceDeclarations.Count == 1 ? sourceDeclarations[0] : metadataMatches[0].type, null);
+        }
 
-        // Strategy 2: Common Godot namespace prefix
-        type = compilation.GetTypeByMetadataName($"Godot.{typeName}");
-        if (type != null) return type;
+        // Strategy 2: exact simple name (case-insensitive) across all projects.
+        var byName = CollectSourceTypes(compilations,
+            name => name.Equals(typeName, StringComparison.OrdinalIgnoreCase));
+        if (byName.Count == 1) return (byName[0], null);
+        if (byName.Count > 1) return (null, AmbiguousTypeError(typeName, byName));
 
-        // Strategy 3: Search by simple name (case-insensitive)
-        var symbols = compilation.GetSymbolsWithName(
-            name => name.Equals(typeName, StringComparison.OrdinalIgnoreCase),
-            SymbolFilter.Type);
-        var found = symbols.OfType<INamedTypeSymbol>().FirstOrDefault();
-        if (found != null) return found;
+        // Strategy 3: partial match (contains).
+        var partial = CollectSourceTypes(compilations,
+            name => name.Contains(typeName, StringComparison.OrdinalIgnoreCase));
+        if (partial.Count == 1) return (partial[0], null);
+        if (partial.Count > 1) return (null, AmbiguousTypeError(typeName, partial));
 
-        // Strategy 4: Partial match (contains)
-        symbols = compilation.GetSymbolsWithName(
-            name => name.Contains(typeName, StringComparison.OrdinalIgnoreCase),
-            SymbolFilter.Type);
-        return symbols.OfType<INamedTypeSymbol>().FirstOrDefault();
+        return (null, null);
     }
 
-    /// <summary>
-    /// Checks if a type has a specific attribute (by simple name).
-    /// </summary>
-    private static bool HasAttribute(ISymbol symbol, string attributeName)
+    // Distinct types only: the same type surfaces from several compilations when
+    // multi-targeting splits a project per TFM — key by fully-qualified name and
+    // keep the first occurrence (earliest project, matching the old preference).
+    private static List<INamedTypeSymbol> CollectSourceTypes(
+        List<Compilation> compilations, Func<string, bool> namePredicate)
     {
-        return symbol.GetAttributes().Any(attr =>
-            attr.AttributeClass?.Name.Equals(attributeName, StringComparison.OrdinalIgnoreCase) == true ||
-            attr.AttributeClass?.Name.Equals($"{attributeName}Attribute", StringComparison.OrdinalIgnoreCase) == true);
+        var byFqn = new Dictionary<string, INamedTypeSymbol>(StringComparer.Ordinal);
+        foreach (var compilation in compilations)
+        {
+            var matches = compilation
+                .GetSymbolsWithName(namePredicate, SymbolFilter.Type)
+                .OfType<INamedTypeSymbol>();
+            foreach (var type in matches)
+            {
+                var fqn = type.ToDisplayString();
+                if (!byFqn.ContainsKey(fqn)) byFqn[fqn] = type;
+            }
+        }
+        return byFqn.Values.ToList();
+    }
+
+    private object AmbiguousTypeError(string typeName, List<INamedTypeSymbol> candidates)
+    {
+        const int maxShown = 10;
+        var shown = candidates
+            .Select(c => c.ToDisplayString())
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .Take(maxShown)
+            .ToList();
+        // The candidate list is capped at maxShown but the message reports the true
+        // total; surface totalCandidates and a truncated flag so the count and the list
+        // never read as disagreeing, and tell the caller how to see the rest.
+        var truncated = candidates.Count > maxShown;
+        return CreateErrorResponse(
+            ErrorCodes.AmbiguousType,
+            $"Type name '{typeName}' matches {candidates.Count} types",
+            hint: truncated
+                ? $"Repeat the call with one of the fully-qualified candidate names ({shown.Count} of {candidates.Count} shown — narrow the name to reveal the rest)."
+                : "Repeat the call with one of the fully-qualified candidate names.",
+            context: new
+            {
+                typeName,
+                totalCandidates = candidates.Count,
+                candidatesShown = shown.Count,
+                truncated,
+                candidates = shown
+            });
     }
 
     /// <summary>
@@ -252,7 +342,7 @@ public partial class RoslynService
     }
 
 
-    public async Task<object> LoadSolutionAsync(string solutionPath)
+    public async Task<object> LoadSolutionAsync(string solutionPath, CancellationToken cancellationToken = default)
     {
         if (!File.Exists(solutionPath))
         {
@@ -283,7 +373,7 @@ public partial class RoslynService
             Console.Error.WriteLine($"[Warning] Workspace: {args.Diagnostic.Message}");
         });
 
-        _solution = await msbuild.OpenSolutionAsync(solutionPath);
+        _solution = await msbuild.OpenSolutionAsync(solutionPath, cancellationToken: cancellationToken);
         _workspace = msbuild;
         _solutionLoadedAt = DateTime.UtcNow;
 
@@ -310,7 +400,7 @@ public partial class RoslynService
     /// Synchronize document changes from disk into the loaded solution.
     /// Agent is responsible for calling this after using Edit/Write tools.
     /// </summary>
-    public async Task<object> SyncDocumentsAsync(List<string>? filePaths)
+    public async Task<object> SyncDocumentsAsync(List<string>? filePaths, CancellationToken cancellationToken = default)
     {
         if (_solution == null || _workspace == null)
         {
@@ -327,17 +417,20 @@ public partial class RoslynService
         var removed = new List<string>();
         var errors = new List<object>();
 
-        // Get all documents in solution for lookup
+        // A file path is not unique: a multi-targeted project has one Project per TFM over
+        // the same .cs files, and linked/shared files appear in several projects. Group by
+        // path (never ToDictionary on a non-unique key — it throws on the first duplicate,
+        // before the per-file try/catch) and, on a change, sync into EVERY document sharing
+        // the path.
         var documentsByPath = _solution.Projects
             .SelectMany(p => p.Documents)
             .Where(d => d.FilePath != null)
-            .ToDictionary(
+            .GroupBy(
                 d => Path.GetFullPath(d.FilePath!),
-                d => d,
                 PathComparison == StringComparison.OrdinalIgnoreCase
                     ? StringComparer.OrdinalIgnoreCase
-                    : StringComparer.Ordinal
-            );
+                    : StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.ToList());
 
         // Determine which files to sync
         IEnumerable<string> pathsToSync;
@@ -362,14 +455,16 @@ public partial class RoslynService
             try
             {
                 var fileExists = File.Exists(fullPath);
-                var docExists = documentsByPath.TryGetValue(fullPath, out var existingDoc);
+                var docExists = documentsByPath.TryGetValue(fullPath, out var existingDocs);
 
                 if (fileExists && docExists)
                 {
-                    // Update existing document
-                    var newText = await File.ReadAllTextAsync(fullPath);
+                    // Update the document in EVERY project that includes this file
+                    // (multi-targeted TFMs and linked/shared files share one path).
+                    var newText = await File.ReadAllTextAsync(fullPath, cancellationToken);
                     var sourceText = SourceText.From(newText, Encoding.UTF8);
-                    _solution = _solution.WithDocumentText(existingDoc!.Id, sourceText);
+                    foreach (var doc in existingDocs!)
+                        _solution = _solution.WithDocumentText(doc.Id, sourceText);
                     updated.Add(FormatPath(fullPath));
                 }
                 else if (fileExists && !docExists)
@@ -378,7 +473,7 @@ public partial class RoslynService
                     var project = FindProjectForFile(fullPath);
                     if (project != null)
                     {
-                        var newText = await File.ReadAllTextAsync(fullPath);
+                        var newText = await File.ReadAllTextAsync(fullPath, cancellationToken);
                         var sourceText = SourceText.From(newText, Encoding.UTF8);
                         var docId = DocumentId.CreateNewId(project.Id);
                         var fileName = Path.GetFileName(fullPath);
@@ -406,11 +501,18 @@ public partial class RoslynService
                 }
                 else if (!fileExists && docExists)
                 {
-                    // Remove deleted document
-                    _solution = _solution.RemoveDocument(existingDoc!.Id);
+                    // Remove the deleted document from every project that included it.
+                    foreach (var doc in existingDocs!)
+                        _solution = _solution.RemoveDocument(doc.Id);
                     removed.Add(FormatPath(fullPath));
                 }
                 // else: file doesn't exist and not in solution - nothing to do
+            }
+            catch (OperationCanceledException)
+            {
+                // A per-call timeout mid-sync must surface as cancellation (→ TIMEOUT),
+                // not be folded into a per-file error and returned as partial success.
+                throw;
             }
             catch (Exception ex)
             {
@@ -475,38 +577,53 @@ public partial class RoslynService
         return bestMatch;
     }
 
-    public async Task<object> GetHealthCheckAsync()
+    public async Task<object> GetHealthCheckAsync(
+        bool includeDiagnostics = false, CancellationToken cancellationToken = default)
     {
         if (_solution == null || _workspace == null)
         {
             return CreateSuccessResponse(data: new
             {
                 status = "Not Ready",
-                message = "No solution loaded. Call roslyn:load_solution first or set DOTNET_SOLUTION_PATH environment variable.",
+                message = "No solution loaded. Call load_solution first or set DOTNET_SOLUTION_PATH environment variable.",
                 solution = (object?)null,
                 workspace = (object?)null
             });
         }
 
-        var errorCount = 0;
-        var warningCount = 0;
+        // Default is O(1): only load state, counts, and configuration. The
+        // diagnostics sweep compiles up to five projects (~tens of seconds on a
+        // large solution), so it runs only when includeDiagnostics is set.
+        int? errorCount = null;
+        int? warningCount = null;
 
-        try
+        if (includeDiagnostics)
         {
-            foreach (var project in _solution.Projects.Take(5)) // Sample first 5 projects for quick health check
+            errorCount = 0;
+            warningCount = 0;
+            try
             {
-                var compilation = await GetProjectCompilationAsync(project);
-                if (compilation != null)
+                foreach (var project in _solution.Projects.Take(5)) // Sample first 5 projects for quick health check
                 {
-                    var diagnostics = compilation.GetDiagnostics();
-                    errorCount += diagnostics.Count(d => d.Severity == DiagnosticSeverity.Error);
-                    warningCount += diagnostics.Count(d => d.Severity == DiagnosticSeverity.Warning);
+                    var compilation = await GetProjectCompilationAsync(project, cancellationToken);
+                    if (compilation != null)
+                    {
+                        var diagnostics = compilation.GetDiagnostics(cancellationToken);
+                        errorCount += diagnostics.Count(d => d.Severity == DiagnosticSeverity.Error);
+                        warningCount += diagnostics.Count(d => d.Severity == DiagnosticSeverity.Warning);
+                    }
                 }
             }
-        }
-        catch
-        {
-            // Ignore errors during health check diagnostics
+            catch (OperationCanceledException)
+            {
+                // A per-call timeout must surface as cancellation (→ TIMEOUT), not be
+                // swallowed and reported as a healthy zero-error sweep.
+                throw;
+            }
+            catch
+            {
+                // Ignore errors during health check diagnostics
+            }
         }
 
         var projectCount = _solution.ProjectIds.Count;
@@ -515,7 +632,7 @@ public partial class RoslynService
         return CreateSuccessResponse(data: new
         {
             status = "Ready",
-            message = "Roslyn MCP Server is operational",
+            message = "SharpLens MCP server is operational",
             solution = new
             {
                 loaded = true,
@@ -523,6 +640,7 @@ public partial class RoslynService
                 projects = projectCount,
                 documents = documentCount,
                 loadedAt = _solutionLoadedAt?.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                diagnosticsIncluded = includeDiagnostics,
                 errors = errorCount,
                 warnings = warningCount
             },
@@ -543,7 +661,7 @@ public partial class RoslynService
             {
                 maxDiagnostics = _maxDiagnostics,
                 timeoutSeconds = _timeoutSeconds,
-                semanticCacheEnabled = Environment.GetEnvironmentVariable("ROSLYN_ENABLE_SEMANTIC_CACHE") != "false"
+                semanticCacheEnabled = SemanticCacheEnabled
             }
         });
     }
@@ -629,67 +747,88 @@ public partial class RoslynService
         return name.Replace(".", "_").Replace("-", "_").Replace(" ", "_");
     }
 
-    private string GenerateInterfaceCode(string interfaceName, List<ISymbol> members, INamespaceSymbol? containingNamespace)
+    // Builds the interface as syntax from the symbol model: each member's
+    // declaration comes from SyntaxGenerator.Declaration (so parameter lists,
+    // generics, ref kinds, and keyword escaping come out right) and
+    // InterfaceDeclaration normalizes them to interface shape (bodies and
+    // accessibility stripped). NormalizeWhitespace is correct here — fresh
+    // generated syntax has no user formatting to preserve.
+    private string GenerateInterfaceCode(string interfaceName, List<ISymbol> members, INamedTypeSymbol sourceType)
     {
-        var sb = new System.Text.StringBuilder();
+        var generator = Microsoft.CodeAnalysis.Editing.SyntaxGenerator.GetGenerator(
+            _workspace!, LanguageNames.CSharp);
 
-        // Add namespace
-        if (containingNamespace != null && !containingNamespace.IsGlobalNamespace)
+        var memberDeclarations = members.Select(generator.Declaration).ToList();
+
+        // A generic source type extracts to a generic interface: its members
+        // reference the type parameters, so the interface must declare them (with
+        // their constraints) or the generated code references undeclared T.
+        var typeParameterNames = sourceType.TypeParameters.Select(tp => tp.Name).ToList();
+        var interfaceDeclaration = generator.InterfaceDeclaration(
+            interfaceName,
+            typeParameters: typeParameterNames.Count > 0 ? typeParameterNames : null,
+            accessibility: Accessibility.Public,
+            members: memberDeclarations);
+
+        foreach (var tp in sourceType.TypeParameters)
         {
-            sb.AppendLine($"namespace {containingNamespace.ToDisplayString()}");
-            sb.AppendLine("{");
-        }
-
-        // Add interface declaration
-        var indent = containingNamespace != null && !containingNamespace.IsGlobalNamespace ? "    " : "";
-        sb.AppendLine($"{indent}public interface {interfaceName}");
-        sb.AppendLine($"{indent}{{");
-
-        // Add members
-        foreach (var member in members)
-        {
-            if (member is IMethodSymbol method)
+            var kinds = Microsoft.CodeAnalysis.Editing.SpecialTypeConstraintKind.None;
+            if (tp.HasReferenceTypeConstraint)
+                kinds |= Microsoft.CodeAnalysis.Editing.SpecialTypeConstraintKind.ReferenceType;
+            if (tp.HasValueTypeConstraint)
+                kinds |= Microsoft.CodeAnalysis.Editing.SpecialTypeConstraintKind.ValueType;
+            if (tp.HasConstructorConstraint)
+                kinds |= Microsoft.CodeAnalysis.Editing.SpecialTypeConstraintKind.Constructor;
+            var constraintTypes = tp.ConstraintTypes.Select(generator.TypeExpression).ToList();
+            if (kinds != Microsoft.CodeAnalysis.Editing.SpecialTypeConstraintKind.None || constraintTypes.Count > 0)
             {
-                var returnType = method.ReturnType.ToDisplayString();
-                var parameters = string.Join(", ", method.Parameters.Select(p =>
-                    $"{p.Type.ToDisplayString()} {p.Name}"));
-                sb.AppendLine($"{indent}    {returnType} {method.Name}({parameters});");
-            }
-            else if (member is IPropertySymbol property)
-            {
-                var propertyType = property.Type.ToDisplayString();
-                var accessors = new List<string>();
-                if (property.GetMethod != null) accessors.Add("get;");
-                if (property.SetMethod != null) accessors.Add("set;");
-                sb.AppendLine($"{indent}    {propertyType} {property.Name} {{ {string.Join(" ", accessors)} }}");
-            }
-            else if (member is IEventSymbol eventSymbol)
-            {
-                var eventType = eventSymbol.Type.ToDisplayString();
-                sb.AppendLine($"{indent}    event {eventType} {eventSymbol.Name};");
+                interfaceDeclaration = generator.WithTypeConstraint(
+                    interfaceDeclaration, tp.Name, kinds, constraintTypes);
             }
         }
 
-        sb.AppendLine($"{indent}}}");
+        var containingNamespace = sourceType.ContainingNamespace;
+        var unit = containingNamespace != null && !containingNamespace.IsGlobalNamespace
+            ? generator.CompilationUnit(
+                generator.NamespaceDeclaration(containingNamespace.ToDisplayString(), interfaceDeclaration))
+            : generator.CompilationUnit(interfaceDeclaration);
 
-        if (containingNamespace != null && !containingNamespace.IsGlobalNamespace)
-        {
-            sb.AppendLine("}");
-        }
-
-        return sb.ToString();
+        return unit.NormalizeWhitespace().ToFullString();
     }
 
     private void EnsureSolutionLoaded()
     {
         if (_solution == null)
         {
-            throw new Exception("No solution loaded. Call roslyn:load_solution first or set DOTNET_SOLUTION_PATH environment variable.");
+            throw new SolutionNotLoadedException();
         }
+    }
+
+    // The structured envelope the dispatcher returns when a tool runs before
+    // load_solution. Static because no solution state exists yet by definition.
+    internal static object CreateSolutionNotLoadedResponse()
+    {
+        return new
+        {
+            success = false,
+            error = new RoslynError
+            {
+                Code = ErrorCodes.SolutionNotLoaded,
+                Message = "No solution loaded. Call load_solution first or set DOTNET_SOLUTION_PATH environment variable.",
+                Hint = "Use load_solution with the absolute path to a .sln or .slnx file, then retry this call."
+            }
+        };
     }
 
     /// <summary>Test-only accessor for the loaded solution. Do not use outside tests.</summary>
     internal Solution? GetSolutionForTesting() => _solution;
+
+    /// <summary>
+    /// Test-only override for the diagnostics cap (normally ROSLYN_MAX_DIAGNOSTICS).
+    /// Setting the env var in tests would race parallel test classes constructing
+    /// their own RoslynService instances; this scopes the override to one instance.
+    /// </summary>
+    internal void SetMaxDiagnosticsForTesting(int value) => _maxDiagnostics = value;
 
     /// <summary>
     /// Test-only entry point: hand RoslynService an already-configured Workspace
@@ -716,12 +855,26 @@ public partial class RoslynService
     /// Thread safety: tool calls are serialized through stdio so there are no concurrent
     /// cache misses in practice. ConcurrentDictionary is used for cheap lock-free reads.
     /// </summary>
-    internal async Task<Compilation?> GetProjectCompilationAsync(Project project)
+    internal async Task<Compilation?> GetProjectCompilationAsync(
+        Project project, CancellationToken cancellationToken = default)
     {
         if (_compilationCache.TryGetValue(project.Id, out var cached))
             return cached;
 
-        var baseCompilation = await project.GetCompilationAsync();
+        var compilation = await ComputeAugmentedCompilationAsync(project, cancellationToken);
+        if (compilation != null)
+            _compilationCache[project.Id] = compilation;
+        return compilation;
+    }
+
+    // The generator-aware compilation WITHOUT touching the cache. Safe for a proposed
+    // (not-yet-applied) project version, whose ProjectId collides with the live one's —
+    // caching it under that id would either return a stale live compilation or poison the
+    // cache with an unapplied one. GetProjectCompilationAsync wraps this with the cache.
+    private async Task<Compilation?> ComputeAugmentedCompilationAsync(
+        Project project, CancellationToken cancellationToken)
+    {
+        var baseCompilation = await project.GetCompilationAsync(cancellationToken);
         if (baseCompilation == null) return null;
 
         var generators = project.AnalyzerReferences
@@ -729,34 +882,70 @@ public partial class RoslynService
             .ToImmutableArray();
 
         if (generators.IsEmpty)
-        {
-            _compilationCache[project.Id] = baseCompilation;
             return baseCompilation;
-        }
+
+        // Roslyn 5.3 workspaces run source generators themselves: the workspace
+        // compilation already contains the generated trees, recognizable as trees
+        // whose paths are not among the project's own documents. Running the
+        // driver again on such a compilation adds every generated tree a second
+        // time and poisons it with duplicate-definition errors.
+        var projectDocumentPaths = new HashSet<string>(
+            project.Documents.Where(d => d.FilePath != null).Select(d => d.FilePath!),
+            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+        if (baseCompilation.SyntaxTrees.Any(t => !projectDocumentPaths.Contains(t.FilePath)))
+            return baseCompilation;
 
         try
         {
-            var additionalTexts = project.AdditionalDocuments
-                .Select(d => (AdditionalText)new AdditionalTextFile(d))
-                .ToImmutableArray();
-
-            var driver = CSharpGeneratorDriver.Create(
-                generators: generators,
-                additionalTexts: additionalTexts,
-                parseOptions: (CSharpParseOptions)project.ParseOptions!,
-                optionsProvider: project.AnalyzerOptions.AnalyzerConfigOptionsProvider);
-
-            driver.RunGeneratorsAndUpdateCompilation(baseCompilation, out var updated, out _);
-            _compilationCache[project.Id] = updated;
+            var driver = CreateGeneratorDriver(project, generators);
+            driver.RunGeneratorsAndUpdateCompilation(baseCompilation, out var updated, out _, cancellationToken);
             return updated;
+        }
+        catch (OperationCanceledException)
+        {
+            // A per-call timeout during generator execution must surface as cancellation,
+            // not be swallowed and silently degrade to the base (pre-generator) compilation.
+            throw;
         }
         catch (Exception ex)
         {
             // A misbehaving generator must not break the entire server.
             Console.Error.WriteLine($"[Warning] Source generator failed for '{project.Name}': {ex.Message}");
-            _compilationCache[project.Id] = baseCompilation;
             return baseCompilation;
         }
+    }
+
+    // Truncates a snippet to at most maxChars WITHOUT splitting a UTF-16 surrogate
+    // pair (an emoji / astral character at the boundary): a raw Substring(maxChars)
+    // can cut between the high and low surrogate and emit a lone, invalid code unit.
+    // Returns the text unchanged when it already fits; otherwise the kept prefix plus
+    // the ellipsis. Shared by every snippet-truncating tool so they behave alike.
+    internal static string TruncateForSnippet(string text, int maxChars, string ellipsis = "…")
+    {
+        if (text.Length <= maxChars) return text;
+        var cut = maxChars;
+        // If the last kept unit is a high surrogate, its low half is at index cut —
+        // dropping the high half keeps the cut on a rune boundary.
+        if (cut > 0 && char.IsHighSurrogate(text[cut - 1])) cut--;
+        return text[..cut] + ellipsis;
+    }
+
+    // The generator driver exactly as the augmented-compilation path runs it:
+    // same generators, additional texts, parse options, and analyzer-config
+    // options provider — so a timing run (get_source_generators) measures the
+    // configuration the server actually compiles with.
+    internal static CSharpGeneratorDriver CreateGeneratorDriver(
+        Project project, ImmutableArray<ISourceGenerator> generators)
+    {
+        var additionalTexts = project.AdditionalDocuments
+            .Select(d => (AdditionalText)new AdditionalTextFile(d))
+            .ToImmutableArray();
+
+        return CSharpGeneratorDriver.Create(
+            generators: generators,
+            additionalTexts: additionalTexts,
+            parseOptions: (CSharpParseOptions)project.ParseOptions!,
+            optionsProvider: project.AnalyzerOptions.AnalyzerConfigOptionsProvider);
     }
 
     private Task<Document> GetDocumentAsync(string filePath)
@@ -793,19 +982,11 @@ public partial class RoslynService
 
         if (document == null) return null;
 
-        var enableCache = Environment.GetEnvironmentVariable("ROSLYN_ENABLE_SEMANTIC_CACHE") != "false";
-        if (enableCache)
+        if (SemanticCacheEnabled)
         {
             _documentCache[filePath] = document;
         }
         return document;
-    }
-
-    private int GetPosition(SyntaxTree syntaxTree, int line, int column)
-    {
-        var text = syntaxTree.GetText();
-        var linePosition = new Microsoft.CodeAnalysis.Text.LinePosition(line, column);
-        return text.Lines.GetPosition(linePosition);
     }
 
     private (ISymbol? symbol, object debugInfo) TryFindSymbolForRename(
@@ -829,7 +1010,7 @@ public partial class RoslynService
         if (node != null)
         {
             debugInfo["nodeKind"] = node.Kind().ToString();
-            debugInfo["nodeText"] = node.ToString().Length > 50 ? node.ToString().Substring(0, 50) + "..." : node.ToString();
+            debugInfo["nodeText"] = TruncateForSnippet(node.ToString(), 50, "...");
 
             // Try GetDeclaredSymbol first (for declarations)
             var symbol = semanticModel.GetDeclaredSymbol(node);
@@ -983,6 +1164,23 @@ public partial class RoslynService
         return Task.FromResult<object>(result);
     }
 
+    // Whether a type display string matches a type-name query. A simple-identifier
+    // query (the common case) must match a whole word, so `int` does not match
+    // `uint` and `Task` does not match `TaskResult`/`TaskCompletionSource`; a
+    // complex query (generics, namespaces, arrays) falls back to a substring match.
+    private static bool TypeDisplayMatches(string displayString, string query)
+    {
+        if (string.IsNullOrEmpty(query)) return true;
+        if (query.All(c => char.IsLetterOrDigit(c) || c == '_'))
+        {
+            return System.Text.RegularExpressions.Regex.IsMatch(
+                displayString,
+                $@"\b{System.Text.RegularExpressions.Regex.Escape(query)}\b",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        }
+        return displayString.Contains(query, StringComparison.OrdinalIgnoreCase);
+    }
+
     public async Task<object> SemanticQueryAsync(
         List<string>? kinds,
         bool? isAsync,
@@ -994,32 +1192,28 @@ public partial class RoslynService
         List<string>? attributes,
         List<string>? parameterIncludes,
         List<string>? parameterExcludes,
-        int? maxResults)
+        int? maxResults,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
         var results = new List<object>();
         var maxResultsToReturn = maxResults ?? 100;
+        var matchCount = 0;
 
         // Statistics for summary
         var countByKind = new Dictionary<string, int>();
 
         foreach (var project in _solution!.Projects)
         {
-            if (results.Count >= maxResultsToReturn)
-                break;
-
-            var compilation = await GetProjectCompilationAsync(project);
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
 
             // Get all symbols in the project
-            var allSymbols = compilation.GetSymbolsWithName(_ => true, SymbolFilter.All);
+            var allSymbols = compilation.GetSymbolsWithName(_ => true, SymbolFilter.All, cancellationToken);
 
             foreach (var symbol in allSymbols)
             {
-                if (results.Count >= maxResultsToReturn)
-                    break;
-
                 // Skip compiler-generated
                 if (symbol.IsImplicitlyDeclared || !symbol.Locations.Any(loc => loc.IsInSource))
                     continue;
@@ -1086,7 +1280,7 @@ public partial class RoslynService
                         matches = false;
 
                     // Filter by return type
-                    if (!string.IsNullOrEmpty(returnType) && !methodSymbol.ReturnType.ToDisplayString().Contains(returnType, StringComparison.OrdinalIgnoreCase))
+                    if (!string.IsNullOrEmpty(returnType) && !TypeDisplayMatches(methodSymbol.ReturnType.ToDisplayString(), returnType))
                         matches = false;
 
                     // Filter by parameters
@@ -1094,7 +1288,7 @@ public partial class RoslynService
                     {
                         var paramTypes = methodSymbol.Parameters.Select(p => p.Type.ToDisplayString()).ToList();
                         bool hasAllIncludes = parameterIncludes.All(include =>
-                            paramTypes.Any(pt => pt.Contains(include, StringComparison.OrdinalIgnoreCase)));
+                            paramTypes.Any(pt => TypeDisplayMatches(pt, include)));
 
                         if (!hasAllIncludes)
                             matches = false;
@@ -1104,7 +1298,7 @@ public partial class RoslynService
                     {
                         var paramTypes = methodSymbol.Parameters.Select(p => p.Type.ToDisplayString()).ToList();
                         bool hasAnyExclude = parameterExcludes.Any(exclude =>
-                            paramTypes.Any(pt => pt.Contains(exclude, StringComparison.OrdinalIgnoreCase)));
+                            paramTypes.Any(pt => TypeDisplayMatches(pt, exclude)));
 
                         if (hasAnyExclude)
                             matches = false;
@@ -1113,13 +1307,13 @@ public partial class RoslynService
                 else if (symbol is IPropertySymbol propertySymbol)
                 {
                     // Filter by type
-                    if (!string.IsNullOrEmpty(type) && !propertySymbol.Type.ToDisplayString().Contains(type, StringComparison.OrdinalIgnoreCase))
+                    if (!string.IsNullOrEmpty(type) && !TypeDisplayMatches(propertySymbol.Type.ToDisplayString(), type))
                         matches = false;
                 }
                 else if (symbol is IFieldSymbol fieldSymbol)
                 {
                     // Filter by type
-                    if (!string.IsNullOrEmpty(type) && !fieldSymbol.Type.ToDisplayString().Contains(type, StringComparison.OrdinalIgnoreCase))
+                    if (!string.IsNullOrEmpty(type) && !TypeDisplayMatches(fieldSymbol.Type.ToDisplayString(), type))
                         matches = false;
                 }
 
@@ -1134,6 +1328,12 @@ public partial class RoslynService
                 var symbolKind = symbol is INamedTypeSymbol nt ? GetTypeKindString(nt) : symbol.Kind.ToString();
 
                 countByKind[symbolKind] = countByKind.GetValueOrDefault(symbolKind) + 1;
+                matchCount++;
+
+                // Materialize the result only while under the cap; keep counting
+                // past it so totalCount and truncated are honest.
+                if (results.Count >= maxResultsToReturn)
+                    continue;
 
                 var result = new Dictionary<string, object>
                 {
@@ -1190,7 +1390,7 @@ public partial class RoslynService
                 "get_symbol_info for detailed info on a result",
                 "find_references to see usages"
             },
-            totalCount: results.Count,
+            totalCount: matchCount,
             returnedCount: results.Count
         );
     }
@@ -1255,44 +1455,36 @@ public partial class RoslynService
             "FluentValidation.IValidator",
 
             // AutoMapper
-            "AutoMapper.Profile",
-
-            // Generic patterns
-            "System.IDisposable",
-            "System.IAsyncDisposable"
+            "AutoMapper.Profile"
         };
 
         // Check if type implements any of these interfaces
-        var allInterfaces = typeSymbol.AllInterfaces;
-        foreach (var iface in allInterfaces)
+        foreach (var iface in typeSymbol.AllInterfaces)
         {
             var fullName = iface.ToDisplayString();
-            foreach (var frameworkInterface in frameworkInterfaces)
-            {
-                if (fullName.Contains(frameworkInterface, StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-            }
+            if (frameworkInterfaces.Any(fi => MatchesFrameworkType(fullName, fi)))
+                return true;
         }
 
         // Check base types (for abstract base classes like BackgroundService)
-        var baseType = typeSymbol.BaseType;
-        while (baseType != null)
+        for (var baseType = typeSymbol.BaseType; baseType != null; baseType = baseType.BaseType)
         {
             var baseTypeName = baseType.ToDisplayString();
-            foreach (var frameworkInterface in frameworkInterfaces)
-            {
-                if (baseTypeName.Contains(frameworkInterface, StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-            }
-            baseType = baseType.BaseType;
+            if (frameworkInterfaces.Any(fi => MatchesFrameworkType(baseTypeName, fi)))
+                return true;
         }
 
         return false;
     }
+
+    // Exact framework-type match that still accepts generic instantiations: the
+    // display name equals the framework type, or is the framework type followed by a
+    // generic argument list (IRequestHandler vs IRequestHandler<Cmd, Res>). A substring
+    // match would false-positive on any type whose name merely contains a framework
+    // type's name.
+    private static bool MatchesFrameworkType(string displayName, string frameworkType) =>
+        displayName == frameworkType
+        || displayName.StartsWith(frameworkType + "<", StringComparison.Ordinal);
 
     /// <summary>
     /// Checks if a type has common framework attributes that indicate it's discovered/used by the framework
@@ -1334,7 +1526,12 @@ public partial class RoslynService
             var attributeName = attribute.AttributeClass?.Name ?? "";
             foreach (var frameworkAttr in frameworkAttributes)
             {
-                if (attributeName.Contains(frameworkAttr, StringComparison.OrdinalIgnoreCase))
+                // Exact class-name match (with the optional 'Attribute' suffix), not a
+                // substring test: a user attribute merely containing "Controller",
+                // "Collection", "Route" etc. must not be mistaken for the framework one
+                // and silently dropped from the unused-code report.
+                if (string.Equals(attributeName, frameworkAttr, StringComparison.Ordinal)
+                    || string.Equals(attributeName, frameworkAttr + "Attribute", StringComparison.Ordinal))
                 {
                     return true;
                 }

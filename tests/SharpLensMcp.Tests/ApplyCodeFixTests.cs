@@ -27,16 +27,35 @@ public class ApplyCodeFixTests : IAsyncLifetime
         _fixturePath = Path.Combine(dir, "tests", "SharpLensMcp.Tests", "Fixtures", "UnusedVariableFixture.cs");
         _originalFixtureContent = File.ReadAllText(_fixturePath);
         File.WriteAllText(_fixturePath, BrokenContent);
-        _service = new RoslynService();
-        var result = await _service.LoadSolutionAsync(_solutionPath);
-        JObject.FromObject(result)["success"]?.Value<bool>().Should().BeTrue();
+        try
+        {
+            _service = new RoslynService();
+            var result = await _service.LoadSolutionAsync(_solutionPath);
+            var loadJson = JObject.FromObject(result);
+            loadJson["success"].Should().NotBeNull();
+            loadJson["success"]!.Value<bool>().Should().BeTrue();
+        }
+        catch
+        {
+            // BrokenContent is already on disk. xUnit runs DisposeAsync only after a
+            // successful InitializeAsync, so an init-time failure here would otherwise
+            // leave the broken fixture on disk and dirty the tree. Restore before
+            // propagating. (Charter C7.)
+            File.WriteAllText(_fixturePath, _originalFixtureContent);
+            throw;
+        }
     }
 
     public Task DisposeAsync()
     {
-        if (_originalFixtureContent != null && _fixturePath != null && File.Exists(_fixturePath))
+        // Always restore the fixture to its committed content — recreating it even
+        // if a test deleted it — and assert the restore physically landed, so a
+        // swallowed write can't leave the tree dirty for the next serialized test.
+        if (_originalFixtureContent != null && _fixturePath != null)
         {
             File.WriteAllText(_fixturePath, _originalFixtureContent);
+            File.ReadAllText(_fixturePath).Should().Be(_originalFixtureContent,
+                "the fixture must be restored to its committed content after the test");
         }
 
         return Task.CompletedTask;
@@ -47,15 +66,20 @@ public class ApplyCodeFixTests : IAsyncLifetime
     {
         var beforeDiag = await _service.GetDiagnosticsAsync(filePath: _fixturePath, projectPath: null, severity: null, includeHidden: false, runAnalyzers: false);
         var beforeJson = JObject.FromObject(beforeDiag);
-        beforeJson["success"]?.Value<bool>().Should().BeTrue();
+        beforeJson["success"].Should().NotBeNull();
+        beforeJson["success"]!.Value<bool>().Should().BeTrue();
         var beforeIds = beforeJson["data"]!["diagnostics"]!.Select(d => d["id"]!.Value<string>()).ToList();
         beforeIds.Should().Contain("CS0219", "the pre-mutated fixture must emit CS0219 before apply");
         var preview = await _service.ApplyCodeFixAsync(_fixturePath, "CS0219", line: 6, column: 12, fixIndex: 0, preview: true);
         var previewJson = JObject.FromObject(preview);
-        previewJson["success"]?.Value<bool>().Should().BeTrue(previewJson.ToString());
-        previewJson["data"]!["preview"]?.Value<bool>().Should().BeTrue();
-        previewJson["data"]!["applied"]?.Value<bool>().Should().BeFalse();
-        previewJson["data"]!["diagnosticId"]?.Value<string>().Should().Be("CS0219");
+        previewJson["success"].Should().NotBeNull();
+        previewJson["success"]!.Value<bool>().Should().BeTrue(previewJson.ToString());
+        previewJson["data"]!["preview"].Should().NotBeNull();
+        previewJson["data"]!["preview"]!.Value<bool>().Should().BeTrue();
+        previewJson["data"]!["applied"].Should().NotBeNull();
+        previewJson["data"]!["applied"]!.Value<bool>().Should().BeFalse();
+        previewJson["data"]!["diagnosticId"].Should().NotBeNull();
+        previewJson["data"]!["diagnosticId"]!.Value<string>().Should().Be("CS0219");
         var changedFiles = previewJson["data"]!["changedFiles"] as JArray;
         changedFiles.Should().NotBeNull();
         changedFiles!.Count.Should().BeGreaterThan(0);
@@ -67,16 +91,55 @@ public class ApplyCodeFixTests : IAsyncLifetime
         diskAfterPreview.Should().Contain("int x = 5", "preview must NOT apply the fix to disk");
         var applied = await _service.ApplyCodeFixAsync(_fixturePath, "CS0219", line: 6, column: 12, fixIndex: 0, preview: false);
         var appliedJson = JObject.FromObject(applied);
-        appliedJson["success"]?.Value<bool>().Should().BeTrue(appliedJson.ToString());
-        appliedJson["data"]!["applied"]?.Value<bool>().Should().BeTrue();
-        appliedJson["data"]!["preview"]?.Value<bool>().Should().BeFalse();
+        appliedJson["success"].Should().NotBeNull();
+        appliedJson["success"]!.Value<bool>().Should().BeTrue(appliedJson.ToString());
+        appliedJson["data"]!["applied"].Should().NotBeNull();
+        appliedJson["data"]!["applied"]!.Value<bool>().Should().BeTrue();
+        appliedJson["data"]!["preview"].Should().NotBeNull();
+        appliedJson["data"]!["preview"]!.Value<bool>().Should().BeFalse();
         var diskAfterApply = File.ReadAllText(_fixturePath);
         diskAfterApply.Should().NotContain("int x = 5", "apply must rewrite the file without the unused variable");
         diskAfterApply.Should().Contain("return 0", "the rest of the method must still be present");
         var afterDiag = await _service.GetDiagnosticsAsync(filePath: _fixturePath, projectPath: null, severity: null, includeHidden: false, runAnalyzers: false);
         var afterJson = JObject.FromObject(afterDiag);
-        afterJson["success"]?.Value<bool>().Should().BeTrue();
+        afterJson["success"].Should().NotBeNull();
+        afterJson["success"]!.Value<bool>().Should().BeTrue();
         var afterIds = afterJson["data"]!["diagnostics"]!.Select(d => d["id"]!.Value<string>()).ToList();
         afterIds.Should().NotContain("CS0219", "apply must remove the CS0219 diagnostic");
+    }
+
+    [Fact]
+    public async Task GetCodeFixes_OnCS0219_ListsTheSameRealFixesAsApplyCodeFix()
+    {
+        // get_code_fixes previously returned canned guidance strings while
+        // apply_code_fix listed the real provider fixes — the documented workflow
+        // showed the agent two different realities. Lock the consistency: both
+        // tools must list the same provider fixes with the same indices.
+        var fixesResult = await _service.GetCodeFixesAsync(_fixturePath, "CS0219", line: 6, column: 12);
+        var fixesJson = JObject.FromObject(fixesResult);
+        fixesJson["success"].Should().NotBeNull("response envelope must include success");
+        fixesJson["success"]!.Value<bool>().Should().BeTrue(fixesJson.ToString());
+
+        var fixes = fixesJson["data"]!["fixes"] as JArray;
+        fixes.Should().NotBeNullOrEmpty("CS0219 has at least one real provider fix (remove unused variable)");
+        foreach (var fix in fixes!)
+        {
+            fix["index"]!.Type.Should().Be(JTokenType.Integer);
+            fix["title"]!.Value<string>().Should().NotBeNullOrEmpty();
+        }
+        fixesJson["data"]!["fallbackSuggestions"]!.Type.Should().Be(JTokenType.Null,
+            "fallback guidance only appears when no provider fix exists");
+
+        // apply_code_fix without fixIndex lists the available fixes — titles and
+        // order must match get_code_fixes so fixIndex round-trips between them.
+        var listing = await _service.ApplyCodeFixAsync(_fixturePath, "CS0219", line: 6, column: 12, fixIndex: null, preview: true);
+        var listingJson = JObject.FromObject(listing);
+        listingJson["success"]!.Value<bool>().Should().BeTrue(listingJson.ToString());
+        var available = listingJson["data"]!["availableFixes"] as JArray;
+        available.Should().NotBeNullOrEmpty();
+
+        fixes.Select(f => f["title"]!.Value<string>())
+            .Should().Equal(available!.Select(a => a["title"]!.Value<string>()),
+                "both tools must present the same fixes in the same order");
     }
 }

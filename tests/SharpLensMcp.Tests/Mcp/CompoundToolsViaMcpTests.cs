@@ -9,13 +9,8 @@ namespace SharpLensMcp.Tests.Mcp;
 // concrete content the aggregation surfaces.
 //
 // Response shapes:
-//  - get_type_overview:          Compound.cs:308-324
-//  - analyze_method:             Compound.cs:496-507
-//  - get_file_overview:          Compound.cs:585-595
-//  - get_method_source:          Inspection.cs:1385-1402
-//  - get_method_source_batch:    Inspection.cs:1486-1494
-//  - get_instantiation_options:  Inspection.cs:1062-1074
-//  - get_project_health:         Quality.cs:572-613
+//  - get_type_overview, analyze_method, get_file_overview, get_method_source,
+//    get_method_source_batch, get_instantiation_options, get_project_health
 //
 // Tightening rule for this file: every accessor uses `!.Value<T>()` (NRE on
 // missing) rather than `?.Value<T>()` (silent-pass via short-circuit).
@@ -26,14 +21,14 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetTypeOverview_OnRoslynService_ReturnsClassWithKnownMemberCounts()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_type_overview", new
+        var data = await CallAndGetDataAsync("get_type_overview", new
         {
             typeName = "RoslynService"
         });
-        // Lock the documented response shape (Compound.cs:308-324).
+        // Lock the documented get_type_overview response shape.
         data["typeName"]!.Value<string>()!.Should().Contain("RoslynService");
         data["simpleName"]!.Value<string>().Should().Be("RoslynService",
-            "simpleName is the unqualified name (Compound.cs:312)");
+            "simpleName is the unqualified name");
         data["typeKind"]!.Value<string>().Should().Be("Class");
         data["namespace"]!.Value<string>().Should().Be("SharpLensMcp");
         data["isAbstract"]!.Value<bool>().Should().BeFalse();
@@ -41,7 +36,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
         data["isStatic"]!.Value<bool>().Should().BeFalse();
         data["interfaceCount"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
 
-        // memberSummary has all five count fields (Compound.cs:290-297).
+        // memberSummary has all five count fields.
         var memberSummary = data["memberSummary"]!;
         memberSummary["methods"]!.Value<int>().Should().BeGreaterOrEqualTo(20,
             "RoslynService has well over 20 ordinary methods across the partials");
@@ -52,35 +47,33 @@ public class CompoundToolsViaMcpTests : McpTestBase
         memberSummary["constructors"]!.Value<int>().Should().BeGreaterOrEqualTo(1,
             "RoslynService must have at least the default constructor");
 
-        // godotAttributes — all four must be false on a non-Godot project (Compound.cs:300-306).
-        var godot = data["godotAttributes"]!;
-        godot["hasExport"]!.Value<bool>().Should().BeFalse();
-        godot["hasSignal"]!.Value<bool>().Should().BeFalse();
-        godot["hasTool"]!.Value<bool>().Should().BeFalse();
-        godot["hasGlobalClass"]!.Value<bool>().Should().BeFalse();
+        // The engine-specific godotAttributes block was removed from this
+        // general-purpose server — lock its absence so it doesn't creep back.
+        data["godotAttributes"].Should().BeNull(
+            "get_type_overview must not carry game-engine-specific fields");
     }
 
     [Fact]
     public async Task GetTypeOverview_OnFourFixtureKinds_DistinguishesRecordClassRecordStructAndPlain()
     {
         // The RecordFixture explicitly declares four control types to exercise
-        // GetTypeKindString (RoslynService.cs:59-66). The prior test only
+        // GetTypeKindString. The prior test only
         // checked Person → "Record"; a regression returning "Record" for every
         // call would pass. Each case below pins its expected typeKind so a
         // regression on any branch of GetTypeKindString fails loudly.
-        var person = await CallAndGetDataAsync("roslyn:get_type_overview", new { typeName = "Person" });
+        var person = await CallAndGetDataAsync("get_type_overview", new { typeName = "Person" });
         person["typeKind"]!.Value<string>().Should().Be("Record",
             "Person is a `record class` — TypeKind.Class + IsRecord=true → 'Record'");
 
-        var point2d = await CallAndGetDataAsync("roslyn:get_type_overview", new { typeName = "Point2D" });
+        var point2d = await CallAndGetDataAsync("get_type_overview", new { typeName = "Point2D" });
         point2d["typeKind"]!.Value<string>().Should().Be("RecordStruct",
             "Point2D is a `record struct` — TypeKind.Struct + IsRecord=true → 'RecordStruct'");
 
-        var customer = await CallAndGetDataAsync("roslyn:get_type_overview", new { typeName = "PlainCustomer" });
+        var customer = await CallAndGetDataAsync("get_type_overview", new { typeName = "PlainCustomer" });
         customer["typeKind"]!.Value<string>().Should().Be("Class",
             "PlainCustomer is a plain class (control case)");
 
-        var point = await CallAndGetDataAsync("roslyn:get_type_overview", new { typeName = "PlainPoint" });
+        var point = await CallAndGetDataAsync("get_type_overview", new { typeName = "PlainPoint" });
         point["typeKind"]!.Value<string>().Should().Be("Struct",
             "PlainPoint is a plain struct (control case)");
     }
@@ -88,7 +81,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task AnalyzeMethod_OnLoadSolutionAsync_ReturnsExpectedSignatureAndCallers()
     {
-        var data = await CallAndGetDataAsync("roslyn:analyze_method", new
+        var data = await CallAndGetDataAsync("analyze_method", new
         {
             typeName = "RoslynService",
             methodName = "LoadSolutionAsync",
@@ -96,7 +89,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
             includeOutgoingCalls = false
         });
 
-        // signature is a nested object (Compound.cs:376-391).
+        // signature is a nested object.
         var signature = data["signature"]!;
         signature["name"]!.Value<string>().Should().Be("LoadSolutionAsync");
         signature["returnType"]!.Value<string>()!.Should().Contain("Task<object>",
@@ -104,24 +97,28 @@ public class CompoundToolsViaMcpTests : McpTestBase
         // Roslyn's default ToDisplayString omits parameter names — the rendered
         // signature is "...LoadSolutionAsync(string)"; the parameter NAME is in
         // parameters[], the TYPE in the full signature.
-        signature["fullSignature"]!.Value<string>()!.Should().Contain("LoadSolutionAsync(string)");
+        signature["fullSignature"]!.Value<string>()!.Should().Contain("LoadSolutionAsync(string, System.Threading.CancellationToken)");
         signature["isAsync"]!.Value<bool>().Should().BeTrue();
         signature["isStatic"]!.Value<bool>().Should().BeFalse();
         signature["accessibility"]!.Value<string>().Should().Be("Public");
 
         var parameters = (signature["parameters"] as JArray)!;
-        parameters.Should().HaveCount(1, "LoadSolutionAsync takes exactly one parameter");
+        parameters.Should().HaveCount(2,
+            "LoadSolutionAsync takes solutionPath plus the cancellationToken every tool method carries");
         parameters[0]["name"]!.Value<string>().Should().Be("solutionPath");
         parameters[0]["type"]!.Value<string>().Should().Be("string");
         parameters[0]["isOptional"]!.Value<bool>().Should().BeFalse();
+        parameters[1]["name"]!.Value<string>().Should().Be("cancellationToken");
+        parameters[1]["isOptional"]!.Value<bool>().Should().BeTrue();
 
         // includeCallers=true → callers populated; includeOutgoingCalls=false →
-        // outgoingCalls must be null (Compound.cs:423, 500).
+        // outgoingCalls must be null.
         var callers = (data["callers"] as JArray)!;
         callers.Should().NotBeEmpty();
-        data["totalCallers"]!.Value<int>().Should().BeGreaterOrEqualTo(1);
+        data["totalCallerGroups"]!.Value<int>().Should().BeGreaterThanOrEqualTo(callers.Count,
+            "totalCallerGroups counts distinct calling symbols and is never less than the groups shown");
         data["callersShown"]!.Value<int>().Should().Be(callers.Count,
-            "callersShown must match the actual returned count (Compound.cs:502)");
+            "callersShown must match the actual returned count");
         data["outgoingCalls"]!.Type.Should().Be(JTokenType.Null,
             "includeOutgoingCalls=false → outgoingCalls is null");
         data["overloadCount"]!.Value<int>().Should().BeGreaterOrEqualTo(1);
@@ -138,19 +135,20 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task AnalyzeMethod_WithOutgoingCalls_ListsCalls()
     {
-        var data = await CallAndGetDataAsync("roslyn:analyze_method", new
+        var data = await CallAndGetDataAsync("analyze_method", new
         {
             typeName = "RoslynService",
             methodName = "LoadSolutionAsync",
             includeCallers = false,
             includeOutgoingCalls = true
         });
-        // includeCallers=false → callers null (Compound.cs:394, 500).
+        // includeCallers=false → callers null.
         data["callers"]!.Type.Should().Be(JTokenType.Null,
             "includeCallers=false → callers is null");
-        data["totalCallers"]!.Value<int>().Should().Be(0);
+        data["totalCallerGroups"]!.Value<int>().Should().Be(0,
+            "includeCallers=false → no caller groups counted");
 
-        // outgoingCalls populated. Per Compound.cs:455-462 each entry has
+        // outgoingCalls populated. Each entry has
         // method, shortName, returnType, isAsync, isExternal.
         var outgoing = (data["outgoingCalls"] as JArray)!;
         outgoing.Should().NotBeEmpty(
@@ -169,8 +167,8 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task AnalyzeMethod_TypeNotFound_ReturnsTypeNotFound()
     {
-        // Compound.cs:357-364: unknown typeName → TypeNotFound.
-        var error = await CallAndGetErrorAsync("roslyn:analyze_method", new
+        // Unknown typeName → TypeNotFound.
+        var error = await CallAndGetErrorAsync("analyze_method", new
         {
             typeName = "DoesNotExist_12345",
             methodName = "DoesNotMatter"
@@ -182,9 +180,9 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task AnalyzeMethod_MethodNotFoundOnType_ReturnsSymbolNotFound()
     {
-        // Compound.cs:367-372: type resolves but method name doesn't exist on it.
+        // Type resolves but method name doesn't exist on it.
         // Distinct branch from TypeNotFound (covered separately).
-        var error = await CallAndGetErrorAsync("roslyn:analyze_method", new
+        var error = await CallAndGetErrorAsync("analyze_method", new
         {
             typeName = "RoslynService",
             methodName = "DoesNotExist_12345"
@@ -195,8 +193,8 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task AnalyzeMethod_EmptyTypeName_ReturnsInvalidParameter()
     {
-        // Compound.cs:349-354: whitespace-or-empty typeName/methodName.
-        var error = await CallAndGetErrorAsync("roslyn:analyze_method", new
+        // Whitespace-or-empty typeName/methodName.
+        var error = await CallAndGetErrorAsync("analyze_method", new
         {
             typeName = "",
             methodName = "LoadSolutionAsync"
@@ -207,10 +205,10 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task AnalyzeDataFlow_OnEmptyRegion_ReturnsAnalysisFailed()
     {
-        // Compound.cs:62-70: line range that doesn't enclose any statements
+        // Line range that doesn't enclose any statements
         // (e.g., a using-directive line) → AnalysisFailed with the "No
         // statements found" message.
-        var error = await CallAndGetErrorAsync("roslyn:analyze_data_flow", new
+        var error = await CallAndGetErrorAsync("analyze_data_flow", new
         {
             filePath = Fixture.RoslynServicePath,
             startLine = 0, // line 0 is a `using` directive
@@ -222,8 +220,8 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task AnalyzeControlFlow_OnEmptyRegion_ReturnsAnalysisFailed()
     {
-        // Compound.cs:172-179: same no-statements branch for control flow.
-        var error = await CallAndGetErrorAsync("roslyn:analyze_control_flow", new
+        // Same no-statements branch for control flow.
+        var error = await CallAndGetErrorAsync("analyze_control_flow", new
         {
             filePath = Fixture.RoslynServicePath,
             startLine = 0,
@@ -235,7 +233,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetFileOverview_NonExistentFile_ReturnsFileNotInSolution()
     {
-        var error = await CallAndGetErrorAsync("roslyn:get_file_overview", new
+        var error = await CallAndGetErrorAsync("get_file_overview", new
         {
             filePath = "/does/not/exist/Nope.cs"
         }, codeContains: ErrorCodes.FileNotInSolution);
@@ -245,7 +243,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task AnalyzeDataFlow_NonExistentFile_ReturnsFileNotInSolution()
     {
-        var error = await CallAndGetErrorAsync("roslyn:analyze_data_flow", new
+        var error = await CallAndGetErrorAsync("analyze_data_flow", new
         {
             filePath = "/does/not/exist/Nope.cs",
             startLine = 0,
@@ -257,7 +255,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task AnalyzeControlFlow_NonExistentFile_ReturnsFileNotInSolution()
     {
-        var error = await CallAndGetErrorAsync("roslyn:analyze_control_flow", new
+        var error = await CallAndGetErrorAsync("analyze_control_flow", new
         {
             filePath = "/does/not/exist/Nope.cs",
             startLine = 0,
@@ -269,11 +267,11 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetFileOverview_OnRoslynService_ReportsTypeDeclarationsIncludingRoslynService()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_file_overview", new
+        var data = await CallAndGetDataAsync("get_file_overview", new
         {
             filePath = Fixture.RoslynServicePath
         });
-        // Lock the documented response shape (Compound.cs:585-595).
+        // Lock the documented get_file_overview response shape.
         data["filePath"]!.Value<string>()!.Should().Contain("RoslynService");
         data["projectName"]!.Value<string>().Should().Be("SharpLensMcp",
             "RoslynService.cs lives in the main SharpLensMcp project");
@@ -291,7 +289,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
             t["name"]?.Value<string>() == "RoslynService");
         roslynServiceDecl.Should().NotBeNull(
             "the file declares the RoslynService partial class");
-        // Per-decl shape (Compound.cs:563-569): name, kind, line, memberCount.
+        // Per-decl shape: name, kind, line, memberCount.
         roslynServiceDecl!["kind"]!.Value<string>().Should().Be("Class",
             "kind strips the 'Declaration' suffix; ClassDeclaration → 'Class'");
         roslynServiceDecl["line"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
@@ -302,23 +300,23 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetMethodSource_ReturnsFullSourceWithSignatureAndBody()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_method_source", new
+        var data = await CallAndGetDataAsync("get_method_source", new
         {
             typeName = "RoslynService",
             methodName = "GetHealthCheckAsync"
         });
-        // Lock the documented response shape (Inspection.cs:1385-1402).
+        // Lock the documented get_method_source response shape.
         data["typeName"]!.Value<string>()!.Should().Contain("RoslynService");
         data["methodName"]!.Value<string>().Should().Be("GetHealthCheckAsync");
         data["signature"]!.Value<string>()!.Should().Contain("GetHealthCheckAsync");
         data["overloadIndex"]!.Value<int>().Should().Be(0,
-            "default overloadIndex is 0 when not specified (Inspection.cs:1323)");
+            "default overloadIndex is 0 when not specified");
         data["totalOverloads"]!.Value<int>().Should().Be(1,
             "GetHealthCheckAsync has exactly one overload");
         data["lineCount"]!.Value<int>().Should().BeGreaterThan(20,
             "GetHealthCheckAsync spans well over 20 lines");
 
-        // location { filePath, startLine, endLine } (Inspection.cs:1393-1398).
+        // location { filePath, startLine, endLine }.
         // Note: the impl uses method.Locations.GetLineSpan() — that's the
         // IDENTIFIER token's span (one line for a single-line declaration),
         // NOT the full method body span. So startLine == endLine is normal.
@@ -330,21 +328,23 @@ public class CompoundToolsViaMcpTests : McpTestBase
             "endLine is >= startLine (equal when the identifier fits on one line)");
 
         var source = data["fullSource"]!.Value<string>()!;
-        source.Should().Contain("public async Task<object> GetHealthCheckAsync()",
-            "fullSource must include the exact declaration");
+        source.Should().Contain("public async Task<object> GetHealthCheckAsync(",
+            "fullSource must include the declaration");
+        source.Should().Contain("bool includeDiagnostics = false",
+            "fullSource must include the includeDiagnostics parameter");
         source.Should().Contain("CreateSuccessResponse",
             "the body uses CreateSuccessResponse");
 
         data["bodySource"]!.Value<string>()!.Should().NotBeNullOrEmpty(
-            "bodySource is populated for block-bodied methods (Inspection.cs:1376-1379)");
+            "bodySource is populated for block-bodied methods");
     }
 
     [Fact]
     public async Task GetMethodSource_InvalidOverloadIndex_ReturnsInvalidParameter()
     {
-        // Inspection.cs:1324-1330: out-of-range overloadIndex → InvalidParameter
+        // Out-of-range overloadIndex → InvalidParameter
         // with a message enumerating the available range.
-        var error = await CallAndGetErrorAsync("roslyn:get_method_source", new
+        var error = await CallAndGetErrorAsync("get_method_source", new
         {
             typeName = "RoslynService",
             methodName = "GetHealthCheckAsync",
@@ -358,7 +358,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetMethodSourceBatch_ReturnsBothSourcesWithFullEnvelopeShape()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_method_source_batch", new
+        var data = await CallAndGetDataAsync("get_method_source_batch", new
         {
             methods = new object[]
             {
@@ -366,7 +366,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
                 new { typeName = "RoslynService", methodName = "GetHealthCheckAsync" }
             }
         });
-        // Lock the batch-tool metadata shape (Inspection.cs:1486-1494).
+        // Lock the batch-tool metadata shape.
         data["totalRequested"]!.Value<int>().Should().Be(2);
         data["successCount"]!.Value<int>().Should().Be(2);
         data["errorCount"]!.Value<int>().Should().Be(0);
@@ -374,7 +374,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
         var results = (data["results"] as JArray)!;
         results.Should().HaveCount(2);
 
-        // Each result envelope (Inspection.cs:1466-1472) has typeName, methodName,
+        // Each result envelope has typeName, methodName,
         // success=true, data{inner}. Tightening from `results[0]["data"]?["fullSource"]`
         // — that `["data"]?` chain silent-passes if the data field is missing.
         foreach (var r in results)
@@ -394,21 +394,21 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetInstantiationOptions_OnDisposableTarget_ImplementsIDisposableHintFires()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_instantiation_options", new
+        var data = await CallAndGetDataAsync("get_instantiation_options", new
         {
             typeName = "DisposableTarget"
         });
         data["implementsIDisposable"]!.Value<bool>().Should().BeTrue();
         data["hint"]!.Value<string>()!.Should().Contain("using",
-            "the IDisposable hint at Inspection.cs:1056 suggests `using` statement");
+            "the IDisposable hint suggests `using` statement");
     }
 
     [Fact]
     public async Task GetInstantiationOptions_OnFactoryTarget_ListsFactoryMethods()
     {
         // FactoryTarget has static Create() and Build(int) returning itself.
-        // Inspection.cs:997-1012 collects these.
-        var data = await CallAndGetDataAsync("roslyn:get_instantiation_options", new
+        // The factoryMethods pass collects these.
+        var data = await CallAndGetDataAsync("get_instantiation_options", new
         {
             typeName = "FactoryTarget"
         });
@@ -422,8 +422,8 @@ public class CompoundToolsViaMcpTests : McpTestBase
     public async Task GetInstantiationOptions_OnExternalFactoryTarget_DetectsExternalFactoriesOnHostType()
     {
         // ExternalFactoryHost has CreateTarget/BuildTarget/NewTarget — all
-        // matching the Create*/Build*/New* prefix patterns at Inspection.cs:1030.
-        var data = await CallAndGetDataAsync("roslyn:get_instantiation_options", new
+        // matching the Create*/Build*/New* prefix patterns.
+        var data = await CallAndGetDataAsync("get_instantiation_options", new
         {
             typeName = "ExternalFactoryTarget"
         });
@@ -442,11 +442,11 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetInstantiationOptions_OnRoslynService_ListsParameterlessConstructor()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_instantiation_options", new
+        var data = await CallAndGetDataAsync("get_instantiation_options", new
         {
             typeName = "RoslynService"
         });
-        // Lock the documented response shape (Inspection.cs:1062-1074).
+        // Lock the documented get_instantiation_options response shape.
         data["typeName"]!.Value<string>()!.Should().Contain("RoslynService");
         data["typeKind"]!.Value<string>().Should().Be("Class");
         data["isAbstract"]!.Value<bool>().Should().BeFalse();
@@ -457,7 +457,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
             "no RoslynServiceBuilder type exists in the solution");
         // hint is null for a non-disposable, non-abstract, non-interface concrete type.
         data["hint"]!.Type.Should().Be(JTokenType.Null,
-            "no hint applies to a non-disposable concrete class (Inspection.cs:1054-1060)");
+            "no hint applies to a non-disposable concrete class");
 
         var ctors = (data["constructors"] as JArray)!;
         ctors.Should().NotBeEmpty();
@@ -465,7 +465,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
         var defaultCtor = ctors.FirstOrDefault(c =>
             (c["parameters"] as JArray)?.Count == 0);
         defaultCtor.Should().NotBeNull("RoslynService exposes a parameterless ctor");
-        // Per-ctor shape (Inspection.cs:982-993): signature, accessibility, parameters, isObsolete.
+        // Per-ctor shape: signature, accessibility, parameters, isObsolete.
         defaultCtor!["signature"]!.Value<string>().Should().NotBeNullOrEmpty();
         defaultCtor["accessibility"]!.Value<string>().Should().Be("Public");
         defaultCtor["isObsolete"]!.Value<bool>().Should().BeFalse();
@@ -481,7 +481,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetProjectHealth_OnSharpLensMcp_ReportsCleanBuildAcrossAllSections()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_project_health", new
+        var data = await CallAndGetDataAsync("get_project_health", new
         {
             projectName = "SharpLensMcp",
             includeAnalyzers = false,
@@ -496,17 +496,40 @@ public class CompoundToolsViaMcpTests : McpTestBase
         diag["warningCount"]!.Value<int>().Should().Be(0,
             "the codebase has no compiler warnings");
         diag["analyzerCount"]!.Value<int>().Should().Be(0,
-            "includeAnalyzers=false → analyzerCount must be 0 (Quality.cs:524)");
+            "includeAnalyzers=false → analyzerCount must be 0");
 
-        data["unusedCode"]!["count"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
-        data["coupling"]!["godObjectCandidates"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
-        data["coverage"]!["uncoveredPublicSurface"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
+        // unusedCode.count and uncoveredPublicSurface must equal the tools
+        // get_project_health aggregates (same filters), not a >= 0 tautology.
+        var unusedTotal = (await CallToolAsync("find_unused_code", new
+        {
+            projectName = "SharpLensMcp", includePrivate = false, includeInternal = false
+        }))["meta"]!["totalCount"]!.Value<int>();
+        data["unusedCode"]!["count"]!.Value<int>().Should().Be(unusedTotal,
+            "the composite unused count must match find_unused_code's total");
 
-        // Summary string must contain all five buckets per Quality.cs:569 format.
+        var uncoveredTotal = (await CallToolAsync("find_untested_code", new
+        {
+            projectName = "SharpLensMcp", includeProperties = false, includeInternal = false
+        }))["meta"]!["totalCount"]!.Value<int>();
+        data["coverage"]!["uncoveredPublicSurface"]!.Value<int>().Should().Be(uncoveredTotal,
+            "the composite uncovered count must match find_untested_code's total");
+
+        // RoslynService is the one type in SharpLensMcp that meets the god-object
+        // thresholds, so the coupling aggregate is exactly 1 — a regression that
+        // dropped the scan (returning 0) would otherwise pass a >= 0 check.
+        data["coupling"]!["godObjectCandidates"]!.Value<int>().Should().Be(1,
+            "RoslynService is the single type expected to meet the god-object thresholds");
+        (data["coupling"]!["hotspots"] as JArray)!
+            .Select(h => h["typeName"]!.Value<string>())
+            .Should().ContainSingle(n => n!.EndsWith("RoslynService"),
+                "the sole god-object hotspot must be RoslynService");
+
+        // Summary string must contain all five buckets per the summary format,
+        // with the known god-object count locked.
         var summary = data["summary"]!.Value<string>()!;
         summary.Should().Contain("0 errors");
         summary.Should().Contain("0 warnings");
-        summary.Should().Contain("god-object");
+        summary.Should().Contain("1 god-object candidates");
         summary.Should().Contain("uncovered");
         summary.Should().Contain("unused");
     }
@@ -515,7 +538,7 @@ public class CompoundToolsViaMcpTests : McpTestBase
     public async Task GetProjectHealth_UnknownProject_ReturnsInvalidParameterWithEchoedName()
     {
         var error = await CallAndGetErrorAsync(
-            "roslyn:get_project_health",
+            "get_project_health",
             new { projectName = "DoesNotExist_12345" },
             codeContains: ErrorCodes.InvalidParameter);
         // The helper already enforced codeContains=InvalidParameter. The prior

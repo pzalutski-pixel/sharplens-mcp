@@ -47,24 +47,29 @@ public class GodObjectTests : RoslynServiceTestBase
         // the displayed thresholds from the applied ones) would go undetected.
         var threshold = data["threshold"] as JObject;
         threshold.Should().NotBeNull();
-        threshold!["efferent"]?.Value<int>().Should().Be(20);
-        threshold["members"]?.Value<int>().Should().Be(20);
+        threshold!["efferent"].Should().NotBeNull();
+        threshold["efferent"]!.Value<int>().Should().Be(20);
+        threshold["members"].Should().NotBeNull();
+        threshold["members"]!.Value<int>().Should().Be(20);
 
         var candidates = data["candidates"] as JArray;
         var god = candidates!.First(c => c["typeName"]!.Value<string>()!.EndsWith("GodObjectFixtureClass"));
 
-        god["efferentCoupling"]?.Value<int>().Should().BeGreaterOrEqualTo(25,
-            "fixture has 25 fields, each of a distinct GodObjectTypeNN type");
-        god["memberCount"]?.Value<int>().Should().BeGreaterOrEqualTo(25,
-            "fixture has 25 fields");
+        god["efferentCoupling"].Should().NotBeNull();
+        god["efferentCoupling"]!.Value<int>().Should().Be(25,
+            "the fixture has exactly 25 fields, each of a distinct GodObjectTypeNN type");
+        god["memberCount"].Should().NotBeNull();
+        god["memberCount"]!.Value<int>().Should().Be(25,
+            "the fixture declares exactly 25 fields and no other members");
 
-        // Every entry's shape: afferentCoupling, score, location must be present.
-        god["afferentCoupling"]?.Type.Should().Be(JTokenType.Integer,
-            "afferentCoupling is always reported as an integer");
-        // score is a numeric scalar; the impl computes it from coupling/member counts.
-        // Either int or float — assert >0 covers both via .Value<double>().
-        god["score"]?.Value<double>().Should().BeGreaterThan(0,
-            "the god class must have a positive numeric score");
+        // afferentCoupling is exactly 0 — nothing in the solution references the fixture.
+        god["afferentCoupling"].Should().NotBeNull();
+        god["afferentCoupling"]!.Value<int>().Should().Be(0,
+            "no type depends on GodObjectFixtureClass");
+        // score = efferent*0.4 + members*0.4 + afferent*0.2 = 25*.4 + 25*.4 + 0 = 20.
+        god["score"].Should().NotBeNull();
+        god["score"]!.Value<double>().Should().BeApproximately(20d, 0.001,
+            "score = efferent*0.4 + members*0.4 + afferent*0.2 = 25*.4 + 25*.4 + 0");
         god["location"].Should().NotBeNull(
             "every candidate must surface its declaration location");
     }
@@ -107,7 +112,7 @@ public class GodObjectTests : RoslynServiceTestBase
     [Fact]
     public async Task FindGodObjects_WithoutProjectFilter_FindsGodAcrossAllProjects()
     {
-        // No projectName → scans ALL projects (RoslynService.Quality.cs:326-328).
+        // No projectName → scans ALL projects.
         // The god-object fixture lives in SharpLensMcp.Tests and must still be flagged.
         var result = await Service.FindGodObjectsAsync(
             projectName: null,
@@ -121,5 +126,17 @@ public class GodObjectTests : RoslynServiceTestBase
         candidates.Should().NotBeNullOrEmpty();
         candidates!.Any(c => c["typeName"]?.Value<string>()?.EndsWith("GodObjectFixtureClass") == true)
             .Should().BeTrue("the god class must surface in a no-filter scan");
+    }
+
+    [Fact]
+    public async Task UnknownProject_ReturnsInvalidParameter()
+    {
+        // An unknown projectName must fail consistently with the rest of the quality
+        // family, not silently return zero candidates.
+        var result = await Service.FindGodObjectsAsync(projectName: "NoSuchProject");
+
+        AssertError(result, ErrorCodes.InvalidParameter);
+        JObject.FromObject(result)["error"]!["Message"]!.Value<string>()
+            .Should().Contain("Project not found");
     }
 }

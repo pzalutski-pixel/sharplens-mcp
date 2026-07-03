@@ -122,7 +122,7 @@ public class RequestIdTests
     [Fact]
     public void Deserialize_ArrayId_ThrowsJsonException()
     {
-        // The converter's switch (RequestId.cs:34-39) only accepts String + Number.
+        // The converter's switch only accepts String + Number.
         // Arrays must fall into the default branch with the canonical message.
         var act = () => JsonSerializer.Deserialize<RequestId>("[1,2,3]", Options);
         act.Should().Throw<JsonException>().WithMessage("*string or integer*");
@@ -138,7 +138,7 @@ public class RequestIdTests
     [Fact]
     public void ToString_DefaultRequestId_ReturnsEmptyString()
     {
-        // Default constructor leaves Value=null. RequestId.cs:19-22 returns "" for that case.
+        // Default constructor leaves Value=null. ToString returns "" for that case.
         // Otherwise the test risks invariant culture / accidental "null" string output.
         default(RequestId).ToString().Should().Be("");
     }
@@ -146,7 +146,7 @@ public class RequestIdTests
     [Fact]
     public void GetHashCode_DefaultRequestId_ReturnsZero()
     {
-        // Per RequestId.cs:26, the null-Value case returns 0.
+        // The null-Value case returns 0.
         default(RequestId).GetHashCode().Should().Be(0);
     }
 
@@ -161,7 +161,7 @@ public class RequestIdTests
     [Fact]
     public void EqualsObjectOverride_WithNonRequestId_ReturnsFalse()
     {
-        // The Equals(object?) override (RequestId.cs:25) must reject anything that
+        // The Equals(object?) override must reject anything that
         // isn't a RequestId — including a string with the same content.
         var id = new RequestId("abc");
         id.Equals((object)"abc").Should().BeFalse(
@@ -172,7 +172,7 @@ public class RequestIdTests
     [Fact]
     public void Serialize_DefaultRequestId_WritesJsonNull()
     {
-        // RequestId.cs:48 — the converter's Write writes JSON null for the default-Value case.
+        // The converter's Write writes JSON null for the default-Value case.
         var json = JsonSerializer.Serialize(default(RequestId), Options);
         json.Should().Be("null");
     }

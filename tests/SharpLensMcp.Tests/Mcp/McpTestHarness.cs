@@ -6,7 +6,7 @@ using Xunit;
 namespace SharpLensMcp.Tests.Mcp;
 
 // Owns a single McpServer for all MCP-layer integration tests. Loads the
-// SharpLensMcp solution once via tools/call roslyn:load_solution (so the
+// SharpLensMcp solution once via tools/call load_solution (so the
 // load_solution path is itself exercised end-to-end). xUnit shares this
 // across every test class in the McpServer collection so the ~30s solution
 // load happens once per test run rather than per class.
@@ -32,10 +32,16 @@ public sealed class McpServerFixture : IAsyncLifetime
         SolutionPath = Path.Combine(dir, "SharpLensMcp.sln");
         RoslynServicePath = Path.Combine(dir, "src", "RoslynService.cs");
 
-        Server = new McpServer();
+        // Generous per-call budget via the internal seam: under full-suite
+        // parallel load a heavy tool (an analyzer-running get_diagnostics, or
+        // find_tests' full-solution coverage BFS) can exceed a tighter budget and
+        // flake with TIMEOUT on a CPU-contended machine. 300s gives those the
+        // headroom to finish under contention. Timeout SEMANTICS stay covered by
+        // the dedicated McpServerTests cases that inject a 1ms budget explicitly.
+        Server = new McpServer(TimeSpan.FromSeconds(300));
 
         var harness = new McpHarnessOps(Server);
-        var loadInner = await harness.CallToolAsync("roslyn:load_solution",
+        var loadInner = await harness.CallToolAsync("load_solution",
             new { solutionPath = SolutionPath });
         loadInner["success"].Should().NotBeNull(
             "response must include success field");
@@ -220,7 +226,7 @@ public abstract class McpTestBase
     protected async Task<(string filePath, int line, int column)> LocateSymbolAsync(
         string query, string? kind = null, Func<JToken, bool>? predicate = null)
     {
-        var data = await CallAndGetDataAsync("roslyn:search_symbols", new
+        var data = await CallAndGetDataAsync("search_symbols", new
         {
             query,
             kind,

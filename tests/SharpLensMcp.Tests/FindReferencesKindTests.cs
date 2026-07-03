@@ -71,7 +71,7 @@ public class FindReferencesKindTests : RoslynServiceTestBase
     {
         // TrackedMarker is a const referenced directly in `[Tracked(TrackedMarker)]`.
         // The classifier walks up from the identifier and reaches AttributeSyntax
-        // before any other matched kind — returns "attribute" (Navigation.cs:718-719).
+        // before any other matched kind — returns "attribute".
         var (file, line, col) = await LocateAsync("TrackedMarker", kind: "Field");
         var result = await Service.FindReferencesAsync(file, line, col);
         AssertSuccess(result);
@@ -80,6 +80,22 @@ public class FindReferencesKindTests : RoslynServiceTestBase
         refs.Should().NotBeNullOrEmpty();
         refs.Any(r => r["kind"]?.Value<string>() == "attribute")
             .Should().BeTrue("TrackedMarker is used directly as an attribute argument");
+    }
+
+    [Fact]
+    public async Task FindReferences_OnReceiverField_ClassifiesReceiverAsReadNotInvocation()
+    {
+        // `Receiver.Use()` reads the field to invoke Use(); the reference to Receiver
+        // must be "read". The classifier previously labeled it "invocation" because the
+        // node sits spatially inside the call's expression.
+        var (file, line, col) = await LocateAsync("Receiver", kind: "Field");
+        var result = await Service.FindReferencesAsync(file, line, col);
+        AssertSuccess(result);
+
+        var refs = (GetData(result)["references"] as JArray)!;
+        refs.Should().NotBeEmpty("Receiver is used as a call receiver in CallViaReceiver");
+        refs.Should().OnlyContain(r => r["kind"]!.Value<string>() == "read",
+            "Receiver's only use is as a call receiver, which is a read — Receiver itself is never invoked");
     }
 
     [Fact]
@@ -97,17 +113,16 @@ public class FindReferencesKindTests : RoslynServiceTestBase
         var data = GetData(filtered);
 
         var refs = data["references"] as JArray;
-        refs.Should().NotBeNullOrEmpty(
-            "TrackedField has at least one write site in the fixture");
-        refs!.All(r => r["kind"]?.Value<string>() == "write")
-            .Should().BeTrue("kind filter must drop every non-write reference");
+        // TrackedField's only write is `TrackedField = () => 7` — exactly one site.
+        refs!.Count.Should().Be(1, "the fixture has exactly one write reference to TrackedField");
+        refs[0]!["kind"]!.Value<string>().Should().Be("write");
 
-        // Both numbers must be present and filtered <= unfiltered.
-        data["totalReferences"]?.Value<int>().Should().Be(unfilteredCount);
-        var afterFilter = data["totalReferencesAfterFilter"]?.Value<int>();
-        afterFilter.Should().NotBeNull("response with kind filter must include totalReferencesAfterFilter");
-        afterFilter!.Value.Should().BeLessThan(unfilteredCount,
-            "the fixture has more non-write references than write references");
+        // The fixture references TrackedField four ways (nameof, write, invocation,
+        // read); the declaration is excluded by SymbolFinder.
+        data["totalReferences"]!.Value<int>().Should().Be(unfilteredCount);
+        unfilteredCount.Should().Be(4, "nameof + write + invocation + read");
+        data["totalReferencesAfterFilter"]!.Value<int>().Should().Be(1,
+            "exactly one of the four references is a write");
     }
 
     [Fact]
@@ -122,8 +137,10 @@ public class FindReferencesKindTests : RoslynServiceTestBase
         refs.Should().NotBeNull();
         refs!.Count.Should().Be(0, "no reference has the kind 'no-such-kind'");
 
-        data["totalReferencesAfterFilter"]?.Value<int>().Should().Be(0);
-        data["totalReferences"]?.Value<int>().Should().BeGreaterThan(0,
+        data["totalReferencesAfterFilter"].Should().NotBeNull();
+        data["totalReferencesAfterFilter"]!.Value<int>().Should().Be(0);
+        data["totalReferences"].Should().NotBeNull();
+        data["totalReferences"]!.Value<int>().Should().BeGreaterThan(0,
             "unfiltered total must still reflect all real references");
     }
 }

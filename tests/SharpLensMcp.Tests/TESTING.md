@@ -1,64 +1,172 @@
-# Tool test contract
+# Testing Charter (C1–C9)
 
-Rules every test in this project must follow. Codifies the lessons from our test-integrity audit so the "vacuous test" failure mode doesn't recur.
+The standing contract for **every** test in this project. A test that cannot
+fail on a wrong answer is a defect, not coverage — "it returned something" is
+never a test. These rules codify the lessons from two test-integrity audits;
+they are binding on all existing and future tests, and every new tool's commit
+must carry both test levels (C4).
 
-## The contract
+---
 
-1. **Exact-content assertions, not shape-only.** A test must assert at least one specific value — a name, a count, a substring, a kind. `Should().NotBeNull()` and `Should().NotBeEmpty()` are allowed *in addition* to a content check, not in place of one.
+## C1 — Lock a specific known value
 
-2. **No silent skips.** Never write `if (results?.Count > 0) { ...assertions... }`. The fixture must guarantee the precondition holds; if it can't (e.g. the underlying tool returns success on some branch and failure on another), assert both branches explicitly.
+Every test asserts at least one concrete expected value: an exact name, an exact
+count, an exact substring, an exact error code, an exact `(line, column)`.
 
-3. **No placebo bodies.** A test body that ends with `var json = JObject.FromObject(result); // Just verify no crash` is not a test. Either delete it or make it assert something the implementation can break.
+Banned **as the sole assertion** on the value a test is named for:
+`NotBeNull()` / `NotBeNullOrEmpty()`, `BeGreaterThan(0)` / `BeGreaterOrEqualTo(0)`
+on counts or coordinates, `.Type.Should().Be(JTokenType.Integer/Boolean)`
+(type-only), and `(success or error).Should().BeTrue()`. They may appear *in
+addition to* a content lock, never in place of one.
 
-4. **Response field names live in code.** When a test reads `data["someField"]`, that field must exist in the implementation's `CreateSuccessResponse` payload. Mismatches mean the test never observes anything and silently passes. (See: the v1.5.3 audit, where 25 tests gated on `data["symbols"]` while the impl returned `data["results"]`.)
+## C2 — No null-conditional in assertions
 
-5. **Use `SemanticAssertions` for shared patterns.** `SemanticAssertions.AssertSymbolFound`, `AssertReferencesInclude`, etc. lower the friction of writing a real assertion to the same length as writing a vacuous one. Prefer them over hand-rolled `.Any(...).Should().BeTrue()` when the pattern repeats.
-
-6. **Tests that modify disk must restore.** Tools like `change_signature` and `rename_symbol` apply edits to source files. Tests for those tools snapshot the file content in `InitializeAsync` and restore it in `DisposeAsync` so xUnit's per-test isolation actually holds.
-
-## Anti-patterns to look for during review
-
-These are smoke signals that a test isn't a test:
+`data["x"]?.Value<T>().Should().Be(y)` silently skips the entire assertion when
+the key is absent — the `?.` short-circuits `.Should()`. Instead:
 
 ```csharp
-// SMOKE: silent skip if search returns nothing
-var symbols = GetData(searchResult)["results"] as JArray;
-if (symbols?.Count > 0)
-{
-    ...
-}
-
-// SMOKE: foreach-with-fallback hides empty case
-foreach (var diag in (data["diagnostics"] as JArray) ?? new JArray())
-{
-    ...
-}
-
-// SMOKE: assertion that always passes
-var json = JObject.FromObject(result);
-// Verify no crash
-
-// SMOKE: shape-only
-data["someField"].Should().NotBeNull();
+data["x"].Should().NotBeNull();          // names the missing field on failure
+data["x"]!.Value<T>().Should().Be(y);    // throws if the type is wrong
 ```
 
-Reviewers: if you see any of these, ask the author what concrete failure the test would catch.
+The bare `?.` is fine inside `.Select`/`.Any`/`.Where` projections (it isn't an
+assertion there) — only the `?.…Should()` chain is banned. Note the regex
+`?.Value<T>().Should()` does **not** catch `["x"]?.Type.Should()` or
+`?.Count.Should()`; find those by reading, not pattern-matching.
 
-## Two test styles, two when-to-use rules
+## C3 — Field names verified against the actual serializer on the test's path
 
-**Solution-loaded integration tests** (`RoslynServiceTestBase`-derived). The whole `SharpLensMcp.sln` is loaded via `MSBuildWorkspace`. Use for tools that need real project references, real source generators, or where end-to-end "this works against our actual codebase" is the assertion. Cost: ~30s solution load amortized across all tests in the run.
+Two serializers, two casings. Confirm against the implementation before asserting.
 
-**In-memory tests** (`TestHelpers.CreateWorkspaceWithCode` + `RoslynService.LoadFromWorkspaceForTesting`). An `AdhocWorkspace` with a single hand-crafted document. Use for tools designed to work on incomplete code (`get_missing_members`, `validate_code`, `add_null_checks`) or anywhere you want exact control over input shape and don't need cross-file references. Cost: ~5ms per test. See `GetMissingMembersTests.cs` for the canonical pattern.
+| Read path | Serializer | Casing |
+|---|---|---|
+| In-process `JObject.FromObject(result)` | Newtonsoft | envelope `success`/`data`/`meta` are **lowercase** (anonymous object)… |
+| …but `meta` (a `ResponseMetadata` class) | Newtonsoft | **PascalCase** `TotalCount` / `ReturnedCount` / `Truncated` |
+| …and `error` (a `RoslynError` class) | Newtonsoft | **PascalCase** `Code` / `Message` / `Hint` / `Context` |
+| Over the MCP wire (`content[0].text`) | System.Text.Json | **camelCase** everywhere: `code` / `message` / `hint`, `totalCount`, … |
 
-**Why both:** Some tools must be tested on broken code (CS0535 etc. are hardwired compiler errors; the file can't sit on disk in our test project without suppression, which the project doesn't allow). The in-memory path is also the established Roslyn community pattern (`dotnet/roslyn`, `dotnet-format`). The solution-loaded path catches integration regressions the in-memory tests can't.
+So an in-process error test reads `json["error"]!["Code"]`; the same assertion
+over the wire (via `McpTestBase`) reads `error["code"]`. Mismatched casing makes
+the read null and (with C2 violated) silently passes.
 
-## When you can't pin to a specific value
+## C4 — Two mandatory levels for EVERY tool
 
-Build a deterministic fixture that pins it down. No exceptions.
+Both ship in the tool's own commit (retroactive for existing tools):
 
-The `(json["success"]?.Value<bool>() == true || json["error"] != null).Should().BeTrue()` "behavior contract" pattern is **forbidden** — it passes on the wrong outcome and is functionally identical to a smoke test. Cursor-position-sensitive Roslyn refactoring tools must either:
+- **Unit level** — at least one content-locked test of the `RoslynService` method
+  against a deterministic fixture.
+- **Integration level** — at least one test that drives the tool **through the MCP
+  dispatcher** (JSON-RPC), unwraps `content[0].text`, and asserts exact
+  pre-determined values, **plus** at least one error path through the wire (which
+  validates the camelCase `error.code` mapping). A direct `Service.XAsync()` call
+  is a unit test, never integration; "integration" means through the
+  dispatcher/wire (`McpTestBase.CallAndGetDataAsync` / `CallAndGetErrorAsync`).
 
-1. Use a fixture position where the action is **always** offered, then assert on specific preview content (success-path locking); OR
-2. Use a fixture position where the action is **never** offered, then assert on the specific `ErrorCodes.*` value the wrapper returns (error-path locking).
+Wire tests live in `Mcp/*ViaMcpTests.cs` and `Mcp/WireCoverageViaMcpTests.cs`.
+For tools whose main path needs inputs that can't exist in the shared clean
+solution (in-memory-only fixtures, deliberate diagnostics, C# 14 extension
+blocks), wire-cover the deterministic error path and keep the value-pinned main
+path at the unit level — and say so in a comment.
 
-If neither path is reliably reproducible, the tool needs better engineering — not a weaker test.
+## C5 — Deterministic fixtures, never live source
+
+Expected values come from fixed `Fixtures/*.cs`, not the evolving repo. No
+inequality thresholds against live source (`totalReferences >= 2`). Positions are
+pinned **exactly** by resolving a line from a marker string and asserting
+equality — never merely `> 0`:
+
+```csharp
+var line = Array.FindIndex(File.ReadAllLines(fixturePath),
+    l => l.Contains("return ComputeAsync().Result;"));
+result["location"]!["line"]!.Value<int>().Should().Be(line); // 0-based, Roslyn's convention
+```
+
+Re-grounding examples: `ReferenceCountFixture.Anchor` (exactly 5 references / 5
+callers), `ComplexityFixture` (cyclomatic 1 for `Trivial`, 6 for `Branchy`),
+`GodObjectFixtureClass` (efferent 25 / members 25 / afferent 0 / score 20).
+Documented exception: tools whose subject **is** the repo (the `diff_api_surface`
+zero-breaking-vs-`HEAD` canary).
+
+## C6 — Out-of-process spine
+
+`StdioIntegrationTests` spawns the **real built binary** and drives JSON-RPC over
+stdin/stdout. It value-pins at least one representative tool **per category**
+(not just the session contract) and runs the `tools/list` golden `DeepEquals`
+over the actual stdio pipe — not only in-process. This is the only layer that
+covers wire serialization, stdout purity, `DOTNET_SOLUTION_PATH` auto-load, and
+clean EOF shutdown.
+
+## C7 — The run is itself deterministic
+
+No pass may depend on timing or scheduling.
+
+- **Serialization:** `xunit.runner.json` sets `parallelizeTestCollections: false`,
+  so no two whole-solution MSBuild loads or on-disk fixture mutations overlap.
+- **Crash-safe mutation:** a fixture-mutating test snapshots content, restores it
+  in `DisposeAsync` (recreating a deleted file), and **asserts the restore
+  landed**; a test that writes during `InitializeAsync` restores in a `catch` so
+  an init-time failure can't leave the tree dirty (xUnit skips `DisposeAsync`
+  after a failed init). Prefer a temp-dir copy over mutating a compiled fixture.
+- **No timing seams:** the tool-call timeout test uses the forced-cancellation
+  seam — `internal McpServer(TimeSpan, CancellationToken)` links a pre-cancelled
+  token into the per-call CTS and is checked before dispatch, yielding `TIMEOUT`
+  deterministically — never a `1 ms`-budget race.
+
+## C8 — Global invariant canaries stay reliable
+
+Keep the solution-wide canaries in `SolutionHealthInvariantTests` (a clean
+solution ⇒ 0 compiler errors; each generated tree appears exactly once) and keep
+them immune to fixture-mutation races (C7). They catch pipeline regressions
+(e.g. a generator pass running twice) regardless of which tool would surface it.
+
+## C9 — Pre-commit gate
+
+Build-clean + green is necessary, **not** sufficient. Before staging: re-read
+every changed test end-to-end; for each assertion ask *"what specific wrong
+answer does this catch?"* If the answer is "none / it crashed / the field was
+missing," it fails the gate. Reason through whether the test would fail if the
+expected value were wrong.
+
+---
+
+## Two test styles — when to use which
+
+- **Solution-loaded** (`RoslynServiceTestBase`-derived): the whole
+  `SharpLensMcp.sln` is loaded via `MSBuildWorkspace`. Use when the tool needs
+  real project references, source generators, or genuine "works against our
+  codebase" coverage. The ~30 s load is amortized across the run.
+- **In-memory** (`TestHelpers.CreateWorkspaceWithCode` +
+  `RoslynService.LoadFromWorkspaceForTesting`): an `AdhocWorkspace` with one
+  hand-crafted document. Use for tools designed for incomplete/broken code
+  (`get_missing_members`, `validate_code`, `find_dead_branches`,
+  `find_naming_violations`) or when you need exact control over input shape — and
+  for inputs that can't sit on disk without breaking the clean-solution canary
+  (CS0535, dead-branch CS0162, C# 14 extension blocks the SDK 8 compiler rejects).
+  The established Roslyn-community pattern; see `GetMissingMembersTests.cs`.
+
+## Anti-patterns — smoke signals a "test" isn't one
+
+```csharp
+// SMOKE: null-conditional silently skips the assertion (C2)
+data["x"]?.Value<int>().Should().Be(5);
+
+// SMOKE: shape-only / type-only, the sole assertion (C1)
+data["x"].Should().NotBeNull();
+data["x"]!.Type.Should().Be(JTokenType.Integer);
+
+// SMOKE: passes on the wrong outcome — the forbidden "behavior contract"
+(json["success"]?.Value<bool>() == true || json["error"] != null).Should().BeTrue();
+
+// SMOKE: silent skip / foreach-with-fallback hides the empty case
+if (symbols?.Count > 0) { ...assertions... }
+foreach (var d in (data["diagnostics"] as JArray) ?? new JArray()) { ... }
+
+// SMOKE: inequality against live, evolving source (C5)
+data["totalReferences"]!.Value<int>().Should().BeGreaterThan(1);
+```
+
+A cursor-position-sensitive refactoring tool must either use a fixture position
+where the action is **always** offered and lock specific preview content, or a
+position where it's **never** offered and lock the exact `ErrorCodes.*` value. If
+neither is reliably reproducible, the tool needs better engineering — not a
+weaker test.

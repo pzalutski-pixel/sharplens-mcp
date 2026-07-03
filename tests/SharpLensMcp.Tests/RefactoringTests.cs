@@ -29,16 +29,16 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Locks every field the preview branch emits (Refactoring.cs:229-238).
+        // Locks every field the preview branch emits.
         data["symbolName"]!.Value<string>().Should().Be("_workspace");
         data["symbolKind"]!.Value<string>().Should().Be("Field",
             "the located symbol is a Field per the search_symbols kind filter");
         data["newName"]!.Value<string>().Should().Be("_roslynWorkspace");
         data["verbosity"]!.Value<string>().Should().Be("summary",
-            "default verbosity is 'summary' (Refactoring.cs:27)");
+            "default verbosity is 'summary'");
         data["preview"]!.Value<bool>().Should().BeTrue();
         data["applied"]!.Value<bool>().Should().BeFalse(
-            "preview=true must report applied=false (Refactoring.cs:237)");
+            "preview=true must report applied=false");
 
         var changes = data["changes"] as JArray;
         changes.Should().NotBeNullOrEmpty("renaming _workspace touches at least RoslynService.cs");
@@ -61,7 +61,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         var symbol = symbols![0];
         var loc = symbol["location"]!;
-        // Refactoring.cs:90-98 rejects names that fail SyntaxFacts.IsValidIdentifier
+        // The impl rejects names that fail SyntaxFacts.IsValidIdentifier
         // (e.g., names starting with a digit).
         var result = await Service.RenameSymbolAsync(
             loc["filePath"]!.Value<string>()!,
@@ -84,7 +84,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         var symbol = symbols![0];
         var loc = symbol["location"]!;
-        // Refactoring.cs:81-88 rejects whitespace/empty newName before the identifier check.
+        // The impl rejects whitespace/empty newName before the identifier check.
         var result = await Service.RenameSymbolAsync(
             loc["filePath"]!.Value<string>()!,
             loc["line"]!.Value<int>(),
@@ -115,7 +115,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Locks every top-level field the success branch emits (Refactoring.cs:362-383).
+        // Locks every top-level field the success branch emits.
         data["className"]!.Value<string>().Should().Be("FixtureRectangle");
         data["interfaceName"]!.Value<string>().Should().Be("IFixtureRectangle");
         data["suggestedFileName"]!.Value<string>().Should().Be("IFixtureRectangle.cs");
@@ -148,7 +148,7 @@ public class RefactoringTests : RoslynServiceTestBase
     {
         // RefactoringTarget has a public field (BareCounter) plus three public methods
         // (Sum/GreetingFor/Compute). ExtractInterface filters to methods/properties/
-        // events (Refactoring.cs:347-351) — fields are dropped. The generated interface
+        // events — fields are dropped. The generated interface
         // exercises the METHOD branch of GenerateInterfaceCode at line 649-655 (only
         // the property branch was previously tested via FixtureRectangle).
         var searchResult = await Service.SearchSymbolsAsync("RefactoringTarget", kind: "Class", maxResults: 10);
@@ -169,13 +169,13 @@ public class RefactoringTests : RoslynServiceTestBase
         code.Should().Contain("GreetingFor(");
         code.Should().Contain("Compute(");
         code.Should().NotContain("BareCounter",
-            "ExtractInterface excludes fields (Refactoring.cs:347-348 filters to methods/properties/events)");
+            "ExtractInterface excludes fields (filters to methods/properties/events)");
     }
 
     [Fact]
     public async Task ExtractInterface_IncludeMemberNamesFilter_LimitsToNamedMembers()
     {
-        // Refactoring.cs:354-357: when includeMemberNames is supplied, only members
+        // When includeMemberNames is supplied, only members
         // whose Name matches survive. Pass just ["Width"] and assert Height/Area drop.
         var searchResult = await Service.SearchSymbolsAsync("FixtureRectangle", kind: "Class", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -200,7 +200,7 @@ public class RefactoringTests : RoslynServiceTestBase
     [Fact]
     public async Task RenameSymbol_VerbosityCompact_EmitsLocationsButNoText()
     {
-        // Refactoring.cs:156-176: compact verbosity emits per-change line/column
+        // Compact verbosity emits per-change line/column
         // entries but NOT old/new text snippets. Verifies the verbosity dispatch.
         var searchResult = await Service.SearchSymbolsAsync("_workspace", kind: "Field", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -224,20 +224,20 @@ public class RefactoringTests : RoslynServiceTestBase
         var first = changes[0]!;
         first["filePath"].Should().NotBeNull();
         var innerChanges = first["changes"] as JArray;
-        innerChanges.Should().NotBeNull("compact verbosity emits inner changes array");
-        if (innerChanges!.Count > 0)
-        {
-            innerChanges[0]!["line"].Should().NotBeNull();
-            innerChanges[0]!["column"].Should().NotBeNull();
-            innerChanges[0]!["oldText"].Should().BeNull("compact omits oldText");
-            innerChanges[0]!["newText"].Should().BeNull("compact omits newText");
-        }
+        innerChanges.Should().NotBeNullOrEmpty(
+            "compact verbosity emits a non-empty inner changes array — the renamed " +
+            "symbol has at least one occurrence in its declaring file");
+        // Lock the shape unconditionally (the prior if(Count>0) made it vacuous).
+        innerChanges![0]!["line"].Should().NotBeNull();
+        innerChanges[0]!["column"].Should().NotBeNull();
+        innerChanges[0]!["oldText"].Should().BeNull("compact omits oldText");
+        innerChanges[0]!["newText"].Should().BeNull("compact omits newText");
     }
 
     [Fact]
     public async Task RenameSymbol_VerbosityFull_EmitsTextSnippets()
     {
-        // Refactoring.cs:178-203: full verbosity adds oldText/newText to each
+        // Full verbosity adds oldText/newText to each
         // inner change entry. Locks the differentiator from compact.
         var searchResult = await Service.SearchSymbolsAsync("_workspace", kind: "Field", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -267,7 +267,7 @@ public class RefactoringTests : RoslynServiceTestBase
     public async Task ExtractInterface_OnNonTypePosition_ReturnsNotAType()
     {
         // Position the cursor on the MatchesGlobPattern method declaration — a method,
-        // not a class. Refactoring.cs:335-343 routes non-INamedTypeSymbol results to NotAType.
+        // not a class. The impl routes non-INamedTypeSymbol results to NotAType.
         var lines = File.ReadAllLines(RoslynServicePath);
         var matchLine = Array.FindIndex(lines, l => l.Contains("MatchesGlobPattern(string input"));
         matchLine.Should().BeGreaterThan(0, "MatchesGlobPattern must exist in RoslynService.cs");
@@ -296,7 +296,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Locks the response shape declared at Refactoring.cs:521-533.
+        // Locks the response shape.
         data["appliesEditsAutomatically"]!.Value<bool>().Should().BeFalse(
             "generate_constructor is generation-only — it does NOT mutate the workspace");
         data["typeName"]!.Value<string>().Should().Contain("RefactoringTarget");
@@ -329,7 +329,7 @@ public class RefactoringTests : RoslynServiceTestBase
     [Fact]
     public async Task ExtractInterface_OnEventBearingTarget_EmitsEventDeclaration()
     {
-        // RoslynService.cs:664-668: IEventSymbol branch emits `event T Name;`.
+        // The IEventSymbol branch emits `event T Name;`.
         // EventBearingTarget has a public event `Triggered` of type EventHandler.
         var searchResult = await Service.SearchSymbolsAsync("EventBearingTarget", kind: "Class", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -345,7 +345,7 @@ public class RefactoringTests : RoslynServiceTestBase
         AssertSuccess(result);
         var data = GetData(result);
         var code = data["interfaceCode"]!.Value<string>()!;
-        // The IEventSymbol branch at RoslynService.cs:666-668 emits `event T Name;`
+        // The IEventSymbol branch emits `event T Name;`
         // where T is the event type's ToDisplayString() (may be fully qualified).
         code.Should().Contain("event ",
             "the IEventSymbol branch must emit the `event` keyword");
@@ -358,7 +358,7 @@ public class RefactoringTests : RoslynServiceTestBase
     [Fact]
     public async Task GenerateConstructor_IncludeProperties_PicksUpSettableProperties()
     {
-        // Refactoring.cs:466-477: with includeProperties=true, regular get/set
+        // With includeProperties=true, regular get/set
         // properties (non-init-only, public setter) are added to the parameter
         // list alongside fields. GenCtorWithProperties has two such properties.
         var searchResult = await Service.SearchSymbolsAsync("GenCtorWithProperties", kind: "Class", maxResults: 10);
@@ -386,7 +386,7 @@ public class RefactoringTests : RoslynServiceTestBase
     [Fact]
     public async Task GenerateConstructor_InitializeToDefault_OnNullableField_EmitsNullCoalesce()
     {
-        // Refactoring.cs:508-510: when initializeToDefault=true and a field is
+        // When initializeToDefault=true and a field is
         // nullable-annotated, the assignment becomes `Field = param ?? default;`.
         var searchResult = await Service.SearchSymbolsAsync("GenCtorWithNullableField", kind: "Class", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -408,7 +408,7 @@ public class RefactoringTests : RoslynServiceTestBase
     [Fact]
     public async Task GenerateConstructor_OnTypeWithNoFieldsOrProperties_ReturnsAnalysisFailed()
     {
-        // Refactoring.cs:482-492: empty class → "No fields or properties found
+        // Empty class → "No fields or properties found
         // to initialize" AnalysisFailed branch.
         var searchResult = await Service.SearchSymbolsAsync("GenCtorEmpty", kind: "Class", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
@@ -447,7 +447,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Locks every field emitted by the preview branch (Refactoring.cs:1151-1170).
+        // Locks every field emitted by the preview branch.
         data["preview"]!.Value<bool>().Should().BeTrue();
         data["methodName"]!.Value<string>().Should().Be("ComputePartial");
         data["returnType"]!.Value<string>().Should().Be("int",
@@ -460,7 +460,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         data["signature"]!.Value<string>().Should()
             .Contain("private int ComputePartial",
-                "default accessibility is 'private' (Refactoring.cs:959) and the return is int");
+                "default accessibility is 'private' and the return is int");
         data["extractedCode"]!.Value<string>().Should()
             .Contain("private int ComputePartial",
                 "the extracted method body must open with the generated signature");
@@ -495,7 +495,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Locks the response shape (Inspection.cs:789-796). The impl always emits an array
+        // Locks the response shape. The impl always emits an array
         // (possibly empty) — never a null. The previous test had an unreachable `missing == null`
         // branch; remove it so a future schema change that DROPS the field would fail loudly.
         data["typeName"]!.Value<string>().Should().Contain("RoslynService",
@@ -524,7 +524,7 @@ public class RefactoringTests : RoslynServiceTestBase
         // Find a known invocation inside the method body — the GetProjectCompilationAsync
         // call inside the foreach. Use RoslynServicePath since search returns a relative path.
         var lines = File.ReadAllLines(RoslynServicePath);
-        var callLine = Array.FindIndex(lines, methodLine, l => l.Contains("GetProjectCompilationAsync(project)"));
+        var callLine = Array.FindIndex(lines, methodLine, l => l.Contains("GetProjectCompilationAsync(project,"));
         callLine.Should().BeGreaterThan(methodLine,
             "the GetProjectCompilationAsync invocation must live inside GetHealthCheckAsync's body");
 
@@ -532,7 +532,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Locks the response shape (Inspection.cs:942-948).
+        // Locks the get_outgoing_calls response shape.
         data["method"]!.Value<string>().Should().Contain("GetHealthCheckAsync");
         data["containingType"]!.Value<string>().Should().Contain("RoslynService");
 
@@ -547,6 +547,115 @@ public class RefactoringTests : RoslynServiceTestBase
         gpc["returnType"]!.Value<string>().Should().NotBeNullOrEmpty();
     }
 
+    private async Task<(string file, int line, int col)> LocateCallChainLevel1Async()
+    {
+        var searchResult = await Service.SearchSymbolsAsync("Level1", kind: "Method", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty(
+            "CallChainFixtureTarget.Level1 must be declared in the fixtures project");
+        var loc = symbols![0]["location"]!;
+        return (loc["filePath"]!.Value<string>()!,
+                loc["line"]!.Value<int>(),
+                loc["column"]!.Value<int>());
+    }
+
+    [Fact]
+    public async Task GetOutgoingCalls_DefaultDepth_ReturnsOnlyDirectCalls()
+    {
+        var (file, line, col) = await LocateCallChainLevel1Async();
+
+        var result = await Service.GetOutgoingCallsAsync(file, line, col);
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["maxDepth"]!.Value<int>().Should().Be(1);
+
+        var calls = (data["calls"] as JArray)!;
+        calls.Select(c => c["shortName"]!.Value<string>()).Should().BeEquivalentTo(
+            new[] { "CallChainFixtureTarget.Level2" },
+            "depth 1 must surface Level1's direct call and nothing transitive");
+        calls[0]["depth"]!.Value<int>().Should().Be(1);
+        data["truncatedByDepth"]!.Value<bool>().Should().BeTrue(
+            "Level2 is an in-source callee whose body was left unexplored at depth 1");
+        GetMeta(result)["Truncated"]!.Value<bool>().Should().BeTrue(
+            "the depth bound left Level2's callees unexplored, so meta.Truncated must surface it");
+    }
+
+    [Fact]
+    public async Task GetOutgoingCalls_MaxDepth2_IncludesTransitiveCallWithItsHop()
+    {
+        var (file, line, col) = await LocateCallChainLevel1Async();
+
+        var result = await Service.GetOutgoingCallsAsync(file, line, col, maxDepth: 2);
+        AssertSuccess(result);
+        var data = GetData(result);
+
+        var calls = (data["calls"] as JArray)!;
+        var depthByName = calls.ToDictionary(
+            c => c["shortName"]!.Value<string>()!,
+            c => c["depth"]!.Value<int>());
+        depthByName.Should().Equal(new Dictionary<string, int>
+        {
+            ["CallChainFixtureTarget.Level2"] = 1,
+            ["CallChainFixtureTarget.Level3"] = 2
+        });
+        data["truncatedByDepth"]!.Value<bool>().Should().BeFalse(
+            "Level3 sits at the depth-2 boundary but calls nothing — a true leaf loses " +
+            "nothing by not being expanded, so the depth-truncation flag stays false");
+    }
+
+    [Fact]
+    public async Task GetOutgoingCalls_MaxDepth3_ExploresFullChainWithoutTruncation()
+    {
+        var (file, line, col) = await LocateCallChainLevel1Async();
+
+        var result = await Service.GetOutgoingCallsAsync(file, line, col, maxDepth: 3);
+        AssertSuccess(result);
+        var data = GetData(result);
+
+        var calls = (data["calls"] as JArray)!;
+        calls.Select(c => c["shortName"]!.Value<string>()).Should().BeEquivalentTo(
+            new[] { "CallChainFixtureTarget.Level2", "CallChainFixtureTarget.Level3" },
+            "the chain bottoms out at Level3, which calls nothing");
+        data["truncatedByDepth"]!.Value<bool>().Should().BeFalse(
+            "every in-source callee in the chain was explored");
+        GetMeta(result)["Truncated"]!.Value<bool>().Should().BeFalse(
+            "nothing was left unexplored, so meta.Truncated must be false");
+    }
+
+    [Fact]
+    public async Task GetOutgoingCalls_CapturesUnqualifiedPropertyRead()
+    {
+        // OutgoingCallsTarget.UsesUnqualifiedProperty reads `Magnitude` with no
+        // member-access node; the broadened collector must still surface it.
+        var searchResult = await Service.SearchSymbolsAsync("UsesUnqualifiedProperty", kind: "Method", maxResults: 10);
+        var symbols = GetData(searchResult)["results"] as JArray;
+        symbols.Should().NotBeNullOrEmpty();
+        var loc = symbols![0]["location"]!;
+
+        var result = await Service.GetOutgoingCallsAsync(
+            loc["filePath"]!.Value<string>()!, loc["line"]!.Value<int>(), loc["column"]!.Value<int>());
+        AssertSuccess(result);
+
+        var calls = (GetData(result)["calls"] as JArray)!;
+        var magnitude = calls.FirstOrDefault(c =>
+            c["shortName"]?.Value<string>() == "OutgoingCallsTarget.Magnitude");
+        magnitude.Should().NotBeNull(
+            "the bare unqualified `Magnitude` read must surface even with no member-access node");
+        magnitude!["isProperty"]!.Value<bool>().Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task GetOutgoingCalls_MaxDepthOutOfRange_ReturnsInvalidParameter()
+    {
+        var (file, line, col) = await LocateCallChainLevel1Async();
+
+        var zero = await Service.GetOutgoingCallsAsync(file, line, col, maxDepth: 0);
+        AssertError(zero, ErrorCodes.InvalidParameter);
+
+        var eleven = await Service.GetOutgoingCallsAsync(file, line, col, maxDepth: 11);
+        AssertError(eleven, ErrorCodes.InvalidParameter);
+    }
+
     [Fact]
     public async Task OrganizeUsings_OnRoslynServiceCs_OutputsSystemFirstThenAlphabetical()
     {
@@ -558,7 +667,7 @@ public class RefactoringTests : RoslynServiceTestBase
         organized.Should().Contain("using System");
         organized.Should().Contain("using Microsoft.CodeAnalysis");
 
-        // The contract of OrganizeUsingsAsync (Analysis.cs:981-984) is: bucket 0 = System*,
+        // The contract of OrganizeUsingsAsync is: bucket 0 = System*,
         // bucket 1 = everything else, alphabetical within each bucket. Verify System* appears
         // BEFORE non-System usings — the test was previously a smoke check that didn't
         // verify any actual ordering.
@@ -567,7 +676,7 @@ public class RefactoringTests : RoslynServiceTestBase
         systemIdx.Should().BeGreaterOrEqualTo(0);
         microsoftIdx.Should().BeGreaterOrEqualTo(0);
         systemIdx.Should().BeLessThan(microsoftIdx,
-            "System-prefixed usings must come before non-System usings per the OrderBy in Analysis.cs:981-984");
+            "System-prefixed usings must come before non-System usings per the OrderBy");
     }
 
     [Fact]
@@ -580,7 +689,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Locks the response shape declared at Analysis.cs:1094-1101 — the prior test
+        // Locks the response shape — the prior test
         // checked a `fileCount` field the impl does NOT emit, then fell back to counting
         // `files` which only contains files-with-changes. That made the test pass for the
         // wrong reason. Lock the real contract.
@@ -603,7 +712,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Locks the response shape declared at Analysis.cs:1188-1195 — same `fileCount`
+        // Locks the response shape — same `fileCount`
         // misnomer fix as OrganizeUsingsBatch.
         data["preview"]!.Value<bool>().Should().BeTrue();
         data["totalFilesScanned"]!.Value<int>().Should().BeGreaterThan(0);
@@ -634,7 +743,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Response shape (Inspection.cs:126-140): methodName, containingType, overloads[].
+        // Response shape: methodName, containingType, overloads[].
         data["methodName"]!.Value<string>().Should().Be("CreateErrorResponse");
         data["containingType"]!.Value<string>().Should().EndWith("RoslynService",
             "CreateErrorResponse is declared on the RoslynService partial class");
@@ -643,7 +752,7 @@ public class RefactoringTests : RoslynServiceTestBase
         overloads.Should().NotBeNullOrEmpty();
         overloads!.Count.Should().BeGreaterOrEqualTo(1,
             "GetMembers(name) must return at least the method itself");
-        // Per-overload shape (Inspection.cs:104-122): signature, parameters[], returnType,
+        // Per-overload shape: signature, parameters[], returnType,
         // isAsync, isStatic, location.
         foreach (var o in overloads!)
         {
@@ -665,7 +774,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Locks every field in the success response (Inspection.cs:218-232).
+        // Locks every field in the success response.
         data["memberName"]!.Value<string>().Should().Be("MatchesGlobPattern");
         data["memberKind"]!.Value<string>().Should().Be("Method");
         data["containingType"]!.Value<string>().Should().Contain("RoslynService");
@@ -686,7 +795,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Locks the full response shape (TypeDiscovery.cs:492-504).
+        // Locks the full response shape.
         data["attributeName"]!.Value<string>().Should().Be("Fact");
         data["totalFound"]!.Value<int>().Should().BeGreaterThan(0,
             "the test project has at least one [Fact]-decorated method");
@@ -722,7 +831,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Locks the response shape (Navigation.cs:467-473).
+        // Locks the find_implementations response shape.
         data["baseType"]!.Value<string>().Should().EndWith("IShapeFixture");
         data["totalImplementations"]!.Value<int>().Should().BeGreaterOrEqualTo(3,
             "InterfaceHierarchyFixture declares Circle, Rectangle, AND transitively Square");
@@ -735,7 +844,7 @@ public class RefactoringTests : RoslynServiceTestBase
         names.Should().Contain(n => n.EndsWith("FixtureSquare"),
             "find_implementations must include transitive implementers (FixtureSquare : FixtureRectangle : IShapeFixture)");
 
-        // Per-impl shape (Navigation.cs:458-464): name, kind, containingNamespace, locations[].
+        // Per-impl shape: name, kind, containingNamespace, locations[].
         foreach (var i in impls!)
         {
             i["kind"]!.Value<string>().Should().Be("Class",
@@ -761,7 +870,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Locks the response shape (Navigation.cs:587-594).
+        // Locks the get_type_hierarchy response shape.
         data["typeName"]!.Value<string>().Should().EndWith("FixtureSquare");
 
         var baseTypes = data["baseTypes"] as JArray;

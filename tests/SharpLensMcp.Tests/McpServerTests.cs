@@ -64,6 +64,172 @@ public class McpServerTests
             "serverInfo.version must be a semver-like X.Y.Z string");
     }
 
+    [Theory]
+    [InlineData("2024-11-05")]
+    [InlineData("2025-03-26")]
+    [InlineData("2025-06-18")]
+    public async Task HandleRequest_Initialize_EchoesSupportedClientProtocolVersion(string clientVersion)
+    {
+        var request = $$"""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"{{clientVersion}}","capabilities":{},"clientInfo":{"name":"t","version":"1"} } }""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["result"]!.AsObject()["protocolVersion"]!.GetValue<string>().Should().Be(clientVersion,
+            "a supported client version must be echoed back, per MCP version negotiation");
+    }
+
+    [Fact]
+    public async Task HandleRequest_Initialize_UnsupportedClientVersion_AnswersWithLatestSupported()
+    {
+        var request = """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["result"]!.AsObject()["protocolVersion"]!.GetValue<string>().Should().Be("2025-06-18",
+            "an unsupported requested version gets the server's latest supported version");
+    }
+
+    [Fact]
+    public async Task HandleRequest_Initialize_WithoutParams_AnswersWithLatestSupported()
+    {
+        var request = """{"jsonrpc":"2.0","id":1,"method":"initialize"}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["result"]!.AsObject()["protocolVersion"]!.GetValue<string>().Should().Be("2025-06-18");
+    }
+
+    [Theory]
+    [InlineData("Trace", "Trace", true)]
+    [InlineData("Debug", "Trace", true)]
+    [InlineData("Trace", "Debug", false)]
+    [InlineData("Information", "Information", true)]
+    [InlineData("Warning", "Error", false)]
+    [InlineData("Error", "Error", true)]
+    public void ShouldLog_ComparesAgainstTheConfiguredLevel(string message, string configured, bool expected)
+    {
+        McpServer.ShouldLog(message, configured).Should().Be(expected);
+    }
+
+    [Fact]
+    public void ShouldLog_UnknownConfiguredLevel_FallsBackToInformation()
+    {
+        // Array.IndexOf's -1 used to make any unrecognized configured level
+        // (including "Trace" before it existed) log EVERYTHING.
+        McpServer.ShouldLog("Debug", "garbage-level").Should().BeFalse(
+            "an unknown configured level must behave like Information, not log everything");
+        McpServer.ShouldLog("Information", "garbage-level").Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task ToolCall_WithAlreadyCancelledBudget_ReturnsInBandTimeoutErrorDeterministically()
+    {
+        // Forced-cancellation seam (no timing race): a PRE-cancelled token is linked
+        // into every per-call CTS, so the pre-dispatch ThrowIfCancellationRequested
+        // yields TIMEOUT regardless of how fast the tool is — unlike the old 1 ms
+        // budget vs a slow MSBuild load. The 5-minute budget proves it is the seam
+        // cancelling, not the timer. The failure must surface in-band with the TIMEOUT
+        // code — a tool failure the model can react to, not a protocol error.
+        using var precancelled = new CancellationTokenSource();
+        precancelled.Cancel();
+        var server = new McpServer(TimeSpan.FromMinutes(5), precancelled.Token);
+        var request = """{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"health_check","arguments":{} } }""";
+
+        var response = ParseResponse(await server.HandleRequestAsync(request));
+
+        response["error"].Should().BeNull("timeouts are tool failures, not JSON-RPC errors");
+        response["result"]!["isError"]!.GetValue<bool>().Should().BeTrue();
+        var inner = JsonSerializer.Deserialize<JsonObject>(
+            response["result"]!["content"]![0]!["text"]!.GetValue<string>())!;
+        inner["success"]!.GetValue<bool>().Should().BeFalse();
+        inner["error"]!["code"]!.GetValue<string>().Should().Be("TIMEOUT");
+        inner["error"]!["hint"]!.GetValue<string>().Should().Contain("SHARPLENS_TIMEOUT_SECONDS",
+            "the hint must name the variable that raises the limit");
+    }
+
+    [Fact]
+    public async Task ToolCall_WithUncancelledBudget_SucceedsWithoutFalseTimeout()
+    {
+        // The forced-cancellation seam stays inert when its token is never cancelled:
+        // a generous, uncancelled budget must let the tool run to completion. Guards
+        // against the pre-dispatch check or the linked CTS firing spuriously.
+        var server = new McpServer(TimeSpan.FromMinutes(5));
+        var request = """{"jsonrpc":"2.0","id":78,"method":"tools/call","params":{"name":"health_check","arguments":{} } }""";
+
+        var response = ParseResponse(await server.HandleRequestAsync(request));
+
+        response["error"].Should().BeNull();
+        var inner = JsonSerializer.Deserialize<JsonObject>(
+            response["result"]!["content"]![0]!["text"]!.GetValue<string>())!;
+        inner["success"]!.GetValue<bool>().Should().BeTrue(
+            "an uncancelled, generous budget must not fail a tool");
+    }
+
+    [Fact]
+    public async Task HandleRequest_ToolsList_EveryToolCarriesAnnotationsMatchingItsMutability()
+    {
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/list"}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+        var tools = response["result"]!.AsObject()["tools"]!.AsArray();
+
+        // Derive the expected mutating set from the registry's ReadOnly flag — the
+        // source of truth — rather than hand-maintaining a parallel list that drifts.
+        // The cross-check is then wire annotation vs registry flag, not list vs list.
+        var mutatingTools = ToolRegistry.Definitions
+            .Where(d => !d.ReadOnly)
+            .Select(d => d.Name)
+            .ToHashSet(StringComparer.Ordinal);
+        mutatingTools.Should().NotBeEmpty("the registry declares mutating tools");
+
+        foreach (var tool in tools)
+        {
+            var name = tool!["name"]!.GetValue<string>();
+            var annotations = tool["annotations"]!.AsObject();
+            var readOnly = annotations["readOnlyHint"]!.GetValue<bool>();
+
+            if (mutatingTools.Contains(name))
+            {
+                readOnly.Should().BeFalse($"{name} mutates the workspace or disk");
+                annotations["destructiveHint"]!.GetValue<bool>().Should().BeTrue(
+                    $"{name} mutates workspace or disk state, which is destructive per MCP semantics");
+            }
+            else
+            {
+                readOnly.Should().BeTrue($"{name} performs no mutation");
+                annotations["destructiveHint"].Should().BeNull(
+                    "destructiveHint is meaningless on a read-only tool and must be omitted");
+            }
+        }
+    }
+
+    [Fact]
+    public async Task HandleRequest_ToolsList_EveryNameMatchesTheMcpToolNamePattern()
+    {
+        // MCP requires ^[a-zA-Z0-9_-]{1,64}$ — the 1.5.x "roslyn:" prefix
+        // violated it (colon). The published names must all comply.
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/list"}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        var tools = response["result"]!.AsObject()["tools"]!.AsArray();
+        foreach (var tool in tools)
+        {
+            tool!["name"]!.GetValue<string>().Should().MatchRegex("^[a-zA-Z0-9_-]{1,64}$",
+                "every published tool name must satisfy the MCP name pattern");
+        }
+    }
+
+    [Fact]
+    public async Task HandleRequest_ToolCall_AcceptsLegacyPrefixedNameAsAlias()
+    {
+        // 1.5.x clients call "roslyn:health_check"; the prefixed spelling stays
+        // accepted as an alias for one release.
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"roslyn:health_check","arguments":{}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["error"].Should().BeNull("the legacy alias must dispatch, not error");
+        var text = response["result"]!.AsObject()["content"]!.AsArray()[0]!.AsObject()["text"]!.GetValue<string>();
+        var inner = JsonSerializer.Deserialize<JsonObject>(text)!;
+        inner["success"]!.GetValue<bool>().Should().BeTrue(
+            "health_check succeeds without a loaded solution");
+    }
+
     [Fact]
     public async Task HandleRequest_ToolsList_ReturnsAllRegisteredTools()
     {
@@ -72,23 +238,24 @@ public class McpServerTests
 
         var result = response["result"]!.AsObject();
         var tools = result["tools"]!.AsArray();
-        // The dispatcher in McpServer.cs has 67 registered tool names; the list response
-        // must surface every one of them. A lower count means a tool was forgotten in
-        // HandleListToolsAsync; a higher count means a duplicate or stale entry.
-        tools.Count.Should().Be(67, "the dispatcher registers exactly 67 tools as of 1.5.3");
+        // The list response must surface every registry record. A lower count
+        // means a tool was forgotten in the projection; a higher count means a
+        // duplicate or stale entry. The absolute count is pinned once, in
+        // ToolsListGoldenTests.
+        tools.Count.Should().Be(ToolRegistry.Definitions.Count, "tools/list must surface every registry record");
         // Every tool entry must carry name + description, the contract for MCP clients.
         foreach (var tool in tools)
         {
             var t = tool!.AsObject();
-            t["name"]!.GetValue<string>().Should().StartWith("roslyn:");
+            t["name"]!.GetValue<string>().Should().NotBeNullOrEmpty();
             t["description"]!.GetValue<string>().Should().NotBeNullOrEmpty();
         }
         // Spot-check: a few representative tools across categories must appear.
         var names = tools.Select(t => t!.AsObject()["name"]!.GetValue<string>()).ToList();
-        names.Should().Contain("roslyn:health_check");
-        names.Should().Contain("roslyn:search_symbols");
-        names.Should().Contain("roslyn:extract_method");
-        names.Should().Contain("roslyn:get_code_actions_at_position");
+        names.Should().Contain("health_check");
+        names.Should().Contain("search_symbols");
+        names.Should().Contain("extract_method");
+        names.Should().Contain("get_code_actions_at_position");
     }
 
     [Fact]
@@ -147,7 +314,7 @@ public class McpServerTests
     [Fact]
     public async Task HandleRequest_ToolCallHealthCheckWithoutSolution_ReportsNotReady()
     {
-        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"roslyn:health_check","arguments":{}}}""";
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"health_check","arguments":{}}}""";
         var response = ParseResponse(await _server.HandleRequestAsync(request));
 
         response["id"]!.GetValue<long>().Should().Be(1);
@@ -155,8 +322,9 @@ public class McpServerTests
         var result = response["result"]!.AsObject();
         var content = result["content"]!.AsArray();
         content.Count.Should().BeGreaterThan(0, "tools/call always wraps tool output in a content array");
+        result["isError"].Should().BeNull("a successful tool result must not carry isError");
         var text = content[0]!.AsObject()["text"]!.GetValue<string>();
-        // health_check without a loaded solution reports status "Not Ready" per RoslynService.cs:474-480.
+        // health_check without a loaded solution reports status "Not Ready".
         text.Should().Contain("\"status\":\"Not Ready\"",
             "an unloaded solution must surface as Not Ready, not as an error");
         text.Should().Contain("load_solution",
@@ -182,18 +350,248 @@ public class McpServerTests
     }
 
     [Fact]
-    public async Task HandleRequest_NotificationThatTriggersInternalException_ReturnsNull()
+    public async Task HandleRequest_IdlessToolCall_ReturnsNullWithoutDispatching()
     {
-        // tools/call expects params.name to be a string; passing a non-object `params`
-        // (here a string literal) trips `paramsNode?.AsObject()` and throws
-        // InvalidOperationException — that exception escapes the dispatcher and
-        // hits the outer catch. With NO `id` (notification), per JSON-RPC 2.0
-        // §4.3, the response MUST be null even on internal error.
+        // A tools/call with NO id is a Notification (JSON-RPC 2.0 §4.3): the server must
+        // return null WITHOUT dispatching — the notification guard short-circuits before
+        // any handler runs. The malformed `params` (a string, not an object) would throw
+        // if dispatch were ever reached, so a null response — not an error — confirms the
+        // request was never dispatched. (The no-side-effect half is locked by
+        // HandleRequest_MutatingToolCallAsNotification_DoesNotExecuteTheTool.)
         var request = """{"jsonrpc":"2.0","method":"tools/call","params":"not-an-object"}""";
         var response = await _server.HandleRequestAsync(request);
 
         response.Should().BeNull(
-            "notifications must produce no response, even when an exception escapes dispatch");
+            "an id-less request is a notification and must be neither dispatched nor answered");
+    }
+
+    [Fact]
+    public async Task HandleRequest_MutatingToolCallAsNotification_DoesNotExecuteTheTool()
+    {
+        // A tools/call without `id` is a notification. The server must NOT dispatch it,
+        // because request methods require a response and dispatching would run a
+        // possibly mutating tool. load_solution mutates server state, so prove it never
+        // ran: the solution must still be unloaded afterward. When the guard works no
+        // load happens (cheap); only a regression would actually load and fail here.
+        var slnDir = Directory.GetCurrentDirectory();
+        while (slnDir != null && !File.Exists(Path.Combine(slnDir, "SharpLensMcp.sln")))
+            slnDir = Directory.GetParent(slnDir)?.FullName;
+        slnDir.Should().NotBeNull("the test must locate the real solution to attempt a load");
+
+        var notification = new JsonObject
+        {
+            ["jsonrpc"] = "2.0",
+            ["method"] = "tools/call",
+            ["params"] = new JsonObject
+            {
+                ["name"] = "load_solution",
+                ["arguments"] = new JsonObject
+                {
+                    ["solutionPath"] = Path.Combine(slnDir!, "SharpLensMcp.sln")
+                }
+            }
+        };
+        var notifResponse = await _server.HandleRequestAsync(notification.ToJsonString());
+        notifResponse.Should().BeNull("a notification produces no response");
+
+        // health_check reflects load state: still Not Ready means load_solution never ran.
+        var check = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"health_check","arguments":{}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(check));
+        var text = response["result"]!["content"]!.AsArray()[0]!.AsObject()["text"]!.GetValue<string>();
+        text.Should().Contain("\"status\":\"Not Ready\"",
+            "load_solution sent as a notification must not have loaded the solution");
+    }
+
+    [Fact]
+    public async Task HandleRequest_ToolRequiringSolution_WithoutSolution_ResultIsError()
+    {
+        // search_symbols calls EnsureSolutionLoaded, which throws SolutionNotLoadedException
+        // with no solution. That surfaces as an in-band CallToolResult whose envelope is
+        // {success:false}; it must carry isError:true like every other tool error so the
+        // model treats it as a failed call.
+        var request = """{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"search_symbols","arguments":{"query":"X"}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        var result = response["result"]!.AsObject();
+        result["isError"]!.GetValue<bool>().Should().BeTrue(
+            "an in-band SOLUTION_NOT_LOADED result must set isError, matching every other tool error");
+        var text = result["content"]!.AsArray()[0]!.AsObject()["text"]!.GetValue<string>();
+        text.Should().Contain("SOLUTION_NOT_LOADED",
+            "the envelope must carry the structured error code");
+    }
+
+    [Fact]
+    public async Task HandleRequest_ToolReturningErrorEnvelope_ResultIsError()
+    {
+        // load_solution with a missing path RETURNS a {success:false} envelope (it does
+        // not throw), so isError must be set by the value-return path — not by a catch.
+        var request = """{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"load_solution","arguments":{"solutionPath":"/does/not/exist/Nope.sln"}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        var result = response["result"]!.AsObject();
+        result["isError"]!.GetValue<bool>().Should().BeTrue(
+            "a tool that RETURNS a {success:false} envelope must surface isError, like the exception paths");
+        var text = result["content"]!.AsArray()[0]!.AsObject()["text"]!.GetValue<string>();
+        text.Should().Contain("FILE_NOT_FOUND", "the envelope must carry the structured error code");
+    }
+
+    [Fact]
+    public async Task HandleRequest_ApplyToolIntroducingCompileError_ResultIsErrorWithPostApplyErrors()
+    {
+        // An apply tool that emits broken code reports success:true/applied:true but lists
+        // the new errors in data.postApplyErrors; the wrapper must still flag the result
+        // isError:true so a client keying on isError sees the broken state. Driven through a
+        // fresh server loaded with an in-memory workspace so nothing touches disk.
+        const string code = @"
+namespace Demo
+{
+    public class C
+    {
+        public int Add(int amount) => amount + 1;
+    }
+}";
+        var (workspace, _) = TestHelpers.CreateWorkspaceWithCode(code, "C.cs");
+        var server = new McpServer();
+        server.LoadFromWorkspaceForTesting(workspace);
+
+        // Renaming a body-used parameter leaves the body referencing the old name (CS0103).
+        var request = """{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"change_signature","arguments":{"typeName":"C","memberName":"Add","preview":false,"changes":[{"action":"rename","name":"amount","newName":"value"}]}}}""";
+        var response = ParseResponse(await server.HandleRequestAsync(request));
+
+        var result = response["result"]!.AsObject();
+        result["isError"]!.GetValue<bool>().Should().BeTrue(
+            "an applied edit that introduced compile errors must flag isError even though it applied");
+
+        var inner = JsonSerializer.Deserialize<JsonObject>(
+            result["content"]!.AsArray()[0]!.AsObject()["text"]!.GetValue<string>())!;
+        inner["success"]!.GetValue<bool>().Should().BeTrue(
+            "the surface contract still applies the edit (success:true), it does not refuse");
+        inner["data"]!["applied"]!.GetValue<bool>().Should().BeTrue("the edit was applied");
+        inner["data"]!["postApplyErrors"]!.AsArray()
+            .Select(e => e!.GetValue<string>())
+            .Should().Contain(s => s.Contains("CS0103"),
+                "the rewritten body still references the old parameter name 'amount'");
+    }
+
+    [Fact]
+    public async Task HandleRequest_MalformedNestedArrayField_ReturnsInvalidParams()
+    {
+        // change_signature's changes[0].position is a string; the nested-array parser
+        // must surface a present-but-wrong-type field as a structured -32602, not an
+        // internal -32603.
+        var request = """{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"change_signature","arguments":{"typeName":"X","memberName":"Y","changes":[{"action":"addParameter","name":"z","type":"int","position":"not-an-int"}]}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["error"]!["code"]!.GetValue<int>().Should().Be(-32602,
+            "a present-but-wrong-type field in a nested array element is invalid params, not an internal error");
+        var message = response["error"]!["message"]!.GetValue<string>();
+        message.Should().Contain("position");
+        message.Should().Contain("change_signature",
+            "the nested-array error names the tool, like the scalar -32602 messages");
+    }
+
+    [Fact]
+    public async Task HandleRequest_MalformedArchitectureRuleField_ReturnsInvalidParams()
+    {
+        // check_architecture's rules[0].from is a number; the nested-array parser must
+        // surface the wrong-type field as a structured -32602 naming the tool.
+        var request = """{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"check_architecture","arguments":{"rules":[{"from":123,"deny":"X"}]}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["error"]!["code"]!.GetValue<int>().Should().Be(-32602);
+        var message = response["error"]!["message"]!.GetValue<string>();
+        message.Should().Contain("from");
+        message.Should().Contain("check_architecture");
+    }
+
+    [Fact]
+    public async Task HandleRequest_MalformedOrderArrayElement_ReturnsInvalidParams()
+    {
+        // change_signature's changes[0].order[0] is a number; the ElementString parser
+        // must surface the wrong-type element as a -32602 naming the tool and the index.
+        var request = """{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"change_signature","arguments":{"typeName":"X","memberName":"Y","changes":[{"action":"reorder","order":[123]}]}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["error"]!["code"]!.GetValue<int>().Should().Be(-32602);
+        var message = response["error"]!["message"]!.GetValue<string>();
+        message.Should().Contain("order[0]");
+        message.Should().Contain("change_signature");
+    }
+
+    [Fact]
+    public async Task HandleRequest_MalformedMethodBatchField_ReturnsInvalidParams()
+    {
+        // get_method_source_batch's methods[0].overloadIndex is a string; the parser must
+        // surface the wrong-type field as a structured -32602 naming the tool and index.
+        var request = """{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"get_method_source_batch","arguments":{"methods":[{"typeName":"X","methodName":"Y","overloadIndex":"not-an-int"}]}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["error"]!["code"]!.GetValue<int>().Should().Be(-32602);
+        var message = response["error"]!["message"]!.GetValue<string>();
+        message.Should().Contain("overloadIndex");
+        message.Should().Contain("get_method_source_batch");
+    }
+
+    [Fact]
+    public async Task HandleRequest_NonStringToolName_ReturnsInvalidParams()
+    {
+        // params.name is a number: read defensively (not GetValue<string>() that throws
+        // into the generic catch as an in-band INTERNAL_ERROR) so it falls into the
+        // missing-tool-name -32602 path with the existing message preserved.
+        var request = """{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":123,"arguments":{}}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["error"]!["code"]!.GetValue<int>().Should().Be(-32602);
+        response["error"]!["message"]!.GetValue<string>().Should().Contain("missing tool name");
+    }
+
+    [Fact]
+    public async Task HandleRequest_NonObjectArguments_ReturnsInvalidParams()
+    {
+        // params.arguments is a string: a present-but-wrong-typed value is invalid params
+        // (-32602), not an exception that escapes to an in-band INTERNAL_ERROR.
+        var request = """{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"health_check","arguments":"not-an-object"}}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["error"]!["code"]!.GetValue<int>().Should().Be(-32602);
+        response["error"]!["message"]!.GetValue<string>().Should().Contain("arguments");
+    }
+
+    [Fact]
+    public async Task HandleRequest_NonStringMethod_ReturnsInvalidRequest()
+    {
+        // A non-string method (here a number) is an Invalid Request (-32600), not an
+        // internal error (-32603) from GetValue<string>() throwing.
+        var request = """{"jsonrpc":"2.0","id":7,"method":12345}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["error"]!["code"]!.GetValue<int>().Should().Be(-32600,
+            "a non-string method is Invalid Request, not Internal error");
+    }
+
+    [Fact]
+    public async Task HandleRequest_NonStringMethodAsNotification_ReturnsNull()
+    {
+        // No id → notification → no response even though the method is malformed.
+        var request = """{"jsonrpc":"2.0","method":12345}""";
+        var response = await _server.HandleRequestAsync(request);
+
+        response.Should().BeNull("an id-less malformed request is still a notification");
+    }
+
+    [Fact]
+    public async Task HandleRequest_StructurallyInvalidId_ReturnsInvalidRequest()
+    {
+        // Per JSON-RPC 2.0 §4.2 the id must be a string, number, or null. An object id
+        // is an Invalid Request (-32600), not an internal error (-32603), and the
+        // unusable id is not echoed back.
+        var request = """{"jsonrpc":"2.0","id":{"bad":"object"},"method":"initialize"}""";
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["error"]!["code"]!.GetValue<int>().Should().Be(-32600,
+            "a structurally-invalid id is Invalid Request, not Internal error");
+        (response["id"] == null || response["id"]!.GetValueKind() == JsonValueKind.Null)
+            .Should().BeTrue("the invalid id cannot be echoed, so it is null");
     }
 
     [Fact]
@@ -211,7 +609,7 @@ public class McpServerTests
     [Fact]
     public async Task HandleRequest_ToolsCall_UnknownToolName_Returns32602InvalidParams()
     {
-        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"roslyn:does_not_exist_xyz","arguments":{}}}""";
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"does_not_exist_xyz","arguments":{}}}""";
         var response = ParseResponse(await _server.HandleRequestAsync(request));
 
         response["id"]!.GetValue<long>().Should().Be(1);
@@ -220,7 +618,7 @@ public class McpServerTests
         // the message must mention "Unknown tool" and echo the bad name.
         error["code"]!.GetValue<int>().Should().Be(-32602);
         error["message"]!.GetValue<string>().Should().Contain("Unknown tool");
-        error["message"]!.GetValue<string>().Should().Contain("roslyn:does_not_exist_xyz");
+        error["message"]!.GetValue<string>().Should().Contain("does_not_exist_xyz");
     }
 
     [Fact]
@@ -245,7 +643,7 @@ public class McpServerTests
         // silently treated non-array as null → sync_documents synced ALL files,
         // hiding the caller's mistake. Now routed through p.OptionalStringArray
         // which validates shape.
-        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"roslyn:sync_documents","arguments":{"filePaths":"not-an-array"}}}""";
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sync_documents","arguments":{"filePaths":"not-an-array"}}}""";
         var response = ParseResponse(await _server.HandleRequestAsync(request));
 
         var error = response["error"]!.AsObject();
@@ -263,7 +661,7 @@ public class McpServerTests
         // the outer catch wrapped as -32603 Internal error. After replacing the
         // helper with p.OptionalStringArray, it surfaces as the structured
         // -32602 with the canonical wording.
-        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"roslyn:sync_documents","arguments":{"filePaths":[42]}}}""";
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sync_documents","arguments":{"filePaths":[42]}}}""";
         var response = ParseResponse(await _server.HandleRequestAsync(request));
 
         var error = response["error"]!.AsObject();
@@ -280,7 +678,7 @@ public class McpServerTests
         // health_check), omitting it must not be an error. The dispatcher's
         // JsonRpcParameters(args: null) constructor handles this (verified separately
         // in JsonRpcParametersTests).
-        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"roslyn:health_check"}}""";
+        var request = """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"health_check"}}""";
         var response = ParseResponse(await _server.HandleRequestAsync(request));
 
         response["id"]!.GetValue<long>().Should().Be(1);

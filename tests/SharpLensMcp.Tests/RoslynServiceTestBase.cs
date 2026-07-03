@@ -98,4 +98,13 @@ public abstract class RoslynServiceTestBase : IAsyncLifetime
         AssertSuccess(response);
         return json["data"]!;
     }
+
+    // The response envelope's meta block. In-process Newtonsoft serialization is
+    // PascalCase, so keys are Truncated/TotalCount/ReturnedCount.
+    protected JToken GetMeta(object response)
+    {
+        var json = JObject.FromObject(response);
+        AssertSuccess(response);
+        return json["meta"]!;
+    }
 }

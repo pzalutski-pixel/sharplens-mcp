@@ -27,15 +27,27 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         // drops attribute/location fields would fail.
         var requestIdUsage = usages!.First(u =>
             u["symbolName"]?.Value<string>()?.Contains("RequestId") == true);
-        requestIdUsage["attribute"]?["name"]?.Value<string>().Should()
+        // The entry carries a flat `attributeName` string (attr.AttributeClass.Name),
+        // not a nested `attribute.name` object — the old read of the wrong shape was
+        // always null and silently passed.
+        requestIdUsage["attributeName"].Should().NotBeNull();
+        requestIdUsage["attributeName"]!.Value<string>().Should()
             .Be("JsonConverterAttribute", "the matched attribute's full type name must appear");
-        requestIdUsage["location"]?["filePath"]?.Value<string>().Should()
+        requestIdUsage["location"].Should().NotBeNull();
+        requestIdUsage["location"]!["filePath"].Should().NotBeNull();
+        requestIdUsage["location"]!["filePath"]!.Value<string>().Should()
             .EndWith(".cs", "every usage must carry a source filePath");
-        requestIdUsage["location"]?["line"]?.Type.Should().Be(JTokenType.Integer);
+        requestIdUsage["location"]!["line"].Should().NotBeNull();
+        requestIdUsage["location"]!["line"]!.Type.Should().Be(JTokenType.Integer);
 
         // totalCount is the unbounded counter; returnedCount might equal it or be capped.
+        // meta is a ResponseMetadata class, so in-process JObject.FromObject keeps its
+        // PascalCase TotalCount (the camelCase `totalCount` only exists over the wire);
+        // the old lowercase read was always null and silently passed.
         var meta = JObject.FromObject(result)["meta"];
-        meta?["totalCount"]?.Value<int>().Should().BeGreaterThan(0);
+        meta.Should().NotBeNull();
+        meta!["TotalCount"].Should().NotBeNull();
+        meta["TotalCount"]!.Value<int>().Should().BeGreaterThan(0);
     }
 
     [Fact]
@@ -148,7 +160,8 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         var result = await Service.FindCircularDependenciesAsync("project");
         AssertSuccess(result);
         var data = GetData(result);
-        data["level"]?.Value<string>().Should().Be("project");
+        data["level"].Should().NotBeNull();
+        data["level"]!.Value<string>().Should().Be("project");
         // Graph is keyed by project name; SharpLensMcp.Tests references SharpLensMcp.
         var graph = data["graph"] as JObject;
         graph.Should().NotBeNull();
@@ -163,10 +176,12 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         var result = await Service.FindCircularDependenciesAsync("namespace");
         AssertSuccess(result);
         var data = GetData(result);
-        data["level"]?.Value<string>().Should().Be("namespace");
+        data["level"].Should().NotBeNull();
+        data["level"]!.Value<string>().Should().Be("namespace");
         // Our solution declares at least SharpLensMcp, SharpLensMcp.Tests,
         // SharpLensMcp.Tests.Mcp, SharpLensMcp.Tests.Fixtures, SharpLensMcp.Tests.TestAnalyzers.
-        data["namespaceCount"]?.Value<int>().Should().BeGreaterOrEqualTo(5);
+        data["namespaceCount"].Should().NotBeNull();
+        data["namespaceCount"]!.Value<int>().Should().BeGreaterOrEqualTo(5);
         // The graph keys must include the well-known namespaces.
         var graph = data["graph"] as JObject;
         graph.Should().NotBeNull();
@@ -188,7 +203,8 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         var result = await Service.FindCircularDependenciesAsync("project");
         AssertSuccess(result);
         var data = GetData(result);
-        data["hasCycles"]?.Value<bool>().Should().BeFalse();
+        data["hasCycles"].Should().NotBeNull();
+        data["hasCycles"]!.Value<bool>().Should().BeFalse();
     }
 
     #endregion
@@ -210,6 +226,12 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         var packages = mainProject!["packages"] as JArray;
         packages.Should().NotBeNull();
         packages!.Any(p => p["packageName"]?.Value<string>() == "Microsoft.Build.Locator").Should().BeTrue();
+
+        // parseError is surfaced (null on success) so a csproj that fails to parse is
+        // not silently reported as having zero dependencies.
+        mainProject["parseError"].Should().NotBeNull("the parseError field must be present even when null");
+        mainProject["parseError"]!.Type.Should().Be(JTokenType.Null,
+            "the SharpLensMcp csproj parses cleanly, so parseError must be the literal null");
     }
 
     [Fact]
@@ -220,7 +242,8 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         var data = GetData(result);
         var projects = data["projects"] as JArray;
         projects!.Count.Should().Be(1);
-        projects![0]["projectName"]?.Value<string>().Should().Be("SharpLensMcp");
+        projects![0]["projectName"].Should().NotBeNull();
+        projects![0]["projectName"]!.Value<string>().Should().Be("SharpLensMcp");
     }
 
     [Fact]
@@ -236,9 +259,11 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         // Per-entry shape: every package must carry packageName (non-empty) AND version (non-empty).
         foreach (var pkg in packages!)
         {
-            pkg["packageName"]?.Value<string>().Should().NotBeNullOrEmpty(
+            pkg["packageName"].Should().NotBeNull();
+            pkg["packageName"]!.Value<string>().Should().NotBeNullOrEmpty(
                 "every package entry must carry a non-empty packageName");
-            pkg["version"]?.Value<string>().Should().NotBeNullOrEmpty(
+            pkg["version"].Should().NotBeNull();
+            pkg["version"]!.Value<string>().Should().NotBeNullOrEmpty(
                 "every package entry must carry a non-empty resolved version string");
         }
     }
@@ -284,6 +309,18 @@ public class DiscoveryToolTests : RoslynServiceTestBase
     {
         var result = await Service.GetGeneratedCodeAsync("SharpLensMcp", "NonExistentFile.g.cs");
         AssertError(result, ErrorCodes.FileNotFound);
+    }
+
+    [Fact]
+    public async Task GetGeneratedCode_WithUnknownProject_ReturnsInvalidParameterListingProjects()
+    {
+        // An unknown project name is an invalid argument (routed through the shared
+        // ProjectNotFoundError), distinct from a known project missing a generated file.
+        var result = await Service.GetGeneratedCodeAsync("NoSuchProject", "Whatever.g.cs");
+        AssertError(result, ErrorCodes.InvalidParameter);
+        var json = JObject.FromObject(result);
+        json["error"]!["Hint"]!.Value<string>().Should().Contain("SharpLensMcp",
+            "the error must list the available project names");
     }
 
     #endregion

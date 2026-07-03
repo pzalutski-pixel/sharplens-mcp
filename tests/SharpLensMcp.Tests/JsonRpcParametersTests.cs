@@ -164,7 +164,7 @@ public class JsonRpcParametersTests
     [Fact]
     public void OptionalStringArray_NullElement_DroppedFromResult()
     {
-        // Per JsonRpcParameters.cs:95-96, non-string/null entries are filtered out
+        // Non-string/null entries are filtered out
         // (mapped to empty string, then dropped). Verify a null array element
         // doesn't crash AND doesn't appear in the returned list.
         var p = Make("""{"kinds":["Method",null,"Field"]}""");
@@ -196,7 +196,7 @@ public class JsonRpcParametersTests
     public void Optional_ClassWrongType_Throws()
     {
         // Counterpart to Required_WrongType_Throws but for the reference-type
-        // Optional<T> overload (JsonRpcParameters.cs:42-50). A scalar number
+        // Optional<T> overload. A scalar number
         // passed where a string is expected must surface "has wrong type"
         // rather than silently returning null or crashing.
         var p = Make("""{"kind":42}""");
@@ -209,7 +209,7 @@ public class JsonRpcParametersTests
     public void RequiredStringArray_Missing_ThrowsArraySpecificWording()
     {
         // Locks the DISTINCT "Missing required array parameter" wording from
-        // JsonRpcParameters.cs:106-107, separate from the scalar Required's
+        // the OptionalStringArray path, separate from the scalar Required's
         // "Missing required parameter" message. A regression unifying the two
         // would slip past the existing wildcard `*typeNames*test-tool*` lock.
         var p = Make("""{}""");

@@ -27,14 +27,21 @@ public class AddNullChecksApplyTests : IAsyncLifetime
 
         _service = new RoslynService();
         var result = await _service.LoadSolutionAsync(_solutionPath);
-        JObject.FromObject(result)["success"]?.Value<bool>().Should().BeTrue();
+        var loadJson = JObject.FromObject(result);
+        loadJson["success"].Should().NotBeNull();
+        loadJson["success"]!.Value<bool>().Should().BeTrue();
     }
 
     public Task DisposeAsync()
     {
-        if (_originalFixtureContent != null && _fixturePath != null && File.Exists(_fixturePath))
+        // Always restore the fixture to its committed content — recreating it even
+        // if a test deleted it — and assert the restore physically landed, so a
+        // swallowed write can't leave the tree dirty for the next serialized test.
+        if (_originalFixtureContent != null && _fixturePath != null)
         {
             File.WriteAllText(_fixturePath, _originalFixtureContent);
+            File.ReadAllText(_fixturePath).Should().Be(_originalFixtureContent,
+                "the fixture must be restored to its committed content after the test");
         }
         return Task.CompletedTask;
     }
@@ -54,11 +61,14 @@ public class AddNullChecksApplyTests : IAsyncLifetime
             preview: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
         var data = json["data"]!;
-        data["applied"]?.Value<bool>().Should().BeTrue(
-            "preview=false sets applied=true (CodeGeneration.cs:488)");
-        data["methodName"]?.Value<string>().Should().Be("Process");
+        data["applied"].Should().NotBeNull();
+        data["applied"]!.Value<bool>().Should().BeTrue(
+            "preview=false sets applied=true");
+        data["methodName"].Should().NotBeNull();
+        data["methodName"]!.Value<string>().Should().Be("Process");
         var paramsList = (data["parametersWithNullChecks"] as JArray)!;
         paramsList.Select(p => p.Value<string>()).Should().BeEquivalentTo(new[] { "input" });
 

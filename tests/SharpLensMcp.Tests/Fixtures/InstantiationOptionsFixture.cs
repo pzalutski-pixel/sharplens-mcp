@@ -4,8 +4,8 @@ namespace SharpLensMcp.Tests.Fixtures;
 
 // Targets for get_instantiation_options branch tests.
 
-// IDisposable implementer — exercises implementsIDisposable=true at
-// Inspection.cs:1049 + the hint about using `using` (Inspection.cs:1056).
+// IDisposable implementer — exercises implementsIDisposable=true + the hint
+// about using `using`.
 public sealed class DisposableTarget : IDisposable
 {
     public DisposableTarget() { }
@@ -13,7 +13,7 @@ public sealed class DisposableTarget : IDisposable
 }
 
 // Class with static factory methods returning itself — exercises the
-// factoryMethods detection at Inspection.cs:997-1012.
+// factoryMethods detection.
 public class FactoryTarget
 {
     private FactoryTarget() { }
@@ -24,7 +24,7 @@ public class FactoryTarget
 
 // Class whose instances are produced by static methods on OTHER types
 // matching the Create/Build/New prefix — exercises externalFactories
-// detection at Inspection.cs:1015-1046.
+// detection.
 public class ExternalFactoryTarget
 {
     public ExternalFactoryTarget() { }

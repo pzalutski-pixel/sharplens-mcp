@@ -4,8 +4,8 @@ using Xunit;
 
 namespace SharpLensMcp.Tests;
 
-// In-memory tests for find_unused_code covering the framework-bound type skips at
-// RoslynService.cs:489-495 — ImplementsFrameworkInterface and HasFrameworkAttribute
+// In-memory tests for find_unused_code covering the framework-bound type skips —
+// ImplementsFrameworkInterface and HasFrameworkAttribute
 // both run BEFORE the SymbolFinder.FindReferencesAsync call, so types matching
 // either filter must be omitted from the unused-symbols list even when they have
 // no real references in the workspace.
@@ -50,6 +50,25 @@ namespace Production
     }
 }";
 
+    // A user attribute whose simple name merely *contains* a framework token
+    // ('CollectionView' contains 'Collection', 'MyController' contains
+    // 'Controller'). Exact-name matching must NOT suppress the unused class.
+    private const string LookalikeAttributeCode = @"
+namespace Production
+{
+    [System.AttributeUsage(System.AttributeTargets.Class)]
+    public class CollectionViewAttribute : System.Attribute { }
+
+    [System.AttributeUsage(System.AttributeTargets.Class)]
+    public class MyControllerAttribute : System.Attribute { }
+
+    [CollectionView]
+    public class LookalikeOne { }
+
+    [MyController]
+    public class LookalikeTwo { }
+}";
+
     private static async Task<JArray> RunAndGetUnused(string code)
     {
         var(workspace, _) = TestHelpers.CreateWorkspaceWithCode(code);
@@ -87,5 +106,16 @@ namespace Production
             "Production.MyController is decorated with [ApiController] — HasFrameworkAttribute must short-circuit before the reference search");
         names.Should().Contain(n => n.Contains("PlainUnused"),
             "Production.PlainUnused has no framework attribute and no references — it must be flagged");
+    }
+
+    [Fact]
+    public async Task FindUnusedCode_DoesNotSuppressAttributesMerelyContainingAFrameworkToken()
+    {
+        var unused = await RunAndGetUnused(LookalikeAttributeCode);
+        var names = unused.Select(u => u["fullyQualifiedName"]!.Value<string>()!).ToList();
+        names.Should().Contain(n => n.Contains("LookalikeOne"),
+            "[CollectionView] is not xUnit's [Collection] — a substring match must not suppress it");
+        names.Should().Contain(n => n.Contains("LookalikeTwo"),
+            "[MyController] is not [Controller] — a substring match must not suppress it");
     }
 }

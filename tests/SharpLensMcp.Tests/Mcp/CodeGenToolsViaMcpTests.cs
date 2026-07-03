@@ -7,10 +7,9 @@ namespace SharpLensMcp.Tests.Mcp;
 // MCP-layer tests for the Code Generation category. Assertions are grounded
 // in the actual generator output from src/RoslynService.CodeGeneration.cs:
 //  - add_null_checks emits `ArgumentNullException.ThrowIfNull({param})` per
-//    nullable reference-type parameter (CodeGeneration.cs:431)
+//    nullable reference-type parameter
 //  - generate_equality_members emits override Equals(object?), Equals(T?),
 //    GetHashCode, and optionally operator ==/!= using HashCode.Combine
-//    (CodeGeneration.cs:587-617)
 //
 // Tightening rule: every accessor uses `!.Value<T>()`.
 public class CodeGenToolsViaMcpTests : McpTestBase
@@ -24,7 +23,7 @@ public class CodeGenToolsViaMcpTests : McpTestBase
             "LoadSolutionAsync", kind: "Method",
             r => r["containingType"]?.Value<string>()?.EndsWith("RoslynService") == true);
 
-        var data = await CallAndGetDataAsync("roslyn:add_null_checks", new
+        var data = await CallAndGetDataAsync("add_null_checks", new
         {
             filePath = file, line, column = col, preview = true
         });
@@ -39,12 +38,14 @@ public class CodeGenToolsViaMcpTests : McpTestBase
         data["generatedCode"]!.Value<string>()!.Should().Contain(
             "ArgumentNullException.ThrowIfNull(solutionPath)");
 
-        // changes[] shape (CodeGeneration.cs:463-469): filePath, insertAfterLine, newCode.
+        // changes[] shape: filePath, insertAfterLine, newCode.
         var changes = (data["changes"] as JArray)!;
         changes.Count.Should().Be(1);
         changes[0]["filePath"]!.Value<string>().Should().NotBeNullOrEmpty();
-        changes[0]["insertAfterLine"]!.Value<int>().Should().BeGreaterOrEqualTo(0,
-            "insertAfterLine is the 0-indexed line of the method's opening brace");
+        // The guard is inserted after the method's opening brace, which (Allman style)
+        // is the line immediately below the single-line declaration LocateSymbolAsync found.
+        changes[0]["insertAfterLine"]!.Value<int>().Should().Be(line + 1,
+            "the guard is inserted after the opening brace, one line below the declaration");
         changes[0]["newCode"]!.Value<string>()!.Should().Contain("ArgumentNullException.ThrowIfNull");
     }
 
@@ -52,13 +53,13 @@ public class CodeGenToolsViaMcpTests : McpTestBase
     public async Task AddNullChecks_OnHealthCheck_ReportsNoNullableParamsWithDistinctShape()
     {
         // GetHealthCheckAsync takes zero parameters — the "no nullable parameters" path
-        // (CodeGeneration.cs:416-425) returns a different shape: { message, methodName }
+        // the no-params branch returns a different shape: { message, methodName }
         // only; no `preview`, `parametersWithNullChecks`, `generatedCode`, or `changes`.
         var (file, line, col) = await LocateSymbolAsync(
             "GetHealthCheckAsync", kind: "Method",
             r => r["containingType"]?.Value<string>()?.EndsWith("RoslynService") == true);
 
-        var data = await CallAndGetDataAsync("roslyn:add_null_checks", new
+        var data = await CallAndGetDataAsync("add_null_checks", new
         {
             filePath = file, line, column = col, preview = true
         });
@@ -70,7 +71,7 @@ public class CodeGenToolsViaMcpTests : McpTestBase
         // unified the two branches into one shape would silently let consumers
         // process a stale `parametersWithNullChecks: []` as "has nullable params".
         data["preview"].Should().BeNull(
-            "the no-params branch omits preview (CodeGeneration.cs:418-424)");
+            "the no-params branch omits preview");
         data["parametersWithNullChecks"].Should().BeNull();
         data["generatedCode"].Should().BeNull();
         data["changes"].Should().BeNull();
@@ -82,13 +83,13 @@ public class CodeGenToolsViaMcpTests : McpTestBase
         // GetResponseData in RoslynService.cs is expression-bodied with a reference
         // parameter (object? response). The nullable-params filter (CodeGeneration.cs:
         // 402-414) includes it, so the count==0 early-return is skipped, and the
-        // body-null check (CodeGeneration.cs:434-444) fires with "Method has no body".
+        // the body-null check fires with "Method has no body".
         var lines = File.ReadAllLines(Fixture.RoslynServicePath);
         var methodLine = Array.FindIndex(lines, l =>
             l.Contains("GetResponseData(object? response)"));
         methodLine.Should().BeGreaterThan(-1);
 
-        var error = await CallAndGetErrorAsync("roslyn:add_null_checks", new
+        var error = await CallAndGetErrorAsync("add_null_checks", new
         {
             filePath = Fixture.RoslynServicePath,
             line = methodLine,
@@ -101,7 +102,7 @@ public class CodeGenToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GenerateEqualityMembers_OnTypeWithNoFieldsOrProperties_ReturnsNoMembersMessage()
     {
-        // CodeGeneration.cs:575-583 returns a distinct shape ({message, typeName})
+        // the empty-type branch returns a distinct shape ({message, typeName})
         // when the type has no instance fields or properties to compare. We need a
         // type that contains methods only. The MatchesGlobPattern host class
         // RoslynService — wait, RoslynService has fields. Looking for a clean
@@ -109,7 +110,7 @@ public class CodeGenToolsViaMcpTests : McpTestBase
         var (file, line, col) = await LocateSymbolAsync(
             "TestHelpers", kind: "Class");
 
-        var data = await CallAndGetDataAsync("roslyn:generate_equality_members", new
+        var data = await CallAndGetDataAsync("generate_equality_members", new
         {
             filePath = file, line, column = col,
             preview = true
@@ -126,14 +127,14 @@ public class CodeGenToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetComplexityMetrics_OnLoadSolutionAsyncMethod_ReturnsMethodScopeResponse()
     {
-        // CodeGeneration.cs:59-126: when line/column point to a method, scope="method"
+        // When line/column point to a method, scope="method"
         // and the response carries name, containingType, metrics. Differs from the
         // file-scope response shape (which has methods[] + fileTotals).
         var (file, line, col) = await LocateSymbolAsync(
             "LoadSolutionAsync", kind: "Method",
             r => r["containingType"]?.Value<string>()?.EndsWith("RoslynService") == true);
 
-        var data = await CallAndGetDataAsync("roslyn:get_complexity_metrics", new
+        var data = await CallAndGetDataAsync("get_complexity_metrics", new
         {
             filePath = file,
             line,
@@ -142,14 +143,38 @@ public class CodeGenToolsViaMcpTests : McpTestBase
         data["scope"]!.Value<string>().Should().Be("method");
         data["name"]!.Value<string>().Should().Be("LoadSolutionAsync");
         data["containingType"]!.Value<string>().Should().Be("RoslynService");
-        // metrics dict carries all 5 default-requested metrics (CodeGeneration.cs:54-56).
+        // The metrics dict must carry all five default metrics. parameters and loc are
+        // deterministic on this method; exact cyclomatic/nesting/cognitive values are
+        // locked on a fixture (AnalysisToolsViaMcpTests.GetComplexityMetrics_OnBranchyFixtureMethod_*),
+        // since this targets live, evolving source.
         var metrics = data["metrics"]!;
-        metrics["cyclomatic"]!.Value<int>().Should().BeGreaterOrEqualTo(1);
-        metrics["nesting"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
-        metrics["loc"]!.Value<int>().Should().BeGreaterThan(0);
-        metrics["parameters"]!.Value<int>().Should().Be(1,
-            "LoadSolutionAsync takes one parameter (solutionPath)");
-        metrics["cognitive"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
+        metrics["cyclomatic"].Should().NotBeNull();
+        metrics["nesting"].Should().NotBeNull();
+        metrics["loc"]!.Value<int>().Should().BeGreaterThan(0, "a multi-line method has positive LOC");
+        metrics["parameters"]!.Value<int>().Should().Be(2,
+            "LoadSolutionAsync takes solutionPath plus the cancellationToken every tool method carries");
+        metrics["cognitive"].Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task GetComplexityMetrics_OnExpressionBodiedProperty_ReturnsPropertyScope()
+    {
+        // A cursor on an expression-bodied property (no accessor list) resolves to the
+        // property declaration itself and reports scope="property" with its branch count.
+        var (file, line, col) = await LocateSymbolAsync(
+            "Sign", kind: "Property",
+            r => r["containingType"]?.Value<string>()?.EndsWith("ExpressionBodiedComplexityTarget") == true);
+
+        var data = await CallAndGetDataAsync("get_complexity_metrics", new
+        {
+            filePath = file,
+            line,
+            column = col
+        });
+        data["scope"]!.Value<string>().Should().Be("property");
+        data["name"]!.Value<string>().Should().Be("Sign");
+        data["metrics"]!["cyclomatic"]!.Value<int>().Should().Be(2, "base 1 plus one ?: branch");
+        data["metrics"]!["parameters"]!.Value<int>().Should().Be(0, "a property declares no parameters");
     }
 
     [Fact]
@@ -157,17 +182,17 @@ public class CodeGenToolsViaMcpTests : McpTestBase
     {
         // Position cursor inside a class declaration but not on any method (line 0
         // is the file's first line — typically a `using` directive, definitely not
-        // a method). CodeGeneration.cs:391-399 returns NotAMethod when no enclosing
+        // a method). The impl returns NotAMethod when no enclosing
         // MethodDeclarationSyntax is found.
-        var error = await CallAndGetErrorAsync("roslyn:add_null_checks", new
+        var error = await CallAndGetErrorAsync("add_null_checks", new
         {
             filePath = Fixture.RoslynServicePath,
             line = 0,
             column = 0,
             preview = true
         }, codeContains: ErrorCodes.NotAMethod);
-        error["message"]!.Value<string>().Should().Contain("No method found",
-            "the impl's documented message at CodeGeneration.cs:395");
+        error["message"]!.Value<string>().Should().Contain("constructor, operator, or local function",
+            "the impl now accepts methods, constructors, operators, and local functions");
     }
 
     [Fact]
@@ -176,7 +201,7 @@ public class CodeGenToolsViaMcpTests : McpTestBase
         var (file, line, col) = await LocateSymbolAsync(
             "RefactoringTarget", kind: "Class");
 
-        var data = await CallAndGetDataAsync("roslyn:generate_equality_members", new
+        var data = await CallAndGetDataAsync("generate_equality_members", new
         {
             filePath = file, line, column = col,
             includeOperators = true, preview = true
@@ -195,9 +220,10 @@ public class CodeGenToolsViaMcpTests : McpTestBase
         code.Should().Contain("public override bool Equals(object? obj)");
         code.Should().Contain("public bool Equals(RefactoringTarget? other)");
         code.Should().Contain("public override int GetHashCode()");
-        code.Should().Contain("HashCode.Combine(BareCounter)");
+        code.Should().Contain("hash.Add(BareCounter);",
+            "GetHashCode uses the HashCode builder so every compared member feeds the hash");
         code.Should().Contain("BareCounter == other.BareCounter",
-            "the specific equality comparison the generator emits at CodeGeneration.cs:598");
+            "the specific equality comparison the generator emits");
         code.Should().Contain("public static bool operator ==(RefactoringTarget? left, RefactoringTarget? right)");
         code.Should().Contain("public static bool operator !=(RefactoringTarget? left, RefactoringTarget? right)");
     }
@@ -208,7 +234,7 @@ public class CodeGenToolsViaMcpTests : McpTestBase
         var (file, line, col) = await LocateSymbolAsync(
             "RefactoringTarget", kind: "Class");
 
-        var data = await CallAndGetDataAsync("roslyn:generate_equality_members", new
+        var data = await CallAndGetDataAsync("generate_equality_members", new
         {
             filePath = file, line, column = col,
             includeOperators = false, preview = true

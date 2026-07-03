@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # On-demand only for non-main refs, by design. A remediation branch is kept local
+  # (not pushed to origin) under this project's workflow, so a push/pull_request
+  # trigger for it would never fire — adding one would be inert. Run the matrix
+  # against such a ref manually via workflow_dispatch (or open a draft PR at merge
+  # time); only main is gated automatically.
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows matters: MSBuildWorkspace and path comparison behave
+        # differently per OS, and most users analyze solutions on Windows.
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test --configuration Release --no-build --verbosity normal

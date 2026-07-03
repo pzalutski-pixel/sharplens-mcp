@@ -8,16 +8,70 @@
     <LangVersion>latest</LangVersion>
 
     <!-- Package metadata -->
-    <Version>1.5.3</Version>
+    <Version>1.6.0</Version>
     <Authors>Peter Zalutski</Authors>
     <Copyright>Copyright (c) 2025 Peter Zalutski</Copyright>
-    <Description>MCP server providing 67 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
+    <Description>MCP server providing 91 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/pzalutski-pixel/sharplens-mcp</PackageProjectUrl>
     <RepositoryUrl>https://github.com/pzalutski-pixel/sharplens-mcp</RepositoryUrl>
     <PackageTags>mcp;roslyn;csharp;dotnet;code-analysis;ai;semantic-analysis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
+v1.6.0
+Added (24 tools, 67 -> 91):
+- move_type_to_file / split_type - move a type into its own file, or split members into a new partial
+- remove_unused_code - bulk preview-first cleanup of find_unused_code results
+- add_missing_imports - the using directives that resolve a file's CS0246/CS0103
+- fix_all - apply a code fix to every instance of a diagnostic across a file, project, or solution
+- generate_test_stub - a compilable test skeleton with the test framework detected
+- diff_api_surface - public-API breaking-change report against a git ref
+- get_exception_flow - which exceptions can escape a method and where each is caught
+- find_similar_code - structurally similar methods (anti-duplication)
+- resolve_stack_trace - map a .NET stack trace to source with compiler mangling undone
+- check_architecture - enforce dependency rules over the type-dependency graph
+- find_unused_dependencies - PackageReference/ProjectReference entries the compiler never needs
+- find_dead_branches - unreachable blocks from the real control-flow graph
+- find_naming_violations - naming-convention audit honoring .editorconfig, with defaults
+- find_async_issues - async void, blocking-on-async, and unforwarded CancellationToken
+- get_super_method - navigate to the overridden or implemented member
+- get_extension_methods - extension members applicable to a type (classic and C# 14)
+- get_documentation - full XML docs with &lt;inheritdoc&gt; resolved recursively
+- find_interceptors - surface [InterceptsLocation] call rerouting
+- find_tests - which tests cover a symbol
+- find_type_instantiations / find_pattern_usages / find_throw_sites / find_catch_blocks - fine-grained usage searches for a type
+Changed:
+- Upgraded Roslyn to 5.3.0 with C# 14 readiness (extension blocks, the field keyword, null-conditional assignment)
+- rename_symbol, change_signature, add_null_checks, generate_constructor, generate_equality_members, extract_interface accept typeName/memberName name-based addressing as an alternative to file/line/column
+- search_symbols adds matchMode "fuzzy" (camel-hump matching)
+- get_file_overview lists per-type members
+- find_references / find_callers / find_implementations now include references inside generated code
+- Tool names dropped the "roslyn:" prefix to satisfy the MCP name pattern; the prefixed spellings stay accepted as aliases for one release
+- Environment variables rebranded to SHARPLENS_* (the ROSLYN_* spellings still read for one release); Trace log level added
+- Tools carry readOnlyHint/destructiveHint annotations; SHARPLENS_TIMEOUT_SECONDS is enforced per call
+- The code-generation tools build syntax instead of concatenating strings
+Fixed:
+- format_document_batch default mode preserves the author's structure; the whole-tree canonical re-printer is opt-in via mode "canonical"
+- Unified atomic apply path: a rejected apply leaves files untouched; rename and apply-by-title no longer leave stale state; refactors no longer need a follow-up sync_documents
+- Unexpected tool-handler errors return an in-band error result instead of a JSON-RPC -32603
+- initialize negotiates the client's protocol version instead of answering with a hardcoded one
+- get_diagnostics counts errors/warnings before the result cap; an invalid severity returns INVALID_PARAMETER
+- organize_usings removes CS8019 usings and sorts the rest; the single-file variant gains preview/apply parity
+- get_code_fixes returns real provider fixes with manual fallback suggestions
+- extract_method drops nested-block duplication and emits an async Task signature when the selection awaits
+- add_null_checks skips already-annotated and already-guarded parameters
+- generate_equality_members filters compiler backing fields and hashes all members consistently
+- get_complexity_metrics guards zero-method files
+- check_type_compatibility resolves both types within one compilation
+- analyze_data_flow / analyze_control_flow honor a sub-range instead of the whole block
+- get_outgoing_calls honors maxDepth
+- find_unused_code reports a symbol unused only at zero references and no longer skips disposable types
+- get_method_signature errors on an out-of-range overload index; get_type_members reports overloadCount
+- get_project_structure reports the real target framework
+- validate_code maps error lines back to the submitted snippet
+- find_attribute_usages and find_untested_code scan only the project's own assembly
+- apply_code_action_by_title requires an exact or unique title match
+- Ambiguous typeName resolution returns a structured AMBIGUOUS_TYPE error listing candidates
 v1.5.3
 Added:
 - get_external_type_info
@@ -37,7 +91,6 @@ Fixed:
 - search_symbols pagination, find_god_objects coupling
 - JSON-RPC notification compliance
 - 15 more (see CHANGELOG.md)
-Tests: 127 → 543
 v1.5.2: Run source generators so tools see generator-produced code (#7). Fixes phantom CS0117, missed references, wrong unused-code results for projects with generators.
 v1.5.1: Fixed notifications/initialized breaking MCP client connections (#6).
 v1.5.0: Added 7 discovery tools: attribute usages, DI registrations, reflection detection, circular dependencies, NuGet dependencies, source generators, generated code viewer.
@@ -75,11 +128,11 @@ v1.1.0: Added 10 new tools (57 total).
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Build.Framework" Version="17.11.31" ExcludeAssets="runtime" PrivateAssets="all" />
-    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="5.0.0" />
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="5.0.0" />
-    <PackageReference Include="Microsoft.CodeAnalysis.Features" Version="5.0.0" />
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Features" Version="5.0.0" />
+    <PackageReference Include="Microsoft.Build.Framework" Version="17.11.48" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="5.3.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="5.3.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Features" Version="5.3.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Features" Version="5.3.0" />
     <PackageReference Include="Microsoft.Build.Locator" Version="1.11.2" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
   </ItemGroup>

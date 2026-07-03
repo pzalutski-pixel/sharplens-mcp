@@ -12,72 +12,13 @@ namespace SharpLensMcp;
 // v1.5.0 partial-class organization.
 public partial class RoslynService
 {
-    public async Task<object> GetMethodOverloadsAsync(string filePath, int line, int column)
+    public async Task<object> GetMethodOverloadsAsync(
+        string filePath, int line, int column, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
-
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                hint: "Check for syntax errors with get_diagnostics",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var position = GetPosition(syntaxTree, line, column);
-        var token = syntaxTree.GetRoot().FindToken(position);
-        var node = token.Parent;
-
-        if (node == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Try adjusting the line/column or use search_symbols to find symbols by name",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var symbolInfo = semanticModel.GetSymbolInfo(node);
-        var symbol = symbolInfo.Symbol ?? semanticModel.GetDeclaredSymbol(node);
-
-        if (symbol == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Try adjusting the line/column or use search_symbols to find symbols by name",
-                context: new { filePath, line, column }
-            );
-        }
+        var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
+        if (symbol == null) return error!;
 
         if (symbol is not IMethodSymbol methodSymbol)
         {
@@ -109,7 +50,7 @@ public partial class RoslynService
                     name = p.Name,
                     type = p.Type.ToDisplayString(),
                     isOptional = p.IsOptional,
-                    defaultValue = p.HasExplicitDefaultValue ? p.ExplicitDefaultValue?.ToString() : null
+                    defaultValue = FormatDefaultValue(p)
                 }).ToList(),
                 returnType = m.ReturnType.ToDisplayString(),
                 isAsync = m.IsAsync,
@@ -140,40 +81,16 @@ public partial class RoslynService
         );
     }
 
-    public async Task<object> GetContainingMemberAsync(string filePath, int line, int column)
+    public async Task<object> GetContainingMemberAsync(
+        string filePath, int line, int column, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var position = GetPosition(syntaxTree, line, column);
-        var token = syntaxTree.GetRoot().FindToken(position);
+        var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
+        if (pos == null) return posError!;
 
         // Walk up the syntax tree to find the containing member
-        var memberNode = token.Parent?.AncestorsAndSelf().FirstOrDefault(n =>
+        var memberNode = pos.Token.Parent?.AncestorsAndSelf().FirstOrDefault(n =>
             n is MethodDeclarationSyntax or
             PropertyDeclarationSyntax or
             ConstructorDeclarationSyntax or
@@ -191,18 +108,7 @@ public partial class RoslynService
             );
         }
 
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                hint: "Check for syntax errors with get_diagnostics",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var symbol = semanticModel.GetDeclaredSymbol(memberNode);
+        var symbol = pos.Model.GetDeclaredSymbol(memberNode, cancellationToken);
         if (symbol == null)
         {
             return CreateErrorResponse(
@@ -213,7 +119,7 @@ public partial class RoslynService
         }
 
         var span = memberNode.Span;
-        var lineSpan = syntaxTree.GetLineSpan(span);
+        var lineSpan = pos.Tree.GetLineSpan(span);
 
         return CreateSuccessResponse(
             data: new
@@ -238,165 +144,17 @@ public partial class RoslynService
         );
     }
 
-    public async Task<object> FindCallersAsync(string filePath, int line, int column, int? maxResults = null)
-    {
-        EnsureSolutionLoaded();
-
-        var maxResultsToReturn = maxResults ?? 100; // Default to 100
-
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
-
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                hint: "Check for syntax errors with get_diagnostics",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var position = GetPosition(syntaxTree, line, column);
-        var token = syntaxTree.GetRoot().FindToken(position);
-        var node = token.Parent;
-
-        if (node == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Try adjusting the line/column or use search_symbols to find symbols by name",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var symbolInfo = semanticModel.GetSymbolInfo(node);
-        var symbol = symbolInfo.Symbol ?? semanticModel.GetDeclaredSymbol(node);
-
-        if (symbol == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Try adjusting the line/column or use search_symbols to find symbols by name",
-                context: new { filePath, line, column }
-            );
-        }
-
-        // Find callers works best for methods, properties, and constructors
-        if (symbol is not (IMethodSymbol or IPropertySymbol))
-        {
-            return CreateErrorResponse(
-                ErrorCodes.NotAMethod,
-                "Not a callable symbol",
-                hint: "This tool works for methods, properties, and constructors. Use find_references for other symbol types.",
-                context: new { actualKind = symbol.Kind.ToString(), symbolName = symbol.Name }
-            );
-        }
-
-        var callers = await SymbolFinder.FindCallersAsync(symbol, _solution!);
-
-        // First count total
-        var totalCallers = 0;
-        foreach (var caller in callers)
-        {
-            totalCallers += caller.Locations.Count(loc => loc.IsInSource);
-        }
-
-        var callerList = new List<object>();
-        foreach (var caller in callers)
-        {
-            var callingSymbol = caller.CallingSymbol;
-            var locations = caller.Locations;
-
-            foreach (var location in locations.Where(loc => loc.IsInSource))
-            {
-                if (callerList.Count >= maxResultsToReturn)
-                    break; // Stop at limit
-
-                if (location.SourceTree == null) continue;
-
-                var callerDocument = _solution!.GetDocument(location.SourceTree);
-                if (callerDocument == null) continue;
-
-                var lineSpan = location.GetLineSpan();
-                var text = location.SourceTree.GetText();
-                var lineText = text.Lines[lineSpan.StartLinePosition.Line].ToString().Trim();
-
-                callerList.Add(new
-                {
-                    callingSymbol = new
-                    {
-                        name = callingSymbol.Name,
-                        kind = callingSymbol.Kind.ToString(),
-                        containingType = callingSymbol.ContainingType?.ToDisplayString(),
-                        signature = callingSymbol.ToDisplayString()
-                    },
-                    location = new
-                    {
-                        filePath = FormatPath(callerDocument.FilePath),
-                        line = lineSpan.StartLinePosition.Line,
-                        column = lineSpan.StartLinePosition.Character,
-                        lineText
-                    }
-                });
-            }
-
-            if (callerList.Count >= maxResultsToReturn)
-                break; // Stop outer loop too
-        }
-
-        return CreateSuccessResponse(
-            data: new
-            {
-                symbolName = symbol.Name,
-                symbolKind = symbol.Kind.ToString(),
-                symbolSignature = symbol.ToDisplayString(),
-                callers = callerList
-            },
-            suggestedNextTools: new[]
-            {
-                "get_containing_member for caller context",
-                "find_references for all usages including non-call references"
-            },
-            totalCount: totalCallers,
-            returnedCount: callerList.Count
-        );
-    }
-
     public async Task<object> FindUnusedCodeAsync(
         string? projectName,
         bool includePrivate,
         bool includeInternal,
         string? symbolKindFilter = null,
-        int? maxResults = null)
+        int? maxResults = null,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
-        var data = await FindUnusedCodeDataAsyncCore(projectName, includePrivate, includeInternal, symbolKindFilter, maxResults ?? 50);
+        if (ValidateUnusedCodeKindFilter(symbolKindFilter) is { } filterError) return filterError;
+        var data = await FindUnusedCodeDataAsyncCore(projectName, includePrivate, includeInternal, symbolKindFilter, maxResults ?? 50, namePredicate: null, cancellationToken);
 
         var countByKind = data.Symbols
             .GroupBy(s => s.Kind)
@@ -427,23 +185,36 @@ public partial class RoslynService
         );
     }
 
-    // Internal typed-data variant used by GetProjectHealthAsync.
+    // Internal typed-data variant used by GetProjectHealthAsync and
+    // RemoveUnusedCodeAsync. namePredicate narrows the candidate sweep to
+    // matching symbol names BEFORE any reference counting — an allow-list
+    // query checks a handful of names instead of the whole project.
     internal Task<UnusedCodeData> FindUnusedCodeDataAsync(
         string? projectName,
         bool includePrivate,
         bool includeInternal,
         string? symbolKindFilter,
-        int maxResults) => FindUnusedCodeDataAsyncCore(projectName, includePrivate, includeInternal, symbolKindFilter, maxResults);
+        int maxResults,
+        Func<string, bool>? namePredicate = null,
+        CancellationToken cancellationToken = default) => FindUnusedCodeDataAsyncCore(projectName, includePrivate, includeInternal, symbolKindFilter, maxResults, namePredicate, cancellationToken);
 
     private async Task<UnusedCodeData> FindUnusedCodeDataAsyncCore(
         string? projectName,
         bool includePrivate,
         bool includeInternal,
         string? symbolKindFilter,
-        int maxResults)
+        int maxResults,
+        Func<string, bool>? namePredicate = null,
+        CancellationToken cancellationToken = default)
     {
+        // The returned list is capped at maxResults to bound the payload, but
+        // totalUnused counts EVERY unused symbol so totalCount is the true total (and
+        // meta.Truncated fires when the cap drops some). Identifying unused code
+        // requires reference-checking every candidate, so this is a full scan by
+        // nature — the only way to know what is unused — bounded by the per-call timeout.
         var unusedSymbols = new List<UnusedSymbolEntry>();
         var maxResultsToReturn = maxResults;
+        var totalUnused = 0;
 
         var projectsToAnalyze = string.IsNullOrEmpty(projectName)
             ? _solution!.Projects
@@ -451,34 +222,34 @@ public partial class RoslynService
 
         foreach (var project in projectsToAnalyze)
         {
-            if (unusedSymbols.Count >= maxResultsToReturn)
-                break;
-
-            var compilation = await GetProjectCompilationAsync(project);
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
 
             var shouldAnalyzeTypes = string.IsNullOrEmpty(symbolKindFilter) ||
                                      symbolKindFilter.Equals("Class", StringComparison.OrdinalIgnoreCase) ||
                                      symbolKindFilter.Equals("Interface", StringComparison.OrdinalIgnoreCase) ||
                                      symbolKindFilter.Equals("Struct", StringComparison.OrdinalIgnoreCase) ||
+                                     symbolKindFilter.Equals("Enum", StringComparison.OrdinalIgnoreCase) ||
+                                     symbolKindFilter.Equals("Delegate", StringComparison.OrdinalIgnoreCase) ||
                                      symbolKindFilter.Equals("Type", StringComparison.OrdinalIgnoreCase);
 
             if (shouldAnalyzeTypes)
             {
-                // Get all named type symbols (classes, interfaces, structs, enums)
-                var allTypes = compilation.GetSymbolsWithName(_ => true, SymbolFilter.Type)
+                // Get all named type symbols (classes, interfaces, structs, enums, delegates)
+                var allTypes = compilation.GetSymbolsWithName(namePredicate ?? (_ => true), SymbolFilter.Type)
                     .OfType<INamedTypeSymbol>();
 
                 foreach (var typeSymbol in allTypes)
                 {
-                    if (unusedSymbols.Count >= maxResultsToReturn)
-                        break;
-
                     // Skip compiler-generated, extern, and types not in source
                     if (typeSymbol.IsImplicitlyDeclared ||
                         typeSymbol.IsExtern ||
                         !typeSymbol.Locations.Any(loc => loc.IsInSource))
                         continue;
+
+                    // Narrow to the requested kind: "Class" must not also report
+                    // interfaces, structs, and enums.
+                    if (!MatchesKindFilter(typeSymbol, symbolKindFilter)) continue;
 
                     // Filter by accessibility
                     if (!includePrivate && typeSymbol.DeclaredAccessibility == Accessibility.Private)
@@ -494,15 +265,16 @@ public partial class RoslynService
                     if (HasFrameworkAttribute(typeSymbol))
                         continue;
 
-                    // Find references to this type
-                    var references = await SymbolFinder.FindReferencesAsync(typeSymbol, _solution!);
+                    // Find references to this type. SymbolFinder reference locations
+                    // exclude the declaration itself, so zero locations means unused.
+                    var references = await SymbolFinder.FindReferencesAsync(typeSymbol, _solution!, cancellationToken);
                     var referenceCount = references.SelectMany(r => r.Locations).Count();
 
                     // For types, also check if any members are referenced
                     // This handles static classes where the class itself isn't referenced
                     // but its static methods/properties are called
                     var hasReferencedMembers = false;
-                    if (referenceCount <= 1) // Type itself has no references
+                    if (referenceCount == 0) // Type itself has no references
                     {
                         // Check if any public/internal members are referenced
                         foreach (var member in typeSymbol.GetMembers())
@@ -512,10 +284,10 @@ public partial class RoslynService
                                 member is IMethodSymbol { MethodKind: MethodKind.Constructor or MethodKind.StaticConstructor })
                                 continue;
 
-                            var memberRefs = await SymbolFinder.FindReferencesAsync(member, _solution!);
+                            var memberRefs = await SymbolFinder.FindReferencesAsync(member, _solution!, cancellationToken);
                             var memberRefCount = memberRefs.SelectMany(r => r.Locations).Count();
 
-                            if (memberRefCount > 1) // Member is referenced (beyond its declaration)
+                            if (memberRefCount > 0) // Member is referenced
                             {
                                 hasReferencedMembers = true;
                                 break; // No need to check other members
@@ -523,21 +295,26 @@ public partial class RoslynService
                         }
                     }
 
-                    if (referenceCount <= 1 && !hasReferencedMembers)
+                    if (referenceCount == 0 && !hasReferencedMembers)
                     {
                         var location = typeSymbol.Locations.FirstOrDefault(loc => loc.IsInSource);
                         if (location != null)
                         {
-                            var lineSpan = location.GetLineSpan();
-                            unusedSymbols.Add(new UnusedSymbolEntry(
-                                Name: typeSymbol.Name,
-                                FullName: typeSymbol.ToDisplayString(),
-                                Kind: GetTypeKindString(typeSymbol),
-                                Accessibility: typeSymbol.DeclaredAccessibility.ToString(),
-                                ContainingType: null,
-                                FilePath: FormatPath(lineSpan.Path),
-                                Line: lineSpan.StartLinePosition.Line,
-                                Column: lineSpan.StartLinePosition.Character));
+                            totalUnused++;
+                            if (unusedSymbols.Count < maxResultsToReturn)
+                            {
+                                var lineSpan = location.GetLineSpan();
+                                unusedSymbols.Add(new UnusedSymbolEntry(
+                                    Name: typeSymbol.Name,
+                                    FullName: typeSymbol.ToDisplayString(),
+                                    Kind: GetTypeKindString(typeSymbol),
+                                    Accessibility: typeSymbol.DeclaredAccessibility.ToString(),
+                                    ContainingType: null,
+                                    FilePath: FormatPath(lineSpan.Path),
+                                    Line: lineSpan.StartLinePosition.Line,
+                                    Column: lineSpan.StartLinePosition.Character,
+                                    Symbol: typeSymbol));
+                            }
                         }
                     }
                 }
@@ -550,18 +327,19 @@ public partial class RoslynService
                                        symbolKindFilter.Equals("Field", StringComparison.OrdinalIgnoreCase) ||
                                        symbolKindFilter.Equals("Member", StringComparison.OrdinalIgnoreCase);
 
-            if (shouldAnalyzeMembers && unusedSymbols.Count < maxResultsToReturn)
+            if (shouldAnalyzeMembers)
             {
                 // Also check methods, properties, and fields
-                var allMembers = compilation.GetSymbolsWithName(_ => true, SymbolFilter.Member);
+                var allMembers = compilation.GetSymbolsWithName(namePredicate ?? (_ => true), SymbolFilter.Member);
 
                 foreach (var member in allMembers)
                 {
-                    if (unusedSymbols.Count >= maxResultsToReturn)
-                        break;
-
                     if (member is not (IMethodSymbol or IPropertySymbol or IFieldSymbol))
                         continue;
+
+                    // Narrow to the requested kind: "Method" must not also report
+                    // properties and fields.
+                    if (!MatchesKindFilter(member, symbolKindFilter)) continue;
 
                     // Skip compiler-generated, extern, and symbols not in source
                     if (member.IsImplicitlyDeclared ||
@@ -569,9 +347,17 @@ public partial class RoslynService
                         !member.Locations.Any(loc => loc.IsInSource))
                         continue;
 
-                    // Skip special methods (constructors, operators, etc.)
+                    // Skip special methods (constructors, operators, etc.) and any
+                    // polymorphic-dispatch member — abstract/virtual/override are reached
+                    // through the type contract, not necessarily a direct call. Properties
+                    // dispatch the same way, so an abstract/virtual/override property is
+                    // excluded too.
                     if (member is IMethodSymbol method &&
-                        (method.MethodKind != MethodKind.Ordinary || method.IsOverride || method.IsVirtual))
+                        (method.MethodKind != MethodKind.Ordinary || method.IsOverride
+                         || method.IsVirtual || method.IsAbstract))
+                        continue;
+                    if (member is IPropertySymbol property &&
+                        (property.IsOverride || property.IsVirtual || property.IsAbstract))
                         continue;
 
                     // Filter by accessibility
@@ -580,35 +366,89 @@ public partial class RoslynService
                     if (!includeInternal && member.DeclaredAccessibility == Accessibility.Internal)
                         continue;
 
-                    // Find references
-                    var references = await SymbolFinder.FindReferencesAsync(member, _solution!);
+                    // Find references. SymbolFinder reference locations exclude the
+                    // declaration itself, so zero locations means unused.
+                    var references = await SymbolFinder.FindReferencesAsync(member, _solution!, cancellationToken);
                     var referenceCount = references.SelectMany(r => r.Locations).Count();
 
-                    if (referenceCount <= 1)
+                    if (referenceCount == 0)
                     {
                         var location = member.Locations.FirstOrDefault(loc => loc.IsInSource);
                         if (location != null)
                         {
-                            var lineSpan = location.GetLineSpan();
-                            unusedSymbols.Add(new UnusedSymbolEntry(
-                                Name: member.Name,
-                                FullName: member.ToDisplayString(),
-                                Kind: member.Kind.ToString(),
-                                Accessibility: member.DeclaredAccessibility.ToString(),
-                                ContainingType: member.ContainingType?.ToDisplayString(),
-                                FilePath: FormatPath(lineSpan.Path),
-                                Line: lineSpan.StartLinePosition.Line,
-                                Column: lineSpan.StartLinePosition.Character));
+                            totalUnused++;
+                            if (unusedSymbols.Count < maxResultsToReturn)
+                            {
+                                var lineSpan = location.GetLineSpan();
+                                unusedSymbols.Add(new UnusedSymbolEntry(
+                                    Name: member.Name,
+                                    FullName: member.ToDisplayString(),
+                                    Kind: member.Kind.ToString(),
+                                    Accessibility: member.DeclaredAccessibility.ToString(),
+                                    ContainingType: member.ContainingType?.ToDisplayString(),
+                                    FilePath: FormatPath(lineSpan.Path),
+                                    Line: lineSpan.StartLinePosition.Line,
+                                    Column: lineSpan.StartLinePosition.Character,
+                                    Symbol: member));
+                            }
                         }
                     }
                 }
             }
         }
 
-        return new UnusedCodeData(TotalCount: unusedSymbols.Count, Symbols: unusedSymbols);
+        return new UnusedCodeData(TotalCount: totalUnused, Symbols: unusedSymbols);
     }
 
-    public Task<object> GetDependencyGraphAsync(string? format)
+    // The symbolKindFilter values find_unused_code and remove_unused_code accept.
+    // The group gates and MatchesKindFilter only recognize these tokens, so an
+    // unrecognized value matches neither group and would silently report "zero
+    // unused" — ValidateUnusedCodeKindFilter rejects it up front instead.
+    private static readonly string[] UnusedCodeKindFilters =
+        { "Class", "Interface", "Struct", "Enum", "Delegate", "Type", "Method", "Property", "Field", "Member" };
+
+    private object? ValidateUnusedCodeKindFilter(string? symbolKindFilter)
+    {
+        if (string.IsNullOrEmpty(symbolKindFilter)) return null;
+        if (UnusedCodeKindFilters.Any(k => k.Equals(symbolKindFilter, StringComparison.OrdinalIgnoreCase)))
+            return null;
+        return CreateErrorResponse(
+            ErrorCodes.InvalidParameter,
+            $"Unknown symbolKindFilter '{symbolKindFilter}'",
+            hint: $"Use one of: {string.Join(", ", UnusedCodeKindFilters)}.",
+            context: new { symbolKindFilter });
+    }
+
+    // Honors a specific symbolKindFilter at the symbol level. The group gates
+    // (shouldAnalyzeTypes/shouldAnalyzeMembers) decide whether a loop runs at all;
+    // this narrows within it. Null/empty matches everything; the group tokens
+    // "Type"/"Member" match every kind in that group.
+    private static bool MatchesKindFilter(ISymbol symbol, string? filter)
+    {
+        if (string.IsNullOrEmpty(filter)) return true;
+        return symbol switch
+        {
+            INamedTypeSymbol type => filter.Equals("Type", StringComparison.OrdinalIgnoreCase)
+                || type.TypeKind switch
+                {
+                    TypeKind.Class => filter.Equals("Class", StringComparison.OrdinalIgnoreCase),
+                    TypeKind.Interface => filter.Equals("Interface", StringComparison.OrdinalIgnoreCase),
+                    TypeKind.Struct => filter.Equals("Struct", StringComparison.OrdinalIgnoreCase),
+                    TypeKind.Enum => filter.Equals("Enum", StringComparison.OrdinalIgnoreCase),
+                    TypeKind.Delegate => filter.Equals("Delegate", StringComparison.OrdinalIgnoreCase),
+                    _ => false
+                },
+            IMethodSymbol => filter.Equals("Member", StringComparison.OrdinalIgnoreCase)
+                || filter.Equals("Method", StringComparison.OrdinalIgnoreCase),
+            IPropertySymbol => filter.Equals("Member", StringComparison.OrdinalIgnoreCase)
+                || filter.Equals("Property", StringComparison.OrdinalIgnoreCase),
+            IFieldSymbol => filter.Equals("Member", StringComparison.OrdinalIgnoreCase)
+                || filter.Equals("Field", StringComparison.OrdinalIgnoreCase),
+            _ => false
+        };
+    }
+
+    public Task<object> GetDependencyGraphAsync(string? format, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -618,6 +458,7 @@ public partial class RoslynService
         // Build dependency graph
         foreach (var project in allProjects)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var dependencies = project.ProjectReferences
                 .Select(pr => _solution!.GetProject(pr.ProjectId)?.Name)
                 .Where(name => name != null)
@@ -666,52 +507,16 @@ public partial class RoslynService
         ));
     }
 
-    public async Task<object> GetMissingMembersAsync(string filePath, int line, int column)
+    public async Task<object> GetMissingMembersAsync(
+        string filePath, int line, int column, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
-
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                hint: "Check for syntax errors with get_diagnostics",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var position = GetPosition(syntaxTree, line, column);
-        var token = syntaxTree.GetRoot().FindToken(position);
-        var node = token.Parent;
+        var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
+        if (pos == null) return posError!;
 
         // Find the type declaration
-        var typeDecl = node?.AncestorsAndSelf().OfType<TypeDeclarationSyntax>().FirstOrDefault();
+        var typeDecl = pos.Token.Parent?.AncestorsAndSelf().OfType<TypeDeclarationSyntax>().FirstOrDefault();
         if (typeDecl == null)
         {
             return CreateErrorResponse(
@@ -722,7 +527,7 @@ public partial class RoslynService
             );
         }
 
-        var typeSymbol = semanticModel.GetDeclaredSymbol(typeDecl) as INamedTypeSymbol;
+        var typeSymbol = pos.Model.GetDeclaredSymbol(typeDecl, cancellationToken) as INamedTypeSymbol;
         if (typeSymbol == null)
         {
             return CreateErrorResponse(
@@ -803,167 +608,15 @@ public partial class RoslynService
     }
 
     /// <summary>
-    /// Gets all methods called by a given method.
-    /// </summary>
-    public async Task<object> GetOutgoingCallsAsync(string filePath, int line, int column, int? maxDepth = null)
-    {
-        EnsureSolutionLoaded();
-
-        var depth = maxDepth ?? 1;
-
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
-
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                hint: "Check for syntax errors with get_diagnostics",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var position = GetPosition(syntaxTree, line, column);
-        var token = syntaxTree.GetRoot().FindToken(position);
-        var node = token.Parent;
-
-        // Find the method declaration
-        var methodDecl = node?.AncestorsAndSelf().OfType<MethodDeclarationSyntax>().FirstOrDefault();
-        if (methodDecl == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.NotAMethod,
-                "No method declaration found at position",
-                hint: "Place cursor inside a method body",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var methodSymbol = semanticModel.GetDeclaredSymbol(methodDecl) as IMethodSymbol;
-        if (methodSymbol == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "Could not resolve method symbol",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var calls = new List<object>();
-        var visited = new HashSet<string>();
-
-        // Find all invocations in the method body
-        var invocations = methodDecl.DescendantNodes().OfType<InvocationExpressionSyntax>();
-        foreach (var invocation in invocations)
-        {
-            var symbolInfo = semanticModel.GetSymbolInfo(invocation);
-            var calledMethod = symbolInfo.Symbol as IMethodSymbol;
-            if (calledMethod == null) continue;
-
-            var key = calledMethod.ToDisplayString();
-            if (visited.Contains(key)) continue;
-            visited.Add(key);
-
-            var location = calledMethod.Locations.FirstOrDefault(l => l.IsInSource);
-            var lineSpan = location?.GetLineSpan();
-
-            calls.Add(new
-            {
-                method = calledMethod.ToDisplayString(),
-                shortName = $"{calledMethod.ContainingType?.Name}.{calledMethod.Name}",
-                returnType = calledMethod.ReturnType.ToDisplayString(),
-                isAsync = calledMethod.IsAsync,
-                isExternal = !location?.IsInSource ?? true,
-                location = lineSpan != null ? new
-                {
-                    filePath = FormatPath(lineSpan.Value.Path),
-                    line = lineSpan.Value.StartLinePosition.Line,
-                    column = lineSpan.Value.StartLinePosition.Character
-                } : null
-            });
-        }
-
-        // Also find property accesses
-        var memberAccesses = methodDecl.DescendantNodes().OfType<MemberAccessExpressionSyntax>();
-        foreach (var access in memberAccesses)
-        {
-            var symbolInfo = semanticModel.GetSymbolInfo(access);
-            if (symbolInfo.Symbol is IPropertySymbol prop)
-            {
-                var key = prop.ToDisplayString();
-                if (visited.Contains(key)) continue;
-                visited.Add(key);
-
-                var location = prop.Locations.FirstOrDefault(l => l.IsInSource);
-                var lineSpan = location?.GetLineSpan();
-
-                calls.Add(new
-                {
-                    method = prop.ToDisplayString(),
-                    shortName = $"{prop.ContainingType?.Name}.{prop.Name}",
-                    returnType = prop.Type.ToDisplayString(),
-                    isAsync = false,
-                    isProperty = true,
-                    isExternal = !location?.IsInSource ?? true,
-                    location = lineSpan != null ? new
-                    {
-                        filePath = FormatPath(lineSpan.Value.Path),
-                        line = lineSpan.Value.StartLinePosition.Line,
-                        column = lineSpan.Value.StartLinePosition.Character
-                    } : null
-                });
-            }
-        }
-
-        return CreateSuccessResponse(
-            data: new
-            {
-                method = methodSymbol.ToDisplayString(),
-                containingType = methodSymbol.ContainingType?.ToDisplayString(),
-                calls
-            },
-            suggestedNextTools: new[]
-            {
-                "get_outgoing_calls on a called method to trace deeper",
-                "find_callers to see who calls this method"
-            },
-            totalCount: calls.Count,
-            returnedCount: calls.Count
-        );
-    }
-
-    /// <summary>
     /// Gets all ways to instantiate a type.
     /// </summary>
-    public async Task<object> GetInstantiationOptionsAsync(string typeName)
+    public async Task<object> GetInstantiationOptionsAsync(
+        string typeName, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var type = await FindTypeByNameAsync(typeName);
+        var (type, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
+        if (ambiguousType != null) return ambiguousType;
         if (type == null)
         {
             return CreateErrorResponse(
@@ -987,7 +640,7 @@ public partial class RoslynService
                     name = p.Name,
                     type = p.Type.ToDisplayString(),
                     isOptional = p.IsOptional,
-                    defaultValue = p.HasExplicitDefaultValue ? p.ExplicitDefaultValue?.ToString() : null
+                    defaultValue = FormatDefaultValue(p)
                 }).ToList(),
                 isObsolete = c.GetAttributes().Any(a => a.AttributeClass?.Name == "ObsoleteAttribute")
             })
@@ -1006,7 +659,9 @@ public partial class RoslynService
                 parameters = m.Parameters.Select(p => new
                 {
                     name = p.Name,
-                    type = p.Type.ToDisplayString()
+                    type = p.Type.ToDisplayString(),
+                    isOptional = p.IsOptional,
+                    defaultValue = FormatDefaultValue(p)
                 }).ToList()
             })
             .ToList();
@@ -1018,27 +673,32 @@ public partial class RoslynService
         // source generators (implicit .NET SDK generators count), base != augmented
         // and SymbolEqualityComparer.Default returns false for the "same" source
         // type across compilations — silently breaking external-factory detection.
-        var typeMetadataName = type.ToDisplayString();
+        // Match the target type by its documentation-comment id — stable across the
+        // base→augmented compilation boundary AND across constructed/definition forms.
+        // The old GetTypeByMetadataName fed a display string (with angle brackets) to an
+        // API that needs `+`-nested, backtick-arity metadata names, so generic/nested
+        // receiver types resolved to null and were skipped entirely; and comparing a
+        // factory's (possibly constructed) return type to the unbound definition by
+        // symbol equality missed generic factories. OriginalDefinition + doc-id fixes both.
+        var targetTypeId = type.OriginalDefinition.GetDocumentationCommentId();
         var externalFactories = new List<object>();
         foreach (var project in _solution!.Projects)
         {
-            var compilation = await GetProjectCompilationAsync(project);
+            if (targetTypeId == null) break;
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
-
-            var typeInCompilation = compilation.GetTypeByMetadataName(typeMetadataName);
-            if (typeInCompilation == null) continue;
 
             var allTypes = compilation.GetSymbolsWithName(_ => true, SymbolFilter.Type).OfType<INamedTypeSymbol>();
             foreach (var t in allTypes)
             {
-                if (SymbolEqualityComparer.Default.Equals(t, typeInCompilation)) continue;
+                if (t.OriginalDefinition.GetDocumentationCommentId() == targetTypeId) continue; // the type itself
 
                 var factories = t.GetMembers()
                     .OfType<IMethodSymbol>()
                     .Where(m => m.IsStatic &&
                                m.DeclaredAccessibility == Accessibility.Public &&
                                (m.Name.StartsWith("Create") || m.Name.StartsWith("Build") || m.Name.StartsWith("New")) &&
-                               SymbolEqualityComparer.Default.Equals(m.ReturnType, typeInCompilation))
+                               m.ReturnType.OriginalDefinition.GetDocumentationCommentId() == targetTypeId)
                     .Take(5); // Limit to avoid too many
 
                 foreach (var f in factories)
@@ -1057,9 +717,20 @@ public partial class RoslynService
 
         // Check for common patterns
         var implementsIDisposable = type.AllInterfaces.Any(i => i.Name == "IDisposable");
-        var hasBuilder = _solution.Projects
-            .SelectMany(p => p.Documents)
-            .Any(d => d.Name.Contains($"{type.Name}Builder"));
+        // A real source type named {Type}Builder, not a filename substring.
+        var builderTypeName = $"{type.Name}Builder";
+        var hasBuilder = false;
+        foreach (var project in _solution!.Projects)
+        {
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
+            if (compilation == null) continue;
+            if (compilation.GetSymbolsWithName(n => n == builderTypeName, SymbolFilter.Type)
+                .OfType<INamedTypeSymbol>().Any(t => t.Locations.Any(l => l.IsInSource)))
+            {
+                hasBuilder = true;
+                break;
+            }
+        }
 
         string? hint = null;
         if (implementsIDisposable)
@@ -1101,73 +772,16 @@ public partial class RoslynService
         int line,
         int column,
         string changeType,
-        string? newValue = null)
+        string? newValue = null,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
-
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var position = GetPosition(syntaxTree, line, column);
-        var token = syntaxTree.GetRoot().FindToken(position);
-        var node = token.Parent;
-
-        if (node == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Place cursor on a symbol (method, property, type, etc.)",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var symbolInfo = semanticModel.GetSymbolInfo(node);
-        var symbol = symbolInfo.Symbol ?? semanticModel.GetDeclaredSymbol(node);
-
-        if (symbol == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "Could not resolve symbol",
-                context: new { filePath, line, column }
-            );
-        }
+        var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
+        if (symbol == null) return error!;
 
         // Find all references
-        var references = await SymbolFinder.FindReferencesAsync(symbol, _solution!);
+        var references = await SymbolFinder.FindReferencesAsync(symbol, _solution!, cancellationToken);
         var allLocations = references.SelectMany(r => r.Locations).ToList();
 
         var impactedLocations = new List<object>();
@@ -1178,8 +792,6 @@ public partial class RoslynService
         {
             if (!location.Location.IsInSource) continue;
 
-            var refDocument = location.Document;
-            var refSemanticModel = await refDocument.GetSemanticModelAsync();
             var lineSpan = location.Location.GetLineSpan();
 
             string impact;
@@ -1201,9 +813,21 @@ public partial class RoslynService
 
                 case "addparameter":
                 case "add_parameter":
-                    impact = "Call site missing new parameter";
-                    severity = "error";
-                    breakingChanges++;
+                    // A new parameter WITH a default value (newValue carries `=`) is
+                    // source-compatible: existing call sites compile unchanged. Only
+                    // a defaultless addition breaks them. This is the one real per-site
+                    // feasibility signal here; the rest are change-type heuristics.
+                    if (newValue != null && newValue.Contains('='))
+                    {
+                        impact = "New parameter has a default value — existing call sites remain valid";
+                        severity = "info";
+                    }
+                    else
+                    {
+                        impact = "Call site missing new parameter";
+                        severity = "error";
+                        breakingChanges++;
+                    }
                     break;
 
                 case "removeparameter":
@@ -1262,6 +886,12 @@ public partial class RoslynService
                 breakingChanges,
                 warnings,
                 safe = breakingChanges == 0,
+                // Honesty about scope: except for the addParameter-with-default case,
+                // each reference's severity is a heuristic from the change type and the
+                // symbol's accessibility — not a per-call-site compile-feasibility check.
+                // Treat this as a categorized reference inventory, not a proof of safety.
+                impactKind = "heuristic-by-change-type",
+                note = "Severities are derived from changeType + accessibility, not a per-call-site feasibility check (except addParameter, which honors a default value in newValue). Validate with get_diagnostics after applying.",
                 impactedLocations
             },
             suggestedNextTools: breakingChanges > 0
@@ -1298,11 +928,14 @@ public partial class RoslynService
     /// <summary>
     /// Gets the actual source code of a method by name.
     /// </summary>
-    public async Task<object> GetMethodSourceAsync(string typeName, string methodName, int? overloadIndex = null)
+    public async Task<object> GetMethodSourceAsync(
+        string typeName, string methodName, int? overloadIndex = null,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var type = await FindTypeByNameAsync(typeName);
+        var (type, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
+        if (ambiguousType != null) return ambiguousType;
         if (type == null)
         {
             return CreateErrorResponse(
@@ -1364,7 +997,7 @@ public partial class RoslynService
             );
         }
 
-        var root = await syntaxTree.GetRootAsync();
+        var root = await syntaxTree.GetRootAsync(cancellationToken);
         var node = root.FindNode(location.SourceSpan);
 
         // Find the method declaration
@@ -1378,7 +1011,10 @@ public partial class RoslynService
             );
         }
 
-        var lineSpan = location.GetLineSpan();
+        // Span the whole method declaration (not the symbol's identifier-only
+        // location) so the reported start/end and lineCount describe the same
+        // range, and lineCount excludes leading-trivia lines.
+        var lineSpan = methodDecl.GetLocation().GetLineSpan();
         var sourceText = methodDecl.ToFullString();
 
         // Also get just the body if available
@@ -1408,7 +1044,9 @@ public partial class RoslynService
                 },
                 fullSource = sourceText,
                 bodySource,
-                lineCount = sourceText.Split('\n').Length
+                // The declaration's own line span — consistent with start/end and
+                // free of the leading-trivia lines that ToFullString() carries.
+                lineCount = lineSpan.EndLinePosition.Line - lineSpan.StartLinePosition.Line + 1
             },
             suggestedNextTools: new[]
             {
@@ -1423,7 +1061,8 @@ public partial class RoslynService
     /// </summary>
     public async Task<object> GetMethodSourceBatchAsync(
         List<Dictionary<string, object>> methods,
-        int maxMethods = 20)
+        int maxMethods = 20,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -1451,11 +1090,28 @@ public partial class RoslynService
 
         foreach (var methodReq in methods)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var typeName = methodReq.TryGetValue("typeName", out var tn) ? tn?.ToString() : null;
             var methodName = methodReq.TryGetValue("methodName", out var mn) ? mn?.ToString() : null;
-            int? overloadIndex = methodReq.TryGetValue("overloadIndex", out var oi) && oi != null
-                ? Convert.ToInt32(oi)
-                : null;
+
+            int? overloadIndex = null;
+            if (methodReq.TryGetValue("overloadIndex", out var oi) && oi != null)
+            {
+                if (oi is int oiInt) overloadIndex = oiInt;
+                else if (int.TryParse(oi.ToString(), out var parsed)) overloadIndex = parsed;
+                else
+                {
+                    // Per-item error — a bad index on one entry must not abort the batch.
+                    errors.Add(new
+                    {
+                        typeName,
+                        methodName,
+                        success = false,
+                        error = $"overloadIndex must be an integer (got '{oi}')"
+                    });
+                    continue;
+                }
+            }
 
             if (string.IsNullOrWhiteSpace(typeName) || string.IsNullOrWhiteSpace(methodName))
             {
@@ -1469,7 +1125,7 @@ public partial class RoslynService
                 continue;
             }
 
-            var result = await GetMethodSourceAsync(typeName, methodName, overloadIndex);
+            var result = await GetMethodSourceAsync(typeName, methodName, overloadIndex, cancellationToken);
 
             if (IsSuccessResponse(result))
             {
@@ -1510,273 +1166,5 @@ public partial class RoslynService
             totalCount: methods.Count,
             returnedCount: results.Count
         );
-    }
-
-    // Transitive call-graph: BFS up to maxDepth, capped at maxNodes, with cycle detection.
-    // Replaces the N-round-trip pattern of agents calling find_callers / get_outgoing_calls
-    // iteratively to trace an impact chain. Returns nodes + edges (streamable) rather than
-    // a nested tree (avoids exponential blowup on diamond-shaped graphs).
-    public async Task<object> GetCallGraphAsync(
-        string filePath,
-        int line,
-        int column,
-        string direction = "callees",
-        int maxDepth = 3,
-        int maxNodes = 100)
-    {
-        EnsureSolutionLoaded();
-
-        if (maxDepth <= 0 || maxDepth > 10)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"maxDepth must be between 1 and 10 (got {maxDepth})",
-                hint: "Depths above 10 explode for highly-connected codebases. Drill iteratively with smaller depths.",
-                context: new { maxDepth });
-        }
-
-        var dir = direction?.ToLowerInvariant() ?? "callees";
-        if (dir != "callees" && dir != "callers" && dir != "both")
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"direction must be 'callees', 'callers', or 'both' (got '{direction}')",
-                context: new { direction });
-        }
-
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath });
-        }
-
-        var semanticModel = await document.GetSemanticModelAsync();
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (semanticModel == null || syntaxTree == null)
-        {
-            return CreateErrorResponse(ErrorCodes.AnalysisFailed, "Could not get semantic model/syntax tree", context: new { filePath });
-        }
-
-        var position = GetPosition(syntaxTree, line, column);
-        var token = syntaxTree.GetRoot().FindToken(position);
-        var node = token.Parent;
-        if (node == null)
-        {
-            return CreateErrorResponse(ErrorCodes.SymbolNotFound, "No symbol found at position", context: new { filePath, line, column });
-        }
-
-        var symbolInfo = semanticModel.GetSymbolInfo(node);
-        var rootSymbol = (symbolInfo.Symbol ?? semanticModel.GetDeclaredSymbol(node)) as IMethodSymbol;
-        if (rootSymbol == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.NotAMethod,
-                "Not a method symbol",
-                hint: "Position the cursor on a method declaration or call site.",
-                context: new { filePath, line, column });
-        }
-
-        // Node table keyed by symbol; assign sequential ids for the wire format.
-        var nodeIds = new Dictionary<IMethodSymbol, int>(SymbolEqualityComparer.Default);
-        var nodes = new List<object>();
-        var edges = new List<object>();
-        // Typed adjacency for cycle-detection BFS — avoids dynamic dispatch through
-        // anonymous-typed edge records (which was both slow and fragile).
-        var adjacency = new Dictionary<int, List<int>>();
-        var cyclesDetected = new HashSet<string>(StringComparer.Ordinal);
-        var truncatedByDepth = false;
-        var truncatedByNodes = false;
-
-        int RegisterNode(IMethodSymbol sym, int depth)
-        {
-            if (nodeIds.TryGetValue(sym, out var existing)) return existing;
-            var id = nodes.Count;
-            nodeIds[sym] = id;
-            nodes.Add(new
-            {
-                id,
-                fullName = sym.ToDisplayString(),
-                kind = sym.MethodKind.ToString(),
-                location = GetSymbolLocation(sym),
-                depth
-            });
-            return id;
-        }
-
-        int rootId = RegisterNode(rootSymbol, 0);
-
-        var queue = new Queue<(IMethodSymbol sym, int depth)>();
-        queue.Enqueue((rootSymbol, 0));
-        var visited = new HashSet<IMethodSymbol>(SymbolEqualityComparer.Default) { rootSymbol };
-
-        while (queue.Count > 0)
-        {
-            if (nodes.Count >= maxNodes)
-            {
-                truncatedByNodes = true;
-                break;
-            }
-
-            var (current, depth) = queue.Dequeue();
-            if (depth >= maxDepth)
-            {
-                truncatedByDepth = true;
-                continue;
-            }
-
-            var currentId = nodeIds[current];
-
-            // Callees: walk the method body for invocations.
-            if (dir == "callees" || dir == "both")
-            {
-                var calleeSymbols = await CollectCalleesAsync(current);
-                foreach (var callee in calleeSymbols)
-                {
-                    if (visited.Contains(callee))
-                    {
-                        // Cycle: an edge that points back into something we've already processed.
-                        if (nodeIds.TryGetValue(callee, out var existingId))
-                        {
-                            AddEdge(edges, adjacency, currentId, existingId);
-                            if (SymbolEqualityComparer.Default.Equals(callee, current) ||
-                                IsAncestor(existingId, currentId, adjacency))
-                            {
-                                cyclesDetected.Add($"{current.ToDisplayString()} -> {callee.ToDisplayString()}");
-                            }
-                        }
-                        continue;
-                    }
-                    visited.Add(callee);
-                    if (nodes.Count >= maxNodes) { truncatedByNodes = true; break; }
-                    var calleeId = RegisterNode(callee, depth + 1);
-                    AddEdge(edges, adjacency, currentId, calleeId);
-                    queue.Enqueue((callee, depth + 1));
-                }
-            }
-
-            // Callers: SymbolFinder gives us call sites; map each to the calling method.
-            if (dir == "callers" || dir == "both")
-            {
-                var callers = await SymbolFinder.FindCallersAsync(current, _solution!);
-                foreach (var callerInfo in callers)
-                {
-                    if (callerInfo.CallingSymbol is not IMethodSymbol callerMethod) continue;
-                    if (visited.Contains(callerMethod))
-                    {
-                        if (nodeIds.TryGetValue(callerMethod, out var existingId))
-                        {
-                            AddEdge(edges, adjacency, existingId, currentId);
-                            if (SymbolEqualityComparer.Default.Equals(callerMethod, current))
-                            {
-                                cyclesDetected.Add($"{callerMethod.ToDisplayString()} -> {current.ToDisplayString()}");
-                            }
-                        }
-                        continue;
-                    }
-                    visited.Add(callerMethod);
-                    if (nodes.Count >= maxNodes) { truncatedByNodes = true; break; }
-                    var callerId = RegisterNode(callerMethod, depth + 1);
-                    AddEdge(edges, adjacency, callerId, currentId);
-                    queue.Enqueue((callerMethod, depth + 1));
-                }
-            }
-        }
-
-        return CreateSuccessResponse(
-            data: new
-            {
-                root = new
-                {
-                    id = rootId,
-                    fullName = rootSymbol.ToDisplayString(),
-                    kind = rootSymbol.MethodKind.ToString(),
-                    location = GetSymbolLocation(rootSymbol)
-                },
-                direction = dir,
-                maxDepth,
-                nodes,
-                edges,
-                truncatedByDepth,
-                truncatedByNodes,
-                cyclesDetected = cyclesDetected.ToList()
-            },
-            suggestedNextTools: new[]
-            {
-                "get_outgoing_calls or find_callers for single-hop detail at a specific node",
-                "analyze_change_impact for the impact of changing this method"
-            },
-            totalCount: nodes.Count,
-            returnedCount: nodes.Count);
-    }
-
-    // Walks the method's body collecting distinct method symbols it invokes.
-    // Excludes operator/conversion/property-accessor calls to keep the graph readable;
-    // callers can drill into properties via get_outgoing_calls if they need that.
-    private async Task<List<IMethodSymbol>> CollectCalleesAsync(IMethodSymbol method)
-    {
-        var result = new List<IMethodSymbol>();
-        foreach (var declRef in method.DeclaringSyntaxReferences)
-        {
-            var syntax = await declRef.GetSyntaxAsync();
-            var document = _solution!.GetDocument(declRef.SyntaxTree);
-            if (document == null) continue;
-            var semanticModel = await document.GetSemanticModelAsync();
-            if (semanticModel == null) continue;
-
-            var invocations = syntax.DescendantNodes().OfType<InvocationExpressionSyntax>();
-            foreach (var inv in invocations)
-            {
-                var calledSymbol = semanticModel.GetSymbolInfo(inv).Symbol as IMethodSymbol;
-                if (calledSymbol == null) continue;
-                if (calledSymbol.MethodKind != MethodKind.Ordinary
-                    && calledSymbol.MethodKind != MethodKind.LocalFunction) continue;
-                if (!result.Any(m => SymbolEqualityComparer.Default.Equals(m, calledSymbol)))
-                    result.Add(calledSymbol);
-            }
-        }
-        return result;
-    }
-
-    // Records the edge in both the wire-format list (for output) and the typed adjacency
-    // map (for in-flight cycle detection). Kept in sync at every edge addition.
-    private static void AddEdge(List<object> edges, Dictionary<int, List<int>> adjacency, int from, int to)
-    {
-        edges.Add(new { from, to, kind = "calls" });
-        if (!adjacency.TryGetValue(from, out var neighbors))
-        {
-            neighbors = new List<int>();
-            adjacency[from] = neighbors;
-        }
-        neighbors.Add(to);
-    }
-
-    // Detects whether `candidateId` is reachable from `targetId` via existing edges
-    // (in-flight graph). Used to record true cycles (A->B->A) rather than back-edges
-    // to siblings. Typed adjacency: O(V+E) BFS, no boxing.
-    private static bool IsAncestor(int candidateId, int targetId, Dictionary<int, List<int>> adjacency)
-    {
-        if (candidateId == targetId) return true;
-        var seen = new HashSet<int> { targetId };
-        var queue = new Queue<int>();
-        queue.Enqueue(targetId);
-        while (queue.Count > 0)
-        {
-            var cur = queue.Dequeue();
-            if (!adjacency.TryGetValue(cur, out var neighbors)) continue;
-            foreach (var to in neighbors)
-            {
-                if (to == candidateId) return true;
-                if (seen.Add(to)) queue.Enqueue(to);
-            }
-        }
-        return false;
     }
 }

@@ -296,14 +296,14 @@ namespace Tests
     {
         // MyApp.Attributes.FactAttribute has the same simple name as xUnit's [Fact]
         // but a different namespace — must NOT be treated as a test attribute. The
-        // (ns, name) tuple lookup at Quality.cs:191 is the guard against this kind
+        // (ns, name) tuple lookup is the guard against this kind
         // of false positive that would inflate the reachable set.
         var data = await RunAndGetData(FalsePositiveSameNameCode, includeProperties: true, includeInternal: true);
         data["testMethodCount"]!.Value<int>().Should().Be(0,
             "the look-alike attribute lives in MyApp.Attributes, not Xunit — IsTestMethod must reject it");
 
         // testProjectsScanned tracks projects where IsTestMethod found something.
-        // With zero hits, the set must stay empty (Quality.cs:90, 108).
+        // With zero hits, the set must stay empty.
         var scanned = (data["testProjectsScanned"] as JArray)!;
         scanned.Count.Should().Be(0,
             "no project should be marked as test-scanned when no test method was detected");
@@ -330,7 +330,7 @@ namespace Tests
             u["fullName"]?.Value<string>()?.Contains("Target.Unreached") == true);
         unreached.Should().NotBeNull();
 
-        // Per-entry shape (Quality.cs:62-70).
+        // Per-entry shape.
         unreached!["kind"]!.Value<string>().Should().Be("Method",
             "Unreached is declared as a method");
         unreached["accessibility"]!.Value<string>().Should().Be("Public");
@@ -341,14 +341,14 @@ namespace Tests
         unreached["location"].Should().NotBeNull(
             "every uncovered entry must surface its declaration location");
         unreached["reason"]!.Value<string>().Should().Be("Not reachable from any test method",
-            "the impl's documented reason string at Quality.cs:69 must round-trip verbatim");
+            "the impl's documented reason string must round-trip verbatim");
     }
 
     [Fact]
     public async Task FindUntestedCode_IncludeInternalFalse_ExcludesInternalMethods()
     {
         // Companion to IncludeInternal_SurfacesInternalUnreached (which uses true).
-        // With includeInternal=false (the default per Quality.cs:37), internal
+        // With includeInternal=false (the default), internal
         // symbols must NOT appear in the uncovered list.
         var data = await RunAndGetData(InternalCode, includeProperties: true, includeInternal: false);
         data["testMethodCount"]!.Value<int>().Should().Be(1,
@@ -364,7 +364,7 @@ namespace Tests
     [Fact]
     public async Task FindUntestedCode_OnNonExistentProject_ReturnsInvalidParameter()
     {
-        // Quality.cs:139-142 throws ArgumentException for an unknown projectName;
+        // The impl throws ArgumentException for an unknown projectName;
         // FindUntestedCodeAsync (line 47-53) catches it and returns InvalidParameter.
         // Lock that branch — without it, a regression to letting the exception escape
         // would crash the tool rather than surface a structured error.

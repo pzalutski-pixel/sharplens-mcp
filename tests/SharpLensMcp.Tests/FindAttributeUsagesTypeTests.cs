@@ -5,7 +5,7 @@ using Xunit;
 namespace SharpLensMcp.Tests;
 
 // In-memory test for find_attribute_usages covering the type-level attribute
-// branch at Discovery.cs:28-42. The impl loops type.GetAttributes() before
+// branch. The impl loops type.GetAttributes() before
 // member.GetAttributes(), so a class-level attribute must surface with
 // symbolKind="Type" (not "Method"), and a method-level attribute with the
 // same simple name must surface separately with symbolKind="Method".
@@ -48,7 +48,7 @@ namespace Production
         json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
         var usages = (json["data"]!["usages"] as JArray)!;
         var typeUsage = usages.FirstOrDefault(u => u["symbolKind"]!.Value<string>() == "Type");
-        typeUsage.Should().NotBeNull("Discovery.cs:28-42 must emit a Type-kinded entry for the class-level [Tagged] attribute");
+        typeUsage.Should().NotBeNull("the impl must emit a Type-kinded entry for the class-level [Tagged] attribute");
         typeUsage!["symbolName"]!.Value<string>()!.Should().Contain("DecoratedClass",
             "the Type entry must name the decorated class");
         typeUsage["attributeName"]!.Value<string>().Should().Be("TaggedAttribute");
@@ -68,8 +68,46 @@ namespace Production
         var methodUsage = usages.FirstOrDefault(u =>
             u["symbolKind"]!.Value<string>() == "Method" &&
             u["symbolName"]!.Value<string>()!.Contains("DecoratedMethod"));
-        methodUsage.Should().NotBeNull("Discovery.cs:44-61 must emit a Method-kinded entry for the method-level [Tagged] attribute");
+        methodUsage.Should().NotBeNull("the impl must emit a Method-kinded entry for the method-level [Tagged] attribute");
         methodUsage!["arguments"]!.Values<string>().Should().Contain(a => a!.Contains("MethodLevel"));
+    }
+
+    [Fact]
+    public async Task FindAttributeUsages_NestedType_ReportedOnce_NotAlsoAsAContainerMember()
+    {
+        const string nestedCode = @"
+namespace MyCollection
+{
+    [System.AttributeUsage(System.AttributeTargets.All)]
+    public class TaggedAttribute : System.Attribute
+    {
+        public TaggedAttribute(string name) { Name = name; }
+        public string Name { get; }
+    }
+}
+
+namespace Production
+{
+    public class Outer
+    {
+        [MyCollection.Tagged(""Nested"")]
+        public class Inner { }
+    }
+}";
+        var (workspace, _) = TestHelpers.CreateWorkspaceWithCode(nestedCode);
+        var service = new RoslynService();
+        service.LoadFromWorkspaceForTesting(workspace);
+        var result = await service.FindAttributeUsagesAsync(attributeName: "Tagged");
+        var json = JObject.FromObject(result);
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+
+        var usages = (json["data"]!["usages"] as JArray)!;
+        var innerHits = usages.Where(u => u["symbolName"]!.Value<string>()!.Contains("Inner")).ToList();
+        innerHits.Should().HaveCount(1,
+            "a nested type's own attribute is visited via the type walk; it must NOT also be reported as a member of its container");
+        innerHits[0]["symbolKind"]!.Value<string>().Should().Be("Type");
+        json["meta"]!["TotalCount"]!.Value<int>().Should().Be(1,
+            "exactly one [Tagged] usage exists — the nested type must not be double-counted");
     }
 
     [Fact]

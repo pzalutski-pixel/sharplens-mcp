@@ -14,7 +14,8 @@ public partial class RoslynService
         string? assemblyName = null,
         bool includeInherited = true,
         bool includeXmlDocs = true,
-        int maxMembers = 200)
+        int maxMembers = 200,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -34,7 +35,7 @@ public partial class RoslynService
         Compilation? owningCompilation = null;
         foreach (var project in _solution!.Projects)
         {
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
 
             var resolved = compilation.GetTypeByMetadataName(typeName);
@@ -80,6 +81,12 @@ public partial class RoslynService
                 allMembers.AddRange(current.GetMembers());
                 current = current.BaseType;
             }
+            // Interface members (including default-interface-members) are part of
+            // the inherited surface but not on the base-type chain.
+            foreach (var iface in type.AllInterfaces)
+            {
+                allMembers.AddRange(iface.GetMembers());
+            }
         }
 
         var visibleMembers = allMembers
@@ -87,6 +94,11 @@ public partial class RoslynService
             .Where(m => m.DeclaredAccessibility == Accessibility.Public
                      || m.DeclaredAccessibility == Accessibility.Protected
                      || m.DeclaredAccessibility == Accessibility.ProtectedOrInternal)
+            // An override and the base member it replaces (and an implemented
+            // interface member) share a containing-type-free signature; keep the
+            // most-derived occurrence, which the type-first walk added first.
+            .GroupBy(m => m.ToDisplayString(MemberDedupFormat))
+            .Select(g => g.First())
             .ToList();
 
         var totalMembers = visibleMembers.Count;
@@ -98,7 +110,9 @@ public partial class RoslynService
                 name = m.Name,
                 kind = m.Kind.ToString(),
                 signature = m.ToDisplayString(),
-                xmlDoc = includeXmlDocs ? ExtractSummary(m.GetDocumentationCommentXml()) : null,
+                xmlDoc = includeXmlDocs
+                    ? StructuredDocsToWireOrNull(XmlDocParser.Parse(m.GetDocumentationCommentXml()).docs)
+                    : null,
                 isStatic = m.IsStatic,
                 isObsolete = m.GetAttributes().Any(a => a.AttributeClass?.Name == "ObsoleteAttribute"),
                 accessibility = m.DeclaredAccessibility.ToString()
@@ -106,7 +120,9 @@ public partial class RoslynService
             .ToList();
 
         var assembly = type.ContainingAssembly?.Name ?? "<unknown>";
-        var typeXmlDoc = includeXmlDocs ? ExtractSummary(type.GetDocumentationCommentXml()) : null;
+        var typeXmlDoc = includeXmlDocs
+            ? StructuredDocsToWireOrNull(XmlDocParser.Parse(type.GetDocumentationCommentXml()).docs)
+            : null;
 
         return CreateSuccessResponse(
             data: new
@@ -149,10 +165,16 @@ public partial class RoslynService
         static INamedTypeSymbol? FindRecursive(INamespaceOrTypeSymbol container, string[] parts, int idx)
         {
             if (idx >= parts.Length) return null;
-            var name = parts[idx];
+            var part = parts[idx];
 
-            // Try child namespaces first
-            if (container is INamespaceSymbol ns)
+            // A part may carry backtick arity (Inner`1); GetTypeMembers matches by the
+            // bare name, so split the arity off and filter the candidates by it.
+            var tick = part.IndexOf('`');
+            var name = tick >= 0 ? part[..tick] : part;
+            int? arity = tick >= 0 && int.TryParse(part[(tick + 1)..], out var a) ? a : null;
+
+            // Child namespaces first — only a non-arity part can be a namespace.
+            if (arity == null && container is INamespaceSymbol ns)
             {
                 foreach (var child in ns.GetNamespaceMembers())
                 {
@@ -165,10 +187,10 @@ public partial class RoslynService
                 }
             }
 
-            // Try type members (handles nested types)
-            var types = container.GetTypeMembers(name);
-            foreach (var t in types)
+            // Type members (handles nested types).
+            foreach (var t in container.GetTypeMembers(name))
             {
+                if (arity != null && t.Arity != arity) continue;
                 if (idx == parts.Length - 1) return t;
                 var found = FindRecursive(t, parts, idx + 1);
                 if (found != null) return found;
@@ -178,21 +200,4 @@ public partial class RoslynService
         }
     }
 
-    // XML doc returned by Roslyn looks like <member><summary>text</summary>...</member>.
-    // Extract the summary text only; fall back to the raw XML if parsing fails so callers
-    // never lose information.
-    private static string? ExtractSummary(string? xml)
-    {
-        if (string.IsNullOrWhiteSpace(xml)) return null;
-        try
-        {
-            var doc = System.Xml.Linq.XDocument.Parse(xml);
-            var summary = doc.Root?.Element("summary")?.Value?.Trim();
-            return string.IsNullOrEmpty(summary) ? null : summary;
-        }
-        catch
-        {
-            return xml.Trim();
-        }
-    }
 }

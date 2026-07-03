@@ -13,6 +13,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      # NuGet publishes the csproj <Version>; npm publishes the release tag. Fail the
+      # release if they disagree so the two packages can never ship different versions.
+      - name: Verify package version matches the release tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CSPROJ_VERSION=$(grep -oPm1 '(?<=<Version>)[^<]+' src/SharpLensMcp.csproj)
+          if [ "$TAG_VERSION" != "$CSPROJ_VERSION" ]; then
+            echo "::error::Release tag '$GITHUB_REF_NAME' (version '$TAG_VERSION') does not match src/SharpLensMcp.csproj <Version> '$CSPROJ_VERSION'. Bump the csproj version or fix the tag before releasing."
+            exit 1
+          fi
+          echo "Version '$CSPROJ_VERSION' matches the release tag."
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:

@@ -25,14 +25,21 @@ public class GenerateEqualityMembersApplyTests : IAsyncLifetime
 
         _service = new RoslynService();
         var result = await _service.LoadSolutionAsync(_solutionPath);
-        JObject.FromObject(result)["success"]?.Value<bool>().Should().BeTrue();
+        var loadJson = JObject.FromObject(result);
+        loadJson["success"].Should().NotBeNull();
+        loadJson["success"]!.Value<bool>().Should().BeTrue();
     }
 
     public Task DisposeAsync()
     {
-        if (_originalFixtureContent != null && _fixturePath != null && File.Exists(_fixturePath))
+        // Always restore the fixture to its committed content — recreating it even
+        // if a test deleted it — and assert the restore physically landed, so a
+        // swallowed write can't leave the tree dirty for the next serialized test.
+        if (_originalFixtureContent != null && _fixturePath != null)
         {
             File.WriteAllText(_fixturePath, _originalFixtureContent);
+            File.ReadAllText(_fixturePath).Should().Be(_originalFixtureContent,
+                "the fixture must be restored to its committed content after the test");
         }
         return Task.CompletedTask;
     }
@@ -52,15 +59,18 @@ public class GenerateEqualityMembersApplyTests : IAsyncLifetime
             preview: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
-        json["data"]!["applied"]?.Value<bool>().Should().BeTrue(
-            "preview=false sets applied=true (CodeGeneration.cs:651)");
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+        json["data"]!["applied"].Should().NotBeNull();
+        json["data"]!["applied"]!.Value<bool>().Should().BeTrue(
+            "preview=false sets applied=true");
 
         var diskContent = File.ReadAllText(_fixturePath);
         diskContent.Should().Contain("public override bool Equals(object? obj)");
         diskContent.Should().Contain("public bool Equals(EqualityMembersTarget? other)");
         diskContent.Should().Contain("public override int GetHashCode()");
-        diskContent.Should().Contain("HashCode.Combine(Value)");
+        diskContent.Should().Contain("hash.Add(Value);",
+            "GetHashCode uses the HashCode builder so every compared member feeds the hash");
         diskContent.Should().NotContain("operator ==",
             "includeOperators=false must NOT emit operator overloads");
     }

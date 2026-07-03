@@ -5,7 +5,7 @@ using Xunit;
 namespace SharpLensMcp.Tests;
 
 // In-memory tests for find_reflection_usage covering the System.Activator and
-// System.Delegate.DynamicInvoke branches at Discovery.cs:192-193. Each branch
+// System.Delegate.DynamicInvoke branches. Each branch
 // is reached by exact (namespace, type, method) tuples beyond the
 // System.Reflection.* catch-all on line 190.
 public class FindReflectionUsageActivatorTests
@@ -30,6 +30,12 @@ namespace Production
             // method=DynamicInvoke. (DynamicInvoke is declared on System.Delegate;
             // all delegate types inherit it.)
             handler.DynamicInvoke(1);
+        }
+
+        public string CallInstanceGetType(object o)
+        {
+            // Hits the instance Object.GetType() branch: ns=System, type=Object.
+            return o.GetType().Name;
         }
     }
 }";
@@ -65,5 +71,14 @@ namespace Production
         var apis = usages.Select(u => u["reflectionApi"]!.Value<string>()!).ToList();
         apis.Should().Contain("Delegate.DynamicInvoke",
             "the impl emits reflectionApi as `Delegate.DynamicInvoke` only when both type AND method match (other Delegate methods stay out)");
+    }
+
+    [Fact]
+    public async Task FindReflectionUsage_DetectsInstanceObjectGetType_DistinguishableByApi()
+    {
+        var usages = await RunAndGetUsages();
+        var apis = usages.Select(u => u["reflectionApi"]!.Value<string>()!).ToList();
+        apis.Should().Contain("Object.GetType",
+            "an instance obj.GetType() runtime-type query is reported, distinguishable by its Object.GetType reflectionApi");
     }
 }

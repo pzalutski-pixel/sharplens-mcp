@@ -10,17 +10,10 @@ namespace SharpLensMcp.Tests.Mcp;
 // zero project cycles; specific NuGet packages per project (verified against
 // the .csproj files).
 //
-// Response shapes:
-//  - health_check:              RoslynService.cs:513-546
-//  - load_solution:             RoslynService.cs:291-304
-//  - sync_documents:            RoslynService.cs:426-443
-//  - get_project_structure:     Analysis.cs:859-872 (summary) / 921-934 (full)
-//  - dependency_graph:          Inspection.cs:637-666
-//  - get_code_fixes:            Analysis.cs:315-336
-//  - apply_code_fix:            Analysis.cs (error path tested here)
-//  - get_nuget_dependencies:    Discovery.cs:378-383
-//  - get_source_generators:     Discovery.cs:438-443
-//  - get_generated_code:        Discovery.cs:475-484
+// Response shapes covered: health_check, load_solution, sync_documents,
+// get_project_structure (summary + full), dependency_graph, get_code_fixes,
+// apply_code_fix (error path), get_nuget_dependencies, get_source_generators,
+// get_generated_code.
 //
 // Tightening rule: every accessor uses `!.Value<T>()` (NRE on missing).
 public class InfrastructureToolsViaMcpTests : McpTestBase
@@ -30,7 +23,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task HealthCheck_ReturnsReadyWithSpecificSolutionMetadata()
     {
-        var data = await CallAndGetDataAsync("roslyn:health_check");
+        var data = await CallAndGetDataAsync("health_check", new { includeDiagnostics = true });
         data["status"]!.Value<string>().Should().Be("Ready");
 
         var solution = data["solution"]!;
@@ -39,6 +32,8 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
         solution["projects"]!.Value<int>().Should().BeGreaterOrEqualTo(3,
             "the solution has SharpLensMcp + SharpLensMcp.Tests + SharpLensMcp.Tests.TestAnalyzers");
         solution["documents"]!.Value<int>().Should().BeGreaterThan(50);
+        solution["diagnosticsIncluded"]!.Value<bool>().Should().BeTrue(
+            "includeDiagnostics=true must run the diagnostics sweep");
         // Errors/warnings counts come from MSBuildWorkspace compilation, which
         // doesn't see the same world as `dotnet build` (metadata-resolution noise).
         // The health_check view of these counts is inherently noisy; the strict
@@ -51,13 +46,13 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
         var workspace = data["workspace"]!;
         workspace["indexed"]!.Value<bool>().Should().BeTrue();
         workspace["cacheSize"]!.Value<int>().Should().BeGreaterOrEqualTo(0,
-            "cacheSize tracks the document cache (RoslynService.cs:530)");
+            "cacheSize tracks the document cache");
 
         var config = data["configuration"]!;
         config["maxDiagnostics"]!.Value<int>().Should().Be(100,
             "the default ROSLYN_MAX_DIAGNOSTICS is 100");
         config["timeoutSeconds"]!.Value<int>().Should().BeGreaterThan(0,
-            "timeoutSeconds is always emitted (RoslynService.cs:543)");
+            "timeoutSeconds is always emitted");
         config["semanticCacheEnabled"]!.Value<bool>().Should().BeTrue(
             "default semantic-cache state when env var not set to 'false'");
 
@@ -70,14 +65,28 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task HealthCheck_DefaultOmitsDiagnosticsOverTheWire()
+    {
+        // The default call runs no compilation sweep: diagnosticsIncluded is false
+        // and the error/warning counts serialize as null over the wire.
+        var data = await CallAndGetDataAsync("health_check");
+        var solution = data["solution"]!;
+        solution["loaded"]!.Value<bool>().Should().BeTrue();
+        solution["diagnosticsIncluded"]!.Value<bool>().Should().BeFalse(
+            "the default health_check must skip the diagnostics sweep");
+        solution["errors"]!.Type.Should().Be(JTokenType.Null);
+        solution["warnings"]!.Type.Should().Be(JTokenType.Null);
+    }
+
+    [Fact]
     public async Task LoadSolution_AlreadyLoaded_ReturnsExpectedCounts()
     {
-        var data = await CallAndGetDataAsync("roslyn:load_solution", new
+        var data = await CallAndGetDataAsync("load_solution", new
         {
             solutionPath = Fixture.SolutionPath
         });
         data["solutionPath"]!.Value<string>().Should().Be(Fixture.SolutionPath,
-            "solutionPath echoes the input (RoslynService.cs:294)");
+            "solutionPath echoes the input");
         data["projectCount"]!.Value<int>().Should().BeGreaterOrEqualTo(3);
         data["documentCount"]!.Value<int>().Should().BeGreaterThan(50,
             "the test project alone has well over 30 files; total is much larger");
@@ -86,10 +95,10 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task LoadSolution_NonExistentPath_ReturnsFileNotFoundEchoingPath()
     {
-        // RoslynService.cs:255-263: File.Exists(false) → FileNotFound with the
+        // File.Exists(false) → FileNotFound with the
         // path echoed in the message.
         var error = await CallAndGetErrorAsync(
-            "roslyn:load_solution",
+            "load_solution",
             new { solutionPath = "/does/not/exist/Nope.sln" },
             codeContains: ErrorCodes.FileNotFound);
         // The helper already enforced codeContains; replaced the prior redundant
@@ -101,7 +110,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task SyncDocuments_AllDocuments_ReportsTotalAsSumOfBuckets()
     {
-        var data = await CallAndGetDataAsync("roslyn:sync_documents", new
+        var data = await CallAndGetDataAsync("sync_documents", new
         {
             filePaths = (string[]?)null
         });
@@ -110,7 +119,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
         var removed = data["removed"]!.Value<int>();
         var total = data["totalSynced"]!.Value<int>();
         total.Should().Be(updated + added + removed,
-            "totalSynced is defined as the sum of the three buckets (RoslynService.cs:432)");
+            "totalSynced is defined as the sum of the three buckets");
         total.Should().BeGreaterThan(0,
             "the solution has many .cs files; syncing all must surface at least one");
     }
@@ -118,7 +127,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task SyncDocuments_SpecificFile_UpdatesExactlyThatFile()
     {
-        var data = await CallAndGetDataAsync("roslyn:sync_documents", new
+        var data = await CallAndGetDataAsync("sync_documents", new
         {
             filePaths = new[] { Fixture.RoslynServicePath }
         });
@@ -135,7 +144,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetProjectStructure_ListsAllThreeKnownProjects()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_project_structure", new
+        var data = await CallAndGetDataAsync("get_project_structure", new
         {
             includeReferences = false,
             includeDocuments = false,
@@ -145,7 +154,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
         projects.Should().NotBeEmpty();
 
         // Each summary-mode entry has name, documentCount, projectReferenceCount,
-        // language (Analysis.cs:851-857). The predicate `?.` returning false-on-null
+        // language. The predicate `?.` returning false-on-null
         // is safe for filtering — but lock per-entry name field presence first.
         foreach (var p in projects)
         {
@@ -160,8 +169,8 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task DependencyGraph_Json_ReportsKnownDependencies()
     {
-        var data = await CallAndGetDataAsync("roslyn:dependency_graph", new { });
-        // JSON form (Inspection.cs:654-660): dependencies (per-project map),
+        var data = await CallAndGetDataAsync("dependency_graph", new { });
+        // JSON form: dependencies (per-project map),
         // hasCycles, cycles.
         data["hasCycles"]!.Value<bool>().Should().BeFalse(
             "the SharpLens solution has no project cycles");
@@ -178,8 +187,8 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task DependencyGraph_Mermaid_ContainsGraphHeaderAndProjectNodes()
     {
-        var data = await CallAndGetDataAsync("roslyn:dependency_graph", new { format = "mermaid" });
-        // Mermaid form (Inspection.cs:637-644): format, graph, hasCycles, cycles.
+        var data = await CallAndGetDataAsync("dependency_graph", new { format = "mermaid" });
+        // Mermaid form: format, graph, hasCycles, cycles.
         data["format"]!.Value<string>().Should().Be("mermaid");
         data["hasCycles"]!.Value<bool>().Should().BeFalse();
         // Lock cycles array presence — impl emits it in both formats.
@@ -197,7 +206,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     public async Task GetCodeFixes_NonExistentDiagnostic_ReturnsSymbolNotFoundWithNearbyHint()
     {
         var error = await CallAndGetErrorAsync(
-            "roslyn:get_code_fixes",
+            "get_code_fixes",
             new
             {
                 filePath = Fixture.RoslynServicePath,
@@ -207,7 +216,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
             },
             codeContains: ErrorCodes.SymbolNotFound);
         // Helper already enforced the code; lock the message contract instead
-        // (Analysis.cs:301).
+        // when the document is missing.
         error["message"]!.Value<string>()!.Should().Contain("ZZZ9999",
             "the error message must echo the diagnostic ID that wasn't found");
     }
@@ -216,7 +225,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     public async Task ApplyCodeFix_NonExistentDiagnostic_ReturnsSymbolNotFound()
     {
         var error = await CallAndGetErrorAsync(
-            "roslyn:apply_code_fix",
+            "apply_code_fix",
             new
             {
                 filePath = Fixture.RoslynServicePath,
@@ -232,7 +241,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetNugetDependencies_SharpLensMcpProject_ContainsKnownPackages()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_nuget_dependencies", new
+        var data = await CallAndGetDataAsync("get_nuget_dependencies", new
         {
             projectName = "SharpLensMcp"
         });
@@ -245,12 +254,12 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
         var packages = (sharpLens!["packages"] as JArray)!;
         packages.Should().NotBeEmpty();
         // Each package entry has packageName, version, privateAssets, excludeAssets
-        // (Discovery.cs:354-360).
+        // from the parsed csproj.
         foreach (var pkg in packages)
         {
             pkg["packageName"]!.Value<string>().Should().NotBeNullOrEmpty();
             pkg["version"]!.Value<string>().Should().NotBeNullOrEmpty(
-                "version defaults to 'unknown' if missing (Discovery.cs:357)");
+                "version defaults to 'unknown' if missing");
         }
         var packageNames = packages.Select(p => p["packageName"]!.Value<string>()!).ToList();
         packageNames.Should().Contain("Microsoft.CodeAnalysis.Workspaces.MSBuild",
@@ -258,7 +267,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
         packageNames.Should().Contain("Microsoft.Build.Locator");
         packageNames.Should().Contain("Microsoft.SourceLink.GitHub");
 
-        // Lock privateAssets/excludeAssets parsing (Discovery.cs:358-359).
+        // Lock privateAssets/excludeAssets parsing.
         // SharpLensMcp.csproj sets PrivateAssets="all" on SourceLink.GitHub and
         // PrivateAssets="all" + ExcludeAssets="runtime" on Microsoft.Build.Framework.
         var sourceLink = packages.First(p =>
@@ -275,7 +284,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetNugetDependencies_TestsProject_ContainsXunitAndFluentAssertions()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_nuget_dependencies", new
+        var data = await CallAndGetDataAsync("get_nuget_dependencies", new
         {
             projectName = "SharpLensMcp.Tests"
         });
@@ -293,13 +302,13 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetSourceGenerators_OnlyIncludesProjectsWithGenerators()
     {
-        // GetSourceGeneratorsAsync (Discovery.cs:401) skips projects with zero
+        // GetSourceGeneratorsAsync skips projects with zero
         // generators. The .NET 8 SDK ships implicit generators (Regex,
         // LoggerMessage, etc.) via AnalyzerReferences, so net8.0 projects in our
         // solution surface them. Per-project contract: every returned entry MUST
         // have a non-empty generators array (the skip condition guarantees this)
         // and a generatedFiles array.
-        var data = await CallAndGetDataAsync("roslyn:get_source_generators", new
+        var data = await CallAndGetDataAsync("get_source_generators", new
         {
             projectName = (string?)null
         });
@@ -310,8 +319,8 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
             p["projectName"]!.Value<string>().Should().NotBeNullOrEmpty();
             var gens = (p["generators"] as JArray)!;
             gens.Should().NotBeEmpty(
-                "Discovery.cs:401 skips projects with zero generators; returned entries must have at least one");
-            // Each generator declares typeName and assemblyName (Discovery.cs:429-433).
+                "the impl skips projects with zero generators; returned entries must have at least one");
+            // Each generator declares typeName and assemblyName.
             foreach (var g in gens)
             {
                 g["typeName"]!.Value<string>().Should().NotBeNullOrEmpty();
@@ -319,7 +328,7 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
             }
             // generatedFiles must be an array (possibly empty).
             (p["generatedFiles"] as JArray).Should().NotBeNull(
-                "Discovery.cs:412 always emits a generatedFiles array per project entry");
+                "the impl always emits a generatedFiles array per project entry");
         }
     }
 
@@ -328,8 +337,8 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     {
         // SharpLensMcp.Tests.TestAnalyzers targets netstandard2.0 and hosts an
         // analyzer (AlwaysFiresAnalyzer) but no [Generator] types. It must have
-        // zero generator entries; the projects array stays empty (Discovery.cs:401 skip).
-        var data = await CallAndGetDataAsync("roslyn:get_source_generators", new
+        // zero generator entries; the projects array stays empty.
+        var data = await CallAndGetDataAsync("get_source_generators", new
         {
             projectName = "SharpLensMcp.Tests.TestAnalyzers"
         });
@@ -341,10 +350,10 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetGeneratedCode_MissingFile_ReturnsFileNotFoundEchoingFileName()
     {
-        // GetGeneratedCodeAsync (Discovery.cs:488): unknown generated file name
+        // GetGeneratedCodeAsync: unknown generated file name
         // in a known project → FileNotFound with the filename echoed.
         var error = await CallAndGetErrorAsync(
-            "roslyn:get_generated_code",
+            "get_generated_code",
             new
             {
                 projectName = "SharpLensMcp",
@@ -356,19 +365,19 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
-    public async Task GetGeneratedCode_UnknownProject_ReturnsFileNotFoundEchoingProjectName()
+    public async Task GetGeneratedCode_UnknownProject_ReturnsInvalidParameterEchoingProjectName()
     {
-        // GetGeneratedCodeAsync (Discovery.cs:453): unknown projectName branch is
-        // distinct from the unknown-generated-file branch (Discovery.cs:488).
-        // Both use FileNotFound but the messages differ.
+        // GetGeneratedCodeAsync: an unknown projectName is routed through the shared
+        // ProjectNotFoundError (InvalidParameter), distinct from the unknown-generated-file
+        // branch which stays FileNotFound.
         var error = await CallAndGetErrorAsync(
-            "roslyn:get_generated_code",
+            "get_generated_code",
             new
             {
                 projectName = "DoesNotExist_12345",
                 generatedFileName = "Anything.g.cs"
             },
-            codeContains: ErrorCodes.FileNotFound);
+            codeContains: ErrorCodes.InvalidParameter);
         error["message"]!.Value<string>()!.Should().Contain("DoesNotExist_12345",
             "the project-not-found branch must echo the bad project name");
     }

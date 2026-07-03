@@ -17,7 +17,8 @@ public partial class RoslynService
         bool includeInherited = false,
         string? memberKind = null,
         string verbosity = "compact",
-        int maxResults = 100)
+        int maxResults = 100,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -31,7 +32,8 @@ public partial class RoslynService
             );
         }
 
-        var type = await FindTypeByNameAsync(typeName);
+        var (type, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
+        if (ambiguousType != null) return ambiguousType;
         if (type == null)
         {
             return CreateErrorResponse(
@@ -49,10 +51,29 @@ public partial class RoslynService
         {
             // Walk up the inheritance chain
             var currentType = type;
+            var isQueriedType = true;
             while (currentType != null && currentType.SpecialType != SpecialType.System_Object)
             {
-                allMembers.AddRange(currentType.GetMembers().Where(m => !m.IsImplicitlyDeclared));
+                allMembers.AddRange(currentType.GetMembers().Where(m =>
+                    !m.IsImplicitlyDeclared
+                    // Constructors, static constructors, and destructors are NOT
+                    // inherited — include them only from the queried type itself.
+                    && (isQueriedType || m is not IMethodSymbol
+                    {
+                        MethodKind: MethodKind.Constructor
+                            or MethodKind.StaticConstructor
+                            or MethodKind.Destructor
+                    })));
                 currentType = currentType.BaseType;
+                isQueriedType = false;
+            }
+            // Interface members (including default-interface-members) are part of
+            // the inherited surface but are not on the base-type chain. The
+            // MemberDedupFormat pass below collapses a member that the type itself
+            // implements, leaving only the genuinely interface-supplied ones.
+            foreach (var iface in type.AllInterfaces)
+            {
+                allMembers.AddRange(iface.GetMembers().Where(m => !m.IsImplicitlyDeclared));
             }
         }
         else
@@ -60,37 +81,68 @@ public partial class RoslynService
             allMembers.AddRange(type.GetMembers().Where(m => !m.IsImplicitlyDeclared));
         }
 
-        // Filter by member kind if specified
+        // Filter by member kind if specified. An unknown kind is rejected rather
+        // than silently returning every member.
         if (!string.IsNullOrEmpty(memberKind))
         {
-            allMembers = allMembers.Where(m =>
+            var kind = memberKind.ToLower();
+            if (kind is not ("method" or "property" or "field" or "event" or "constructor" or "operator"))
             {
-                return memberKind.ToLower() switch
-                {
-                    "method" => m is IMethodSymbol ms && ms.MethodKind == MethodKind.Ordinary,
-                    "property" => m is IPropertySymbol,
-                    "field" => m is IFieldSymbol,
-                    "event" => m is IEventSymbol,
-                    _ => true
-                };
+                return CreateErrorResponse(
+                    ErrorCodes.InvalidParameter,
+                    $"Unknown memberKind '{memberKind}'",
+                    hint: "Use one of: Method, Property, Field, Event, Constructor, Operator.",
+                    context: new { typeName, memberKind });
+            }
+            allMembers = allMembers.Where(m => kind switch
+            {
+                "method" => m is IMethodSymbol ms && ms.MethodKind == MethodKind.Ordinary,
+                "property" => m is IPropertySymbol,
+                "field" => m is IFieldSymbol,
+                "event" => m is IEventSymbol,
+                "constructor" => m is IMethodSymbol cm && cm.MethodKind == MethodKind.Constructor,
+                "operator" => m is IMethodSymbol om && om.MethodKind is MethodKind.UserDefinedOperator or MethodKind.Conversion,
+                _ => false
             }).ToList();
         }
 
-        // Remove duplicates (from inheritance) and limit
-        var uniqueMembers = allMembers
-            .GroupBy(m => m.Name + m.Kind.ToString())
-            .Select(g => g.First())
-            .Take(maxResults)
+        // Members that share a containing-type-free signature are reconciled by who
+        // concretely provides them:
+        //  - If a class/struct member is present, it overrides the base member and
+        //    implements the interface member of the same signature — keep only that
+        //    most-derived occurrence (the inheritance walk adds it first).
+        //  - If only interface members remain, they come from DISTINCT interfaces
+        //    (GetMembers dedups within a type), so keep one per declaring interface
+        //    rather than collapsing IFoo.Do() and IBar.Do() into a single entry.
+        var distinctMembers = allMembers
+            .GroupBy(m => m.ToDisplayString(MemberDedupFormat))
+            .SelectMany(g =>
+            {
+                var concrete = g.FirstOrDefault(m => m.ContainingType?.TypeKind != TypeKind.Interface);
+                if (concrete != null) return new[] { concrete };
+                return g.GroupBy(m => m.ContainingType?.ToDisplayString() ?? string.Empty)
+                        .Select(byInterface => byInterface.First());
+            })
             .ToList();
 
-        var totalCount = allMembers.GroupBy(m => m.Name + m.Kind.ToString()).Count();
+        // One entry per member name+kind: overloads collapse into their first
+        // declaration, and the entry reports how many overloads share the name.
+        var memberGroups = distinctMembers
+            .GroupBy(m => m.Name + m.Kind.ToString())
+            .ToList();
+
+        var totalCount = memberGroups.Count;
+        var limitedGroups = memberGroups.Take(maxResults).ToList();
 
         // Format members based on verbosity
-        var formattedMembers = uniqueMembers.Select(m => FormatMember(m, verbosity)).ToList();
+        var formattedMembers = limitedGroups
+            .Select(g => FormatMember(g.First(), verbosity, g.Count()))
+            .ToList();
 
-        // Count by kind
-        var countByKind = uniqueMembers
-            .GroupBy(m => GetMemberKindString(m))
+        // Count by kind across ALL members, not just the returned page, so the
+        // per-kind counts sum to totalMembers rather than to the capped list.
+        var countByKind = memberGroups
+            .GroupBy(g => GetMemberKindString(g.First()))
             .ToDictionary(g => g.Key, g => g.Count());
 
         return CreateSuccessResponse(
@@ -106,10 +158,10 @@ public partial class RoslynService
             {
                 $"get_method_signature to get detailed parameter info for a specific method",
                 $"get_base_types for {type.Name} to see inheritance chain",
-                $"get_attributes to find [Export] or [Signal] decorated members"
+                "find_attribute_usages to find members decorated with a specific attribute"
             },
             totalCount: totalCount,
-            returnedCount: uniqueMembers.Count,
+            returnedCount: limitedGroups.Count,
             verbosity: verbosity
         );
     }
@@ -122,7 +174,8 @@ public partial class RoslynService
         bool includeInherited = false,
         string? memberKind = null,
         string verbosity = "compact",
-        int maxResultsPerType = 50)
+        int maxResultsPerType = 50,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -141,7 +194,7 @@ public partial class RoslynService
 
         foreach (var typeName in typeNames.Distinct())
         {
-            var result = await GetTypeMembersAsync(typeName, includeInherited, memberKind, verbosity, maxResultsPerType);
+            var result = await GetTypeMembersAsync(typeName, includeInherited, memberKind, verbosity, maxResultsPerType, cancellationToken);
 
             if (IsSuccessResponse(result))
             {
@@ -182,13 +235,32 @@ public partial class RoslynService
         );
     }
 
-    private object FormatMember(ISymbol member, string verbosity)
+    // MinimallyQualifiedFormat with the containing type removed from member
+    // rendering: "void Run()" instead of "void DerivedRunner.Run()", so an
+    // override and the base member it replaces produce the same key.
+    private static readonly SymbolDisplayFormat MemberDedupFormat =
+        SymbolDisplayFormat.MinimallyQualifiedFormat.WithMemberOptions(
+            SymbolDisplayMemberOptions.IncludeParameters |
+            SymbolDisplayMemberOptions.IncludeType |
+            SymbolDisplayMemberOptions.IncludeRef |
+            SymbolDisplayMemberOptions.IncludeExplicitInterface);
+
+    private object FormatMember(ISymbol member, string verbosity, int overloadCount = 1)
     {
         var kind = GetMemberKindString(member);
 
         // Summary: minimal info
         if (verbosity == "summary")
         {
+            if (member is IMethodSymbol)
+            {
+                return new
+                {
+                    name = member.Name,
+                    kind,
+                    overloadCount
+                };
+            }
             return new
             {
                 name = member.Name,
@@ -213,6 +285,7 @@ public partial class RoslynService
             result["isVirtual"] = method.IsVirtual;
             result["isOverride"] = method.IsOverride;
             result["isAbstract"] = method.IsAbstract;
+            result["overloadCount"] = overloadCount;
         }
         else if (member is IPropertySymbol property)
         {
@@ -266,7 +339,8 @@ public partial class RoslynService
     public async Task<object> GetMethodSignatureAsync(
         string typeName,
         string methodName,
-        int? overloadIndex = null)
+        int? overloadIndex = null,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -288,7 +362,8 @@ public partial class RoslynService
             );
         }
 
-        var type = await FindTypeByNameAsync(typeName);
+        var (type, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
+        if (ambiguousType != null) return ambiguousType;
         if (type == null)
         {
             return CreateErrorResponse(
@@ -307,6 +382,14 @@ public partial class RoslynService
             currentType = currentType.BaseType;
         }
 
+        // An override and the base method it replaces share a containing-type-free
+        // signature; collapse them (keeping the most-derived, walked first) so the
+        // overload count and index range don't double-count the same method.
+        methods = methods
+            .GroupBy(m => m.ToDisplayString(MemberDedupFormat))
+            .Select(g => g.First())
+            .ToList();
+
         if (methods.Count == 0)
         {
             return CreateErrorResponse(
@@ -317,10 +400,18 @@ public partial class RoslynService
             );
         }
 
-        // Select the specific overload or first one
-        var method = overloadIndex.HasValue && overloadIndex.Value < methods.Count
-            ? methods[overloadIndex.Value]
-            : methods[0];
+        // Select the specific overload or default to first
+        var index = overloadIndex ?? 0;
+        if (index < 0 || index >= methods.Count)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                $"Invalid overloadIndex {index}. Available: 0 to {methods.Count - 1}",
+                context: new { overloadIndex, availableOverloads = methods.Count }
+            );
+        }
+
+        var method = methods[index];
 
         var parameters = method.Parameters.Select(p => new
         {
@@ -328,7 +419,7 @@ public partial class RoslynService
             type = p.Type.ToDisplayString(),
             isOptional = p.IsOptional,
             hasDefaultValue = p.HasExplicitDefaultValue,
-            defaultValue = p.HasExplicitDefaultValue ? p.ExplicitDefaultValue?.ToString() : null,
+            defaultValue = FormatDefaultValue(p),
             isParams = p.IsParams,
             refKind = p.RefKind.ToString(),
             isNullable = p.NullableAnnotation == NullableAnnotation.Annotated
@@ -357,7 +448,7 @@ public partial class RoslynService
                 parameters,
                 typeParameters,
                 overloadCount = methods.Count,
-                selectedOverload = overloadIndex ?? 0,
+                selectedOverload = index,
                 documentation = method.GetDocumentationCommentXml(),
                 location = GetSymbolLocation(method)
             },
@@ -370,14 +461,51 @@ public partial class RoslynService
         );
     }
 
+    // A parameter's default value rendered as the C# literal a caller would write:
+    // `true`/`false` (not boxed `True`), quoted strings/chars, `null` vs `default`
+    // for a struct's zero value — not the ambiguous boxed .ToString().
+    private static string? FormatDefaultValue(IParameterSymbol p) =>
+        p.HasExplicitDefaultValue ? FormatConstantLiteral(p.Type, p.ExplicitDefaultValue) : null;
+
+    // The single renderer for a constant/default value as the C# literal a caller
+    // would write — shared by get_method_signature, generate_constructor, and
+    // change_signature so enums, primitives, and null/default format identically.
+    // An enum value (a boxed underlying integer) renders as its member name, not
+    // the raw int; an unmatched flags combo as a cast.
+    internal static string FormatConstantLiteral(ITypeSymbol type, object? value)
+    {
+        if (value == null)
+        {
+            return type.IsValueType
+                && type.OriginalDefinition.SpecialType != SpecialType.System_Nullable_T
+                ? "default"
+                : "null";
+        }
+        // Unwrap Nullable<T> so a nullable enum (`Mode? x = Mode.On`) maps to its
+        // member name rather than the boxed underlying integer — the underlying value
+        // is identical, only the static type differs.
+        var effectiveType = type is INamedTypeSymbol { OriginalDefinition.SpecialType: SpecialType.System_Nullable_T } nullable
+            && nullable.TypeArguments.Length == 1
+            ? nullable.TypeArguments[0]
+            : type;
+        if (effectiveType is INamedTypeSymbol { TypeKind: TypeKind.Enum } enumType)
+        {
+            var field = enumType.GetMembers().OfType<IFieldSymbol>()
+                .FirstOrDefault(f => f.HasConstantValue && Equals(f.ConstantValue, value));
+            return field != null ? $"{enumType.Name}.{field.Name}" : $"({enumType.Name}){value}";
+        }
+        return SymbolDisplay.FormatPrimitive(value, quoteStrings: true, useHexadecimalNumbers: false)
+            ?? value.ToString() ?? "null";
+    }
+
     /// <summary>
-    /// Finds all symbols with specific attributes, with Godot-specific parsing.
+    /// Finds all symbols with specific attributes.
     /// </summary>
     public async Task<object> GetAttributesAsync(
         string attributeName,
         string? scope = null,
-        bool parseGodotHints = true,
-        int maxResults = 100)
+        int maxResults = 100,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -386,12 +514,15 @@ public partial class RoslynService
             return CreateErrorResponse(
                 ErrorCodes.InvalidParameter,
                 "attributeName is required",
-                hint: "Provide an attribute name like 'Export', 'Signal', 'Tool', or 'GlobalClass'"
+                hint: "Provide an attribute name like 'Obsolete', 'Serializable', or 'JsonProperty'"
             );
         }
 
         var results = new List<object>();
         var totalFound = 0;
+        // A partial type resolves to the same symbol from each of its parts; dedup by
+        // symbol identity (across trees and files) so its attributes are counted once.
+        var seenSymbols = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
 
         // Determine which projects/documents to search
         IEnumerable<Project> projectsToSearch = _solution!.Projects;
@@ -408,7 +539,7 @@ public partial class RoslynService
 
         foreach (var project in projectsToSearch)
         {
-            var compilation = await GetProjectCompilationAsync(project);
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
@@ -422,7 +553,7 @@ public partial class RoslynService
                 }
 
                 var semanticModel = compilation.GetSemanticModel(syntaxTree);
-                var root = await syntaxTree.GetRootAsync();
+                var root = await syntaxTree.GetRootAsync(cancellationToken);
 
                 // Find all declarations with attributes
                 var declarations = root.DescendantNodes()
@@ -430,60 +561,55 @@ public partial class RoslynService
 
                 foreach (var decl in declarations)
                 {
-                    var symbol = semanticModel.GetDeclaredSymbol(decl);
-                    if (symbol == null) continue;
-
-                    var matchingAttrs = symbol.GetAttributes()
-                        .Where(a =>
-                            a.AttributeClass?.Name.Contains(attributeName, StringComparison.OrdinalIgnoreCase) == true ||
-                            a.AttributeClass?.Name.Contains($"{attributeName}Attribute", StringComparison.OrdinalIgnoreCase) == true)
-                        .ToList();
-
-                    if (matchingAttrs.Count == 0) continue;
-
-                    totalFound++;
-                    if (results.Count >= maxResults) continue;
-
-                    foreach (var attr in matchingAttrs)
+                    foreach (var symbol in DeclaredSymbolsForAttributes(decl, semanticModel, cancellationToken))
                     {
-                        var attrInfo = new Dictionary<string, object?>
-                        {
-                            ["name"] = attr.AttributeClass?.Name,
-                            ["fullName"] = attr.AttributeClass?.ToDisplayString()
-                        };
+                        // A field/event-field declares one symbol per variable; partial
+                        // parts share a symbol. Process each declared symbol exactly once.
+                        if (symbol == null || !seenSymbols.Add(symbol)) continue;
 
-                        // Godot-specific parsing for [Export] attributes
-                        if (parseGodotHints && attributeName.Equals("Export", StringComparison.OrdinalIgnoreCase))
+                        // Exact match (with trailing-Attribute handling) via the shared
+                        // matcher, NOT substring Contains — so get_attributes agrees with
+                        // find_attribute_usages and a query for "Obsolete" doesn't also match
+                        // an unrelated "ObsoleteThing" attribute.
+                        var matchingAttrs = symbol.GetAttributes()
+                            .Where(a => MatchesAttribute(a, attributeName))
+                            .ToList();
+
+                        if (matchingAttrs.Count == 0) continue;
+
+                        foreach (var attr in matchingAttrs)
                         {
-                            var args = attr.ConstructorArguments;
-                            if (args.Length > 0)
+                            // Count per attribute APPLICATION, exactly as find_attribute_usages
+                            // does — an AllowMultiple attribute applied twice on one declaration
+                            // counts twice, so returnedCount never exceeds totalCount and the
+                            // maxResults cap can't overshoot inside a single declaration.
+                            totalFound++;
+                            if (results.Count >= maxResults) continue;
+
+                            var attrInfo = new Dictionary<string, object?>
                             {
-                                attrInfo["godotHint"] = args[0].Value?.ToString();
-                            }
-                            if (args.Length > 1)
+                                ["name"] = attr.AttributeClass?.Name,
+                                ["fullName"] = attr.AttributeClass?.ToDisplayString(),
+                                // Positional and named arguments, rendered with the C#-literal
+                                // renderer (ToCSharpString) exactly as find_attribute_usages
+                                // emits them — not the ambiguous boxed .ToString().
+                                ["arguments"] = attr.ConstructorArguments.Select(a => a.ToCSharpString()).ToList(),
+                                ["namedArguments"] = attr.NamedArguments
+                                    .ToDictionary(na => na.Key, na => (object?)na.Value.ToCSharpString())
+                            };
+
+                            results.Add(new
                             {
-                                attrInfo["godotHintString"] = args[1].Value?.ToString();
-                            }
+                                symbolName = symbol.Name,
+                                symbolKind = symbol.Kind.ToString(),
+                                containingType = symbol.ContainingType?.ToDisplayString(),
+                                memberType = symbol is IPropertySymbol ps ? ps.Type.ToDisplayString() :
+                                            symbol is IFieldSymbol fs ? fs.Type.ToDisplayString() :
+                                            symbol is IMethodSymbol ms ? ms.ReturnType.ToDisplayString() : null,
+                                location = GetSymbolLocation(symbol),
+                                attribute = attrInfo
+                            });
                         }
-
-                        // Include named arguments
-                        if (attr.NamedArguments.Length > 0)
-                        {
-                            attrInfo["namedArguments"] = attr.NamedArguments
-                                .ToDictionary(na => na.Key, na => na.Value.Value?.ToString());
-                        }
-
-                        results.Add(new
-                        {
-                            symbolName = symbol.Name,
-                            symbolKind = symbol.Kind.ToString(),
-                            containingType = symbol.ContainingType?.ToDisplayString(),
-                            memberType = symbol is IPropertySymbol ps ? ps.Type.ToDisplayString() :
-                                        symbol is IFieldSymbol fs ? fs.Type.ToDisplayString() :
-                                        symbol is IMethodSymbol ms ? ms.ReturnType.ToDisplayString() : null,
-                            location = GetSymbolLocation(symbol),
-                            attribute = attrInfo
-                        });
                     }
                 }
             }
@@ -506,13 +632,38 @@ public partial class RoslynService
         );
     }
 
+    // Yields the declared symbol(s) carrying a declaration's attributes. A field or
+    // event-field declares one symbol PER variable, and GetDeclaredSymbol on the
+    // declaration node itself returns null, so its variables are resolved individually —
+    // matching find_attribute_usages' per-member walk, which would otherwise see field
+    // and event-field attributes that get_attributes dropped.
+    private static IEnumerable<ISymbol?> DeclaredSymbolsForAttributes(
+        SyntaxNode declaration, SemanticModel semanticModel, CancellationToken cancellationToken)
+    {
+        switch (declaration)
+        {
+            case FieldDeclarationSyntax field:
+                foreach (var variable in field.Declaration.Variables)
+                    yield return semanticModel.GetDeclaredSymbol(variable, cancellationToken);
+                break;
+            case EventFieldDeclarationSyntax eventField:
+                foreach (var variable in eventField.Declaration.Variables)
+                    yield return semanticModel.GetDeclaredSymbol(variable, cancellationToken);
+                break;
+            default:
+                yield return semanticModel.GetDeclaredSymbol(declaration, cancellationToken);
+                break;
+        }
+    }
+
     /// <summary>
     /// Finds all types inheriting from a base type, by name.
     /// </summary>
     public async Task<object> GetDerivedTypesAsync(
         string baseTypeName,
         bool includeTransitive = true,
-        int maxResults = 100)
+        int maxResults = 100,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -525,7 +676,8 @@ public partial class RoslynService
             );
         }
 
-        var baseType = await FindTypeByNameAsync(baseTypeName);
+        var (baseType, ambiguousBaseType) = await FindTypeByNameAsync(baseTypeName, cancellationToken);
+        if (ambiguousBaseType != null) return ambiguousBaseType;
         if (baseType == null)
         {
             return CreateErrorResponse(
@@ -536,7 +688,7 @@ public partial class RoslynService
         }
 
         var derivedTypes = await SymbolFinder.FindDerivedClassesAsync(
-            baseType, _solution!, transitive: includeTransitive);
+            baseType, _solution!, transitive: includeTransitive, cancellationToken: cancellationToken);
 
         var derivedList = derivedTypes.ToList();
         var totalCount = derivedList.Count;
@@ -576,7 +728,7 @@ public partial class RoslynService
     /// <summary>
     /// Gets full inheritance chain by type name.
     /// </summary>
-    public async Task<object> GetBaseTypesAsync(string typeName)
+    public async Task<object> GetBaseTypesAsync(string typeName, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -589,7 +741,8 @@ public partial class RoslynService
             );
         }
 
-        var type = await FindTypeByNameAsync(typeName);
+        var (type, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
+        if (ambiguousType != null) return ambiguousType;
         if (type == null)
         {
             return CreateErrorResponse(

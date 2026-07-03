@@ -52,11 +52,14 @@ public class Target
             runAnalyzers: true);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
 
         var data = json["data"]!;
-        data["analyzersRan"]?.Value<bool>().Should().BeTrue();
-        data["analyzerCount"]?.Value<int>().Should().Be(1,
+        data["analyzersRan"].Should().NotBeNull();
+        data["analyzersRan"]!.Value<bool>().Should().BeTrue();
+        data["analyzerCount"].Should().NotBeNull();
+        data["analyzerCount"]!.Value<int>().Should().Be(1,
             "exactly one analyzer (AlwaysFiresAnalyzer) was attached");
 
         var diagnostics = data["diagnostics"] as JArray;
@@ -79,13 +82,57 @@ public class Target
 
         foreach (var d in test0001)
         {
-            d["severity"]?.Value<string>().Should().Be("Warning",
+            d["severity"].Should().NotBeNull();
+            d["severity"]!.Value<string>().Should().Be("Warning",
                 "AlwaysFiresAnalyzer declares defaultSeverity: Warning");
-            d["filePath"]?.Value<string>().Should().EndWith("Sample.cs",
+            d["filePath"].Should().NotBeNull();
+            d["filePath"]!.Value<string>().Should().EndWith("Sample.cs",
                 "the diagnostic location must surface the source file");
-            d["line"]?.Type.Should().Be(JTokenType.Integer,
+            d["line"].Should().NotBeNull();
+            d["line"]!.Type.Should().Be(JTokenType.Integer,
                 "every diagnostic must carry a numeric line position");
         }
+    }
+
+    [Fact]
+    public async Task GetDiagnostics_FilePathFilter_KeepsDiagnosticsPhysicallyInFileDespiteLineDirective()
+    {
+        // The method physically lives in Mapped.cs, but a #line directive remaps its
+        // reported (mapped) path to Elsewhere.g.cs. The file filter must key off the
+        // physical source tree, so the analyzer diagnostic survives the filter.
+        const string mappedCode = @"
+namespace Sample;
+public class Target
+{
+#line 100 ""Elsewhere.g.cs""
+    public void Mapped() { }
+#line default
+}
+";
+        var (workspace, document) = TestHelpers.CreateWorkspaceWithCode(mappedCode, fileName: "Mapped.cs");
+        var analyzerRef = new AnalyzerImageReference(
+            ImmutableArray.Create<DiagnosticAnalyzer>(new AlwaysFiresAnalyzer()));
+        var solution = workspace.CurrentSolution.AddAnalyzerReference(document.Project.Id, analyzerRef);
+        workspace.TryApplyChanges(solution);
+
+        var service = new RoslynService();
+        service.LoadFromWorkspaceForTesting(workspace);
+
+        var result = await service.GetDiagnosticsAsync(
+            filePath: document.FilePath,
+            projectPath: null,
+            severity: null,
+            includeHidden: false,
+            runAnalyzers: true);
+
+        var json = JObject.FromObject(result);
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+        var diagnostics = (json["data"]!["diagnostics"] as JArray)!;
+        diagnostics
+            .Where(d => d["id"]?.Value<string>() == AlwaysFiresAnalyzer.DiagnosticId)
+            .Should().ContainSingle(
+                "TEST0001 physically lives in Mapped.cs and must survive the file filter even "
+                + "though #line remaps its reported path to Elsewhere.g.cs");
     }
 
     [Fact]
@@ -103,11 +150,14 @@ public class Target
             runAnalyzers: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue();
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue();
 
         var data = json["data"]!;
-        data["analyzersRan"]?.Value<bool>().Should().BeFalse();
-        data["analyzerCount"]?.Value<int>().Should().Be(0);
+        data["analyzersRan"].Should().NotBeNull();
+        data["analyzersRan"]!.Value<bool>().Should().BeFalse();
+        data["analyzerCount"].Should().NotBeNull();
+        data["analyzerCount"]!.Value<int>().Should().Be(0);
 
         var diagnostics = data["diagnostics"] as JArray;
         diagnostics.Should().NotBeNull("response must always carry a diagnostics array");

@@ -5,30 +5,67 @@ namespace SharpLensMcp;
 
 public class McpServer
 {
-    private const string ProtocolVersion = "2024-11-05";
+    // Protocol versions this server can speak, newest first. initialize echoes
+    // the client's requested version when supported and otherwise answers with
+    // the newest, per MCP version negotiation.
+    private static readonly string[] SupportedProtocolVersions =
+        { "2025-06-18", "2025-03-26", "2024-11-05" };
     private static readonly string ServerVersion = typeof(McpServer).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
 
-    private static readonly string[] LogLevels = { "Debug", "Information", "Warning", "Error" };
+    private static readonly string[] LogLevels = { "Trace", "Debug", "Information", "Warning", "Error" };
 
     private readonly RoslynService _roslynService;
     private readonly JsonSerializerOptions _jsonOptions;
     private readonly string _logLevel;
+    private readonly TimeSpan _toolCallTimeout;
+    // Deterministic cancellation seam for timeout tests: when this token is already
+    // cancelled, every tool call's effective token is born cancelled (it is linked
+    // into the per-call CTS), so the pre-dispatch check in HandleToolCallAsync forces
+    // a TIMEOUT with no timing race. CancellationToken.None in production (never fires).
+    private readonly CancellationToken _testToolCallCancellation;
 
-    public McpServer()
+    public McpServer() : this(ReadConfiguredToolCallTimeout())
+    {
+    }
+
+    // Test seam: injects the per-call timeout directly (and optionally a forced
+    // cancellation token). Tests must not mutate SHARPLENS_TIMEOUT_SECONDS —
+    // environment variables are process-wide and parallel test classes would race.
+    internal McpServer(TimeSpan toolCallTimeout, CancellationToken testToolCallCancellation = default)
     {
         _roslynService = new RoslynService();
-        _logLevel = Environment.GetEnvironmentVariable("ROSLYN_LOG_LEVEL") ?? "Information";
+        _logLevel = EnvironmentConfig.Get("SHARPLENS_LOG_LEVEL", "ROSLYN_LOG_LEVEL") ?? "Information";
         _jsonOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             WriteIndented = false,
             Converters = { new RequestId.Converter() }
         };
+        _toolCallTimeout = toolCallTimeout;
+        _testToolCallCancellation = testToolCallCancellation;
     }
+
+    // Test seam: load an in-memory workspace into the underlying service so the
+    // dispatcher + result wrapper can be exercised end-to-end against code that
+    // wouldn't compile (and so can't live on disk) — without an MSBuild solution.
+    // Mirrors RoslynService.LoadFromWorkspaceForTesting; production loads via the
+    // load_solution tool.
+    internal void LoadFromWorkspaceForTesting(Microsoft.CodeAnalysis.Workspace workspace)
+        => _roslynService.LoadFromWorkspaceForTesting(workspace);
+
+    private static TimeSpan ReadConfiguredToolCallTimeout() =>
+        TimeSpan.FromSeconds(ParseToolCallTimeoutSeconds(
+            EnvironmentConfig.Get("SHARPLENS_TIMEOUT_SECONDS", "ROSLYN_TIMEOUT_SECONDS")));
+
+    // A configured timeout must be a positive integer; anything else (missing,
+    // non-numeric, zero, or negative) falls back to the 30s default. Pure so the
+    // guard is unit-testable without mutating the shared process environment.
+    internal static int ParseToolCallTimeoutSeconds(string? configured) =>
+        int.TryParse(configured, out var parsed) && parsed > 0 ? parsed : 30;
 
     public async Task RunAsync()
     {
-        await LogAsync("Information", "Roslyn MCP Server starting...");
+        await LogAsync("Information", "SharpLens MCP server starting...");
 
         // Auto-load solution from environment variable
         var solutionPath = Environment.GetEnvironmentVariable("DOTNET_SOLUTION_PATH");
@@ -135,37 +172,53 @@ public class McpServer
             // was incorrect and produced `{"id":null,...}` for valid notifications like
             // `{"jsonrpc":"2.0","method":"initialize"}`, which Zod-validated clients reject.
             hasId = request.ContainsKey("id") && request["id"] != null;
-            id = hasId
-                ? JsonSerializer.Deserialize<RequestId>(request["id"]!, _jsonOptions)
-                : null;
+            try
+            {
+                id = hasId
+                    ? JsonSerializer.Deserialize<RequestId>(request["id"]!, _jsonOptions)
+                    : null;
+            }
+            catch (JsonException)
+            {
+                // Per JSON-RPC 2.0 §4.2 the id MUST be a string, number, or null. A
+                // structurally-invalid id (object/array) is an Invalid Request (-32600),
+                // not an internal error; we cannot echo the bad id, so respond id:null.
+                return CreateErrorResponse((RequestId?)null, -32600,
+                    "Invalid Request: id must be a string, number, or null");
+            }
             parsed = true;
-            var method = request["method"]?.GetValue<string>();
+            // A non-string method (number/object/array) is as invalid as a missing one;
+            // read it safely so it routes to the -32600/notification handling below
+            // instead of throwing GetValue<string>() into the generic catch (-32603).
+            string? method = null;
+            if (request["method"] is JsonValue methodValue) methodValue.TryGetValue<string>(out method);
             var paramsNode = request["params"];
 
             if (string.IsNullOrEmpty(method))
             {
                 if (!hasId) return null;
-                return CreateErrorResponse(id, -32600, "Invalid Request: missing method");
+                return CreateErrorResponse(id, -32600, "Invalid Request: missing or non-string method");
             }
 
-            // Dispatch through the method switch. For notifications (no id) we still
-            // dispatch so that any side-effecting handlers run, then discard the
-            // response at the wire layer per JSON-RPC 2.0 §4.3.
-            var response = method switch
+            // Per JSON-RPC 2.0 §4.3 a request without `id` is a Notification, which
+            // gets no response. The methods we serve (initialize/tools/list/tools/call)
+            // all REQUIRE a response, so receiving one as a notification is a client
+            // error — do not dispatch it. Dispatching would run a possibly mutating tool
+            // whose result the spec forbids us from returning. Genuine notifications
+            // (notifications/*) are not handled and simply no-op here.
+            if (!hasId)
             {
-                "initialize" => await HandleInitializeAsync(id),
+                await LogAsync("Debug", $"Ignoring notification '{method}': request methods require an id and are not dispatched");
+                return null;
+            }
+
+            return method switch
+            {
+                "initialize" => await HandleInitializeAsync(id, paramsNode?.AsObject()),
                 "tools/list" => await HandleListToolsAsync(id),
                 "tools/call" => await HandleToolCallAsync(id, paramsNode?.AsObject()),
                 _ => CreateErrorResponse(id, -32601, $"Method not found: {method}")
             };
-
-            if (!hasId)
-            {
-                await LogAsync("Debug", $"Received notification: {method} (response discarded)");
-                return null;
-            }
-
-            return response;
         }
         catch (Exception ex)
         {
@@ -179,11 +232,22 @@ public class McpServer
         }
     }
 
-    private Task<object> HandleInitializeAsync(RequestId? id)
+    private Task<object> HandleInitializeAsync(RequestId? id, JsonObject? requestParams)
     {
+        string? requested = null;
+        if (requestParams?["protocolVersion"] is JsonValue versionValue &&
+            versionValue.TryGetValue<string>(out var versionString))
+        {
+            requested = versionString;
+        }
+
+        var negotiated = requested != null && SupportedProtocolVersions.Contains(requested)
+            ? requested
+            : SupportedProtocolVersions[0];
+
         var response = CreateSuccessResponse(id, new
         {
-            protocolVersion = ProtocolVersion,
+            protocolVersion = negotiated,
             capabilities = new
             {
                 tools = new { }
@@ -199,1764 +263,73 @@ public class McpServer
 
     private Task<object> HandleListToolsAsync(RequestId? id)
     {
-        var tools = new List<object>
-        {
-            (object)new
-            {
-                name = "roslyn:health_check",
-                description = "Check the health and status of the Roslyn MCP server and workspace. Returns: server status, solution loaded state, project count, and memory usage. Call this first to verify the server is ready.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new { }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:load_solution",
-                description = "Load a .NET solution for analysis. MUST be called before using any other analysis tools. Returns: projectCount, documentCount, and load time. Use health_check to verify current state.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        solutionPath = new { type = "string", description = "Absolute path to .sln or .slnx file" }
-                    },
-                    required = new[] { "solutionPath" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:sync_documents",
-                description = @"Synchronize document changes from disk into the loaded solution. Call this after using Edit/Write tools to ensure Roslyn has fresh content.
-
-USAGE:
-- sync_documents(filePaths: [""src/Foo.cs"", ""src/Bar.cs""]) - sync specific files
-- sync_documents() - sync ALL documents (refresh entire solution)
-
-WHEN TO CALL:
-- After using Edit tool to modify .cs files
-- After using Write tool to create new .cs files
-- After deleting .cs files
-- NOT needed after using SharpLensMcp refactoring tools (they auto-update)
-
-HANDLES: Modified files (updates content), new files (adds to solution), deleted files (removes from solution).
-Much faster than load_solution - only updates documents, doesn't re-parse projects.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePaths = new {
-                            type = "array",
-                            items = new { type = "string" },
-                            description = "Optional: specific file paths to sync. If omitted, syncs ALL documents from disk."
-                        }
-                    }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_symbol_info",
-                description = "Get detailed semantic information about a symbol at a specific position. IMPORTANT: Uses ZERO-BASED coordinates. If your editor shows 'Line 14, Column 5', pass line=13, column=4. Returns symbol kind, type, namespace, documentation, and location.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number (Visual Studio line 14 = line 13 here)" },
-                        column = new { type = "integer", description = "Zero-based column number (Visual Studio col 5 = col 4 here)" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:go_to_definition",
-                description = "Fast navigation to symbol definition. Returns the definition location without finding all references. IMPORTANT: Uses ZERO-BASED coordinates (editor line 10 = pass line 9).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file containing the symbol" },
-                        line = new { type = "integer", description = "Zero-based line number (editor line - 1)" },
-                        column = new { type = "integer", description = "Zero-based column number (editor column - 1)" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:find_references",
-                description = "Find all references to a symbol across the entire solution. Returns file paths, line numbers, code context, and a `kind` for each reference: write (assignment LHS, ++/--, ref/out arg), invocation (call target), cast (cast target type), typeof, nameof, attribute, or read. IMPORTANT: Uses ZERO-BASED coordinates (editor line 10 = pass line 9).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file containing the symbol" },
-                        line = new { type = "integer", description = "Zero-based line number (editor line - 1)" },
-                        column = new { type = "integer", description = "Zero-based column number (editor column - 1)" },
-                        maxResults = new { type = "integer", description = "Maximum number of references to return (default: 100). Results are truncated with a hint if limit is exceeded." },
-                        kind = new { type = "string", description = "Optional kind filter (case-insensitive). One of: write, invocation, cast, typeof, nameof, attribute, read. When set, the response includes totalReferences (unfiltered) and totalReferencesAfterFilter so callers see both numbers." }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:find_implementations",
-                description = "Find all implementations of an interface or abstract class. Returns implementing types with their locations. IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        maxResults = new { type = "integer", description = "Maximum number of implementations to return (default: 50). Results are truncated with a hint if limit is exceeded." }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_type_hierarchy",
-                description = "Get the inheritance hierarchy (base types and derived types) for a type. Returns baseTypes chain and derivedTypes list. IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        maxDerivedTypes = new { type = "integer", description = "Maximum number of derived types to return (default: 50). Results are truncated with a hint if limit is exceeded." }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:search_symbols",
-                description = "Search for types, methods, properties, etc. by name across the solution. Supports glob patterns (e.g., '*Handler' finds classes ending with 'Handler', 'Get*' finds symbols starting with 'Get'). Use ? for single character wildcard. PAGINATION: Returns totalCount and hasMore. Use offset to paginate through results.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        query = new { type = "string", description = "Search query - supports wildcards: * (any characters), ? (single character). Examples: 'Handler', '*Handler', 'Get*', 'I?Service'. Case-insensitive." },
-                        kind = new { type = "string", description = "Optional: filter by symbol kind. For types use: Class, Interface, Struct, Enum, Delegate. For members use: Method, Property, Field, Event. Other: Namespace. Case-insensitive." },
-                        maxResults = new { type = "integer", description = "Maximum number of results per page (default: 50)" },
-                        namespaceFilter = new { type = "string", description = "Optional: filter by namespace (supports wildcards). Examples: 'MyApp.Core.*', '*.Services', 'MyApp.*.Handlers'. Case-insensitive." },
-                        offset = new { type = "integer", description = "Offset for pagination (default: 0). Use pagination.nextOffset from previous response to get next page." }
-                    },
-                    required = new[] { "query" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:semantic_query",
-                description = @"Advanced semantic code query with multiple filters. Find symbols based on their semantic properties.
-
-EXAMPLES:
-- Async methods without CancellationToken: isAsync=true, parameterExcludes=[""CancellationToken""]
-- Public static methods: accessibility=""Public"", isStatic=true
-- Classes with [Obsolete]: kinds=[""Class""], attributes=[""ObsoleteAttribute""]
-
-FILTERS: All specified filters are combined with AND logic. Omit a filter to skip it. Returns symbol details with locations.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        kinds = new { type = "array", items = new { type = "string" }, description = "Optional: filter by symbol kinds (can specify multiple). For types: Class, Interface, Struct, Enum, Delegate. For members: Method, Property, Field, Event. Example: ['Class', 'Interface']" },
-                        isAsync = new { type = "boolean", description = "Optional: filter methods by async/await (true for async methods, false for sync methods)" },
-                        namespaceFilter = new { type = "string", description = "Optional: filter by namespace (supports wildcards). Examples: 'MyApp.Core.*', '*.Services'" },
-                        accessibility = new { type = "string", description = "Optional: filter by accessibility. Values: Public, Private, Internal, Protected, ProtectedInternal, PrivateProtected" },
-                        isStatic = new { type = "boolean", description = "Optional: filter by static modifier (true for static, false for instance)" },
-                        type = new { type = "string", description = "Optional: filter fields/properties by their type. Partial match. Example: 'ILogger' finds all ILogger fields/properties" },
-                        returnType = new { type = "string", description = "Optional: filter methods by return type. Partial match. Example: 'Task' finds all methods returning Task" },
-                        attributes = new { type = "array", items = new { type = "string" }, description = "Optional: filter by attributes (must have ALL specified). Example: ['ObsoleteAttribute', 'EditorBrowsableAttribute']" },
-                        parameterIncludes = new { type = "array", items = new { type = "string" }, description = "Optional: filter methods that MUST have these parameter types (partial match). Example: ['CancellationToken']" },
-                        parameterExcludes = new { type = "array", items = new { type = "string" }, description = "Optional: filter methods that must NOT have these parameter types (partial match). Example: ['CancellationToken']" },
-                        maxResults = new { type = "integer", description = "Maximum number of results (default: 100)" }
-                    },
-                    required = new string[] { }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_diagnostics",
-                description = "Get compiler errors, warnings, info messages, AND configured analyzer findings (StyleCop, Roslynator, NetAnalyzers, custom analyzers; editorconfig-resolved severities) for a file or project. Use before committing - this matches what CI will fail on. Response includes analyzersRan and analyzerCount so callers know whether analyzers contributed.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Optional: path to specific file, omit for all files" },
-                        projectPath = new { type = "string", description = "Optional: path to specific project" },
-                        severity = new { type = "string", description = "Optional: filter by severity (Error, Warning, Info)" },
-                        includeHidden = new { type = "boolean", description = "Include hidden diagnostics (default: false)" },
-                        runAnalyzers = new { type = "boolean", description = "Run configured DiagnosticAnalyzers in addition to the compiler (default: true). Set false for a fast compiler-only pass when speed matters; otherwise leave true so output matches CI build behavior." }
-                    }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_code_fixes",
-                description = "Get available code fixes for a specific diagnostic. Returns list of fix titles and descriptions. WORKFLOW: (1) get_diagnostics to find issues, (2) get_code_fixes to see options, (3) apply_code_fix to fix.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        diagnosticId = new { type = "string", description = "Diagnostic ID (e.g., CS0246)" },
-                        line = new { type = "integer", description = "Zero-based line number" },
-                        column = new { type = "integer", description = "Zero-based column number" }
-                    },
-                    required = new[] { "filePath", "diagnosticId", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:apply_code_fix",
-                description = "Apply automated code fix for a diagnostic. WORKFLOW: (1) Call with no fixIndex to list available fixes, (2) Call with fixIndex and preview=true to preview changes, (3) Call with preview=false to apply. IMPORTANT: Uses ZERO-BASED coordinates.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        diagnosticId = new { type = "string", description = "Diagnostic ID (e.g., CS0168, CS1998, CS4012)" },
-                        line = new { type = "integer", description = "Zero-based line number (editor line - 1)" },
-                        column = new { type = "integer", description = "Zero-based column number (editor column - 1)" },
-                        fixIndex = new { type = "integer", description = "Index of fix to apply (omit to list available fixes). Call without this parameter first to see available fixes." },
-                        preview = new { type = "boolean", description = "Preview mode (default: true). Set to false to apply changes to disk. ALWAYS preview first!" }
-                    },
-                    required = new[] { "filePath", "diagnosticId", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_project_structure",
-                description = "Get solution/project structure. IMPORTANT: For large solutions (100+ projects), use summaryOnly=true or projectNamePattern to avoid token limit errors. Maximum output is limited to 25,000 tokens.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        includeReferences = new { type = "boolean", description = "Include package references (default: true, limited to 100 per project)" },
-                        includeDocuments = new { type = "boolean", description = "Include document lists (default: false, limited to 500 per project)" },
-                        projectNamePattern = new { type = "string", description = "Filter projects by name pattern (supports * and ? wildcards, e.g., '*.Application' or 'MyApp.*')" },
-                        maxProjects = new { type = "integer", description = "Maximum number of projects to return (e.g., 10 for large solutions)" },
-                        summaryOnly = new { type = "boolean", description = "Return only project names and counts (default: false, recommended for large solutions)" }
-                    }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:organize_usings",
-                description = "Sort and remove unused using directives in a file. Returns the modified file content. Automatically removes unused usings and sorts alphabetically.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" }
-                    },
-                    required = new[] { "filePath" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:organize_usings_batch",
-                description = "Organize using directives for multiple files in a project. Supports file pattern filtering (e.g., '*.cs', 'Services/*.cs'). PREVIEW mode by default - set preview=false to apply changes.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        projectName = new { type = "string", description = "Optional: Project name to process. If omitted, processes all projects in solution." },
-                        filePattern = new { type = "string", description = "Optional: Glob pattern to filter files (e.g., '*.cs', 'Services/*.cs', '*Repository.cs'). Matches against file names, not full paths." },
-                        preview = new { type = "boolean", description = "Preview mode (default: true). Set to false to apply changes to disk. ALWAYS preview first!" }
-                    },
-                    required = new string[] { }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:format_document_batch",
-                description = "Format multiple documents in a project using Roslyn's NormalizeWhitespace. Ensures consistent indentation, spacing, and line breaks. PREVIEW mode by default - set preview=false to apply changes.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        projectName = new { type = "string", description = "Optional: Project name to format. If omitted, formats all projects in solution." },
-                        includeTests = new { type = "boolean", description = "Include test projects (default: true). Set to false to skip projects with 'Test' in the name." },
-                        filePattern = new { type = "string", description = "Optional: Glob pattern to filter files (e.g., '*.cs', 'Services/*.cs', '*Repository.cs'). Matches against file names, not full paths." },
-                        preview = new { type = "boolean", description = "Preview mode (default: true). Set to false to apply changes to disk. ALWAYS preview first!" }
-                    },
-                    required = new string[] { }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_method_overloads",
-                description = "Get all overloads of a method. Returns list of signatures with parameter details. Use when you need to choose between overloads. IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number" },
-                        column = new { type = "integer", description = "Zero-based column number" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_containing_member",
-                description = "Get information about the containing method/property/class at a position. Returns the enclosing symbol's name, kind, and signature. Useful for understanding context. IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number" },
-                        column = new { type = "integer", description = "Zero-based column number" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:find_callers",
-                description = "Find all methods/properties that call or reference a specific symbol (inverse of find_references). Essential for impact analysis: 'If I change this method, what code will be affected?' IMPORTANT: Uses ZERO-BASED coordinates.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number (editor line - 1)" },
-                        column = new { type = "integer", description = "Zero-based column number (editor column - 1)" },
-                        maxResults = new { type = "integer", description = "Maximum number of call sites to return (default: 100). Results are truncated with a hint if limit is exceeded." }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:find_unused_code",
-                description = @"Find unused types, methods, properties, and fields in a project or entire solution. Returns symbols with zero references (excluding their declaration).
-
-USAGE: find_unused_code() for entire solution, or find_unused_code(projectName=""MyProject"") for specific project.
-OUTPUT: List of unused symbols with location, kind, and accessibility. Default limit: 50 results.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        projectName = new { type = "string", description = "Optional: analyze specific project by name, omit to analyze entire solution" },
-                        includePrivate = new { type = "boolean", description = "Include private members (default: true)" },
-                        includeInternal = new { type = "boolean", description = "Include internal members (default: false - usually want to keep internal APIs)" },
-                        symbolKindFilter = new { type = "string", description = "Optional: filter by symbol kind (Class, Method, Property, Field)" },
-                        maxResults = new { type = "integer", description = "Maximum results to return (default: 50, helps manage large outputs)" }
-                    }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:rename_symbol",
-                description = "Safely rename a symbol (type, method, property, etc.) across the entire solution. Uses Roslyn's semantic analysis to ensure all references are updated. SUPPORTS PREVIEW MODE - always preview first! IMPORTANT: Uses ZERO-BASED coordinates. Default shows first 20 files with summary verbosity.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file containing the symbol" },
-                        line = new { type = "integer", description = "Zero-based line number (editor line - 1)" },
-                        column = new { type = "integer", description = "Zero-based column number (editor column - 1)" },
-                        newName = new { type = "string", description = "New name for the symbol" },
-                        preview = new { type = "boolean", description = "Preview changes without applying (default: true). ALWAYS preview first!" },
-                        maxFiles = new { type = "integer", description = "Max files to show in preview (default: 20, prevents large outputs)" },
-                        verbosity = new { type = "string", description = "Output detail level: 'summary' (default, file paths + counts only ~200 tokens/file), 'compact' (add locations ~500 tokens/file), 'full' (include old/new text ~3000+ tokens/file)" }
-                    },
-                    required = new[] { "filePath", "line", "column", "newName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:extract_interface",
-                description = @"Generate an interface from a class or struct. Extracts all public instance members (methods, properties, events).
-
-USAGE: Position on class declaration, provide interfaceName=""IMyService"".
-OUTPUT: Generated interface code ready to insert. Useful for dependency injection and testability.
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file containing the class" },
-                        line = new { type = "integer", description = "Zero-based line number (editor line - 1)" },
-                        column = new { type = "integer", description = "Zero-based column number (editor column - 1)" },
-                        interfaceName = new { type = "string", description = "Name for the new interface (e.g., 'IMyService')" },
-                        includeMemberNames = new { type = "array", items = new { type = "string" }, description = "Optional: specific member names to include (omit to include all public members)" }
-                    },
-                    required = new[] { "filePath", "line", "column", "interfaceName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:dependency_graph",
-                description = @"Visualize project dependencies as a graph. Shows which projects reference which, detects circular dependencies.
-
-OUTPUT: format=""json"" returns structured data with nodes/edges. format=""mermaid"" returns diagram syntax.
-USE CASE: Understand solution architecture, find circular dependencies, plan refactoring.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        format = new { type = "string", description = "Output format: 'json' (default) returns structured data, 'mermaid' returns Mermaid diagram syntax" }
-                    }
-                }
-            },
-
-            // ============ NEW TOOLS: Name-Based Type Discovery ============
-
-            (object)new
-            {
-                name = "roslyn:get_type_members",
-                description = @"Get all members (methods, properties, fields, events) of a type BY NAME.
-
-USAGE PATTERNS:
-- Basic: get_type_members(""MyClass"") - list all members
-- With inheritance: get_type_members(""MyService"", includeInherited=true)
-- Filter by kind: get_type_members(""MyClass"", memberKind=""Method"")
-- Verbosity control: verbosity=""summary"" (names only), ""compact"" (default, + signatures), ""full"" (+ docs, attrs)
-
-WORKS WITH: Fully-qualified (""MyNamespace.MyClass""), simple (""MyClass""), or partial names.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        typeName = new { type = "string", description = "Type name (e.g., 'MyClass', 'MyNamespace.MyService')" },
-                        includeInherited = new { type = "boolean", description = "Include members from base classes (default: false)" },
-                        memberKind = new { type = "string", description = "Filter: 'Method', 'Property', 'Field', 'Event'" },
-                        verbosity = new { type = "string", description = "'summary' (names only), 'compact' (default), 'full' (+ docs, attrs)" },
-                        maxResults = new { type = "integer", description = "Maximum members to return (default: 100)" }
-                    },
-                    required = new[] { "typeName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_method_signature",
-                description = @"Get detailed method signature BY NAME including parameters, return type, nullability, and modifiers.
-
-USAGE: get_method_signature(""MyClass"", ""ProcessData"") or with overload selection: get_method_signature(""MyClass"", ""ProcessData"", overloadIndex=1)",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        typeName = new { type = "string", description = "Containing type name" },
-                        methodName = new { type = "string", description = "Method name" },
-                        overloadIndex = new { type = "integer", description = "Which overload (0-based, default: 0)" }
-                    },
-                    required = new[] { "typeName", "methodName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_attributes",
-                description = @"Find all symbols with specific attributes.
-
-USAGE:
-- Find obsolete: get_attributes(""Obsolete"")
-- Find serializable: get_attributes(""Serializable"")
-- Scope to project: get_attributes(""Obsolete"", scope=""project:MyProject"")
-- Scope to file: get_attributes(""Obsolete"", scope=""file:MyClass.cs"")",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        attributeName = new { type = "string", description = "Attribute name (e.g., 'Obsolete', 'Serializable', 'JsonProperty')" },
-                        scope = new { type = "string", description = "'solution' (default), 'project:Name', or 'file:path'" },
-                        maxResults = new { type = "integer", description = "Maximum results (default: 100)" }
-                    },
-                    required = new[] { "attributeName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_derived_types",
-                description = @"Find all types inheriting from a base type BY NAME.
-
-USAGE:
-- Find all subclasses: get_derived_types(""BaseService"")
-- Direct children only: get_derived_types(""BaseClass"", includeTransitive=false)",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        baseTypeName = new { type = "string", description = "Base type name" },
-                        includeTransitive = new { type = "boolean", description = "Include indirect descendants (default: true)" },
-                        maxResults = new { type = "integer", description = "Maximum results (default: 100)" }
-                    },
-                    required = new[] { "baseTypeName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_base_types",
-                description = @"Get full inheritance chain BY NAME.
-
-USAGE: get_base_types(""MyService"") returns: MyService → BaseService → ... → Object",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        typeName = new { type = "string", description = "Type name" }
-                    },
-                    required = new[] { "typeName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:analyze_data_flow",
-                description = @"Analyze variable assignments and usage in a code region.
-
-Returns: variablesDeclared, alwaysAssigned, dataFlowsIn/Out, readInside/Outside, writtenInside/Outside, captured.
-
-USAGE: analyze_data_flow(""path/to/file.cs"", startLine=10, endLine=25)",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        startLine = new { type = "integer", description = "Start line (0-based)" },
-                        endLine = new { type = "integer", description = "End line (0-based)" }
-                    },
-                    required = new[] { "filePath", "startLine", "endLine" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:analyze_control_flow",
-                description = @"Analyze branching and reachability in a code region.
-
-Returns: entryPoints, exitPoints, returnStatements, endPointIsReachable.
-
-USAGE: analyze_control_flow(""path/to/file.cs"", startLine=10, endLine=25)",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        startLine = new { type = "integer", description = "Start line (0-based)" },
-                        endLine = new { type = "integer", description = "End line (0-based)" }
-                    },
-                    required = new[] { "filePath", "startLine", "endLine" }
-                }
-            },
-
-            // ============ COMPOUND TOOLS ============
-
-            (object)new
-            {
-                name = "roslyn:get_type_overview",
-                description = @"Get comprehensive type overview in ONE CALL: type info + base types (first 3) + member counts.
-
-USAGE: get_type_overview(""MyService"") - returns everything you need to understand a type quickly.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        typeName = new { type = "string", description = "Type name" }
-                    },
-                    required = new[] { "typeName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:analyze_method",
-                description = @"Get comprehensive method analysis in ONE CALL: signature + callers + outgoing calls + location.
-
-USAGE: analyze_method(""MyService"", ""ProcessData"") or analyze_method(""MyClass"", ""Calculate"", includeCallers=true, includeOutgoingCalls=true)",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        typeName = new { type = "string", description = "Containing type name" },
-                        methodName = new { type = "string", description = "Method name" },
-                        includeCallers = new { type = "boolean", description = "Include caller analysis (default: true)" },
-                        includeOutgoingCalls = new { type = "boolean", description = "Include methods/properties this method calls (default: false)" },
-                        maxCallers = new { type = "integer", description = "Max callers to return (default: 20)" },
-                        maxOutgoingCalls = new { type = "integer", description = "Max outgoing calls to return (default: 50)" }
-                    },
-                    required = new[] { "typeName", "methodName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_file_overview",
-                description = @"Get comprehensive file overview in ONE CALL: diagnostics summary + type declarations + namespace + line count.
-
-USAGE: get_file_overview(""path/to/MyClass.cs"")",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" }
-                    },
-                    required = new[] { "filePath" }
-                }
-            },
-
-            // Phase 2: AI-Focused Tools
-            (object)new
-            {
-                name = "roslyn:get_missing_members",
-                description = @"Get all interface and abstract members that must be implemented for a type.
-
-USAGE: Position on a class that implements interfaces or extends abstract classes.
-OUTPUT: List of missing members with exact signatures ready to copy. Use before implementing interfaces.
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number on the type declaration" },
-                        column = new { type = "integer", description = "Zero-based column number" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_outgoing_calls",
-                description = "Get all methods and properties that a method calls. Helps understand method dependencies and behavior. Returns list of called symbols with locations. IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number inside the method" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        maxDepth = new { type = "integer", description = "How deep to trace calls (1 = direct only, default: 1)" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:validate_code",
-                description = @"Check if code would compile without writing to disk. Use to validate generated code before applying.
-
-USAGE: validate_code(code=""public void Foo() {}"", contextFilePath=""path/to/file.cs"") to check with existing usings.
-OUTPUT: compiles (bool), errors list with line numbers. Essential before inserting AI-generated code.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        code = new { type = "string", description = "C# code to validate" },
-                        contextFilePath = new { type = "string", description = "Optional: file to use for context (usings, namespace)" },
-                        standalone = new { type = "boolean", description = "If true, treat code as complete file (default: false)" }
-                    },
-                    required = new[] { "code" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:check_type_compatibility",
-                description = @"Check if one type can be assigned to another. Use before generating assignments or casts.
-
-USAGE: check_type_compatibility(sourceType=""MyDerivedClass"", targetType=""MyBaseClass"")
-OUTPUT: compatible (bool), requiresCast (bool), conversionKind, and explanation of why/why not.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        sourceType = new { type = "string", description = "The source type name (e.g., 'MyDerivedClass')" },
-                        targetType = new { type = "string", description = "The target type name (e.g., 'MyBaseClass')" }
-                    },
-                    required = new[] { "sourceType", "targetType" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_instantiation_options",
-                description = @"Get all ways to create an instance of a type: constructors, factory methods, and builder patterns.
-
-USAGE: get_instantiation_options(typeName=""HttpClient"")
-OUTPUT: List of constructors with signatures, static factory methods, and hints (e.g., ""implements IDisposable"").",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        typeName = new { type = "string", description = "The type name to check (e.g., 'HttpClient')" }
-                    },
-                    required = new[] { "typeName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:analyze_change_impact",
-                description = @"Analyze what would break if you change a symbol. Identifies breaking changes before you make them.
-
-USAGE: analyze_change_impact(filePath, line, column, changeType=""rename|changeType|addParameter|removeParameter"")
-OUTPUT: List of impacted locations, whether change is safe, and specific issues at each location.
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number of the symbol" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        changeType = new { type = "string", description = "Type of change: rename, changeType, addParameter, removeParameter, changeAccessibility, delete" },
-                        newValue = new { type = "string", description = "Optional: new value for rename/changeType" }
-                    },
-                    required = new[] { "filePath", "line", "column", "changeType" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_method_source",
-                description = @"Get the actual source code of a method by type and method name. Eliminates need for file Read.
-
-USAGE: get_method_source(typeName=""MyService"", methodName=""ProcessData"")
-OUTPUT: Full method source including signature, body, location (file + line numbers), and line count.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        typeName = new { type = "string", description = "The containing type name (e.g., 'MyService', 'MyController')" },
-                        methodName = new { type = "string", description = "The method name (e.g., 'ProcessData')" },
-                        overloadIndex = new { type = "integer", description = "Which overload to get (0-based, default: 0)" }
-                    },
-                    required = new[] { "typeName", "methodName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_method_source_batch",
-                description = @"Get source code for multiple methods in a single call (batch optimization).
-
-USAGE: get_method_source_batch(methods: [{typeName: 'ServiceA', methodName: 'Process'}, {typeName: 'ServiceB', methodName: 'Handle'}])
-OUTPUT: Results array with source for each method, plus errors array for any that failed.
-BENEFIT: One call instead of multiple - reduces round trips when tracing code flows.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        methods = new
-                        {
-                            type = "array",
-                            description = "Array of method requests",
-                            items = new
-                            {
-                                type = "object",
-                                properties = new
-                                {
-                                    typeName = new { type = "string", description = "Containing type name" },
-                                    methodName = new { type = "string", description = "Method name" },
-                                    overloadIndex = new { type = "integer", description = "Which overload (0-based, optional)" }
-                                },
-                                required = new[] { "typeName", "methodName" }
-                            }
-                        },
-                        maxMethods = new { type = "integer", description = "Maximum methods to process (default: 20)" }
-                    },
-                    required = new[] { "methods" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:generate_constructor",
-                description = @"Generate a constructor from fields and/or properties of a type.
-
-USAGE: Position on class/struct declaration. Use includeProperties=true for auto-properties.
-OUTPUT: constructorCode string ready to paste, parameter list, and field assignments.
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file containing the type" },
-                        line = new { type = "integer", description = "Zero-based line number on the type declaration" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        includeProperties = new { type = "boolean", description = "Include properties with setters (default: false)" },
-                        initializeToDefault = new { type = "boolean", description = "Use ?? default for nullable types (default: false)" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:change_signature",
-                description = @"Change a method signature and preview impact on all call sites.
-
-ACTIONS: add (new param), remove, rename, reorder parameters.
-WORKFLOW: (1) Call with preview=true (default) to see affected call sites, (2) Review changes, (3) Call with preview=false to apply.
-OUTPUT: oldSignature, newSignature, list of call sites needing updates.
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file containing the method" },
-                        line = new { type = "integer", description = "Zero-based line number on the method" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        changes = new
-                        {
-                            type = "array",
-                            description = "Array of changes to apply",
-                            items = new
-                            {
-                                type = "object",
-                                properties = new
-                                {
-                                    action = new { type = "string", description = "Action: 'add', 'remove', 'rename', or 'reorder'" },
-                                    name = new { type = "string", description = "Parameter name (for add/remove/rename)" },
-                                    type = new { type = "string", description = "Parameter type (for add)" },
-                                    newName = new { type = "string", description = "New name (for rename)" },
-                                    defaultValue = new { type = "string", description = "Default value (for add)" },
-                                    position = new { type = "integer", description = "Position to insert (for add), -1 means end" },
-                                    order = new { type = "array", items = new { type = "string" }, description = "New parameter order (for reorder)" }
-                                }
-                            }
-                        },
-                        preview = new { type = "boolean", description = "Preview mode (default: true). Set to false to apply changes." }
-                    },
-                    required = new[] { "filePath", "line", "column", "changes" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:extract_method",
-                description = @"Extract selected statements into a new method. Uses data flow analysis to determine parameters and return type.
-
-USAGE: Specify startLine/endLine range containing complete statements inside a method.
-OUTPUT: extractedCode (the new method), replacementCode (the call to insert), detected parameters and return type.
-WORKFLOW: (1) Preview with preview=true, (2) Apply with preview=false.
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        startLine = new { type = "integer", description = "Zero-based start line of selection" },
-                        endLine = new { type = "integer", description = "Zero-based end line of selection" },
-                        methodName = new { type = "string", description = "Name for the new method" },
-                        accessibility = new { type = "string", description = "Accessibility: private, public, internal (default: private)" },
-                        preview = new { type = "boolean", description = "Preview mode (default: true). Set to false to apply." }
-                    },
-                    required = new[] { "filePath", "startLine", "endLine", "methodName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_code_actions_at_position",
-                description = @"Get ALL available code actions (fixes + refactorings) at a position. This is the master tool that exposes 100+ Roslyn refactorings.
-
-USAGE: get_code_actions_at_position(filePath, line, column) or with selection: add endLine, endColumn
-OUTPUT: List of actions with title, kind (fix/refactoring), equivalenceKey
-WORKFLOW: (1) Call this to see available actions, (2) Use apply_code_action_by_title to apply one
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        endLine = new { type = "integer", description = "Optional: end line for selection" },
-                        endColumn = new { type = "integer", description = "Optional: end column for selection" },
-                        includeCodeFixes = new { type = "boolean", description = "Include fixes for diagnostics (default: true)" },
-                        includeRefactorings = new { type = "boolean", description = "Include refactorings (default: true)" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:apply_code_action_by_title",
-                description = @"Apply a code action by its title. Supports exact and partial matching.
-
-USAGE: apply_code_action_by_title(filePath, line, column, title)
-OUTPUT: Changed files with preview or applied changes
-WORKFLOW: (1) Call get_code_actions_at_position first, (2) Apply with preview=true, (3) Apply with preview=false
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        title = new { type = "string", description = "Action title (exact or partial match)" },
-                        endLine = new { type = "integer", description = "Optional: end line for selection" },
-                        endColumn = new { type = "integer", description = "Optional: end column for selection" },
-                        preview = new { type = "boolean", description = "Preview mode (default: true). Set to false to apply." }
-                    },
-                    required = new[] { "filePath", "line", "column", "title" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:implement_missing_members",
-                description = @"Generate stub implementations for interface/abstract members.
-
-USAGE: Position cursor on class declaration that implements interface or extends abstract class.
-OUTPUT: Generated stub code for all missing members.
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number on the class declaration" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        preview = new { type = "boolean", description = "Preview mode (default: true)" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:encapsulate_field",
-                description = @"Convert a field to a property with getter/setter.
-
-USAGE: Position cursor on a field declaration.
-OUTPUT: Generated property wrapping the field.
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number on the field" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        preview = new { type = "boolean", description = "Preview mode (default: true)" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:inline_variable",
-                description = @"Inline a variable, replacing all usages with its value.
-
-USAGE: Position cursor on a variable declaration or usage.
-OUTPUT: Variable removed and all usages replaced with the expression.
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        preview = new { type = "boolean", description = "Preview mode (default: true)" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:extract_variable",
-                description = @"Extract an expression to a local variable.
-
-USAGE: Position cursor on or select an expression.
-OUTPUT: Expression extracted to a new local variable.
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        endLine = new { type = "integer", description = "Optional: end line for selection" },
-                        endColumn = new { type = "integer", description = "Optional: end column for selection" },
-                        preview = new { type = "boolean", description = "Preview mode (default: true)" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_complexity_metrics",
-                description = @"Get complexity metrics for a method or entire file.
-
-METRICS: cyclomatic (decision points), nesting (max depth), loc (lines), parameters (count), cognitive (Sonar-style)
-USAGE: get_complexity_metrics(filePath) for file, or add line/column for specific method
-OUTPUT: Per-method breakdown with all requested metrics
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Optional: zero-based line for specific method" },
-                        column = new { type = "integer", description = "Optional: zero-based column" },
-                        metrics = new { type = "array", items = new { type = "string" }, description = "Optional: specific metrics [cyclomatic, nesting, loc, parameters, cognitive]" }
-                    },
-                    required = new[] { "filePath" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:add_null_checks",
-                description = @"Add ArgumentNullException.ThrowIfNull guard clauses for nullable parameters.
-
-USAGE: Position cursor on a method with reference type parameters.
-OUTPUT: Generated guard clauses inserted at method start.
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number on the method" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        preview = new { type = "boolean", description = "Preview mode (default: true)" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:generate_equality_members",
-                description = @"Generate Equals, GetHashCode, and == / != operators for a type.
-
-USAGE: Position cursor on a class or struct declaration.
-OUTPUT: Generated equality members comparing all instance fields and properties.
-IMPORTANT: Uses ZERO-BASED coordinates (editor line - 1).",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "Absolute path to source file" },
-                        line = new { type = "integer", description = "Zero-based line number on the type" },
-                        column = new { type = "integer", description = "Zero-based column number" },
-                        includeOperators = new { type = "boolean", description = "Include == and != operators (default: true)" },
-                        preview = new { type = "boolean", description = "Preview mode (default: true)" }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_type_members_batch",
-                description = @"Get members for multiple types in a single call (batch optimization).
-
-USAGE: get_type_members_batch(typeNames: ['ServiceA', 'ServiceB', 'ControllerC'])
-OUTPUT: Results for each type with members, or error if type not found
-BENEFIT: One call instead of multiple - reduces context usage for AI agents",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        typeNames = new { type = "array", items = new { type = "string" }, description = "Array of type names to look up" },
-                        includeInherited = new { type = "boolean", description = "Include inherited members (default: false)" },
-                        memberKind = new { type = "string", description = "Filter: 'Method', 'Property', 'Field', 'Event'" },
-                        verbosity = new { type = "string", description = "'summary', 'compact' (default), or 'full'" },
-                        maxResultsPerType = new { type = "integer", description = "Max members per type (default: 50)" }
-                    },
-                    required = new[] { "typeNames" }
-                }
-            }
-            ,
-            (object)new
-            {
-                name = "roslyn:find_attribute_usages",
-                description = @"Find all types and members decorated with a specific attribute.
-
-USAGE: find_attribute_usages(attributeName: ""Authorize"")
-USAGE: find_attribute_usages(attributeName: ""HttpGet"", projectName: ""MyApi"")
-
-OUTPUT: List of symbols with the attribute, their kind, arguments, and source location.
-Use for: finding all API endpoints, authorization points, serialization config, test fixtures.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        attributeName = new { type = "string", description = "Attribute name (e.g. 'Authorize', 'HttpGet', 'Obsolete')" },
-                        projectName = new { type = "string", description = "Filter to specific project" },
-                        maxResults = new { type = "integer", description = "Maximum results (default: 100)" }
-                    },
-                    required = new[] { "attributeName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_di_registrations",
-                description = @"Scan for dependency injection service registrations (AddScoped, AddTransient, AddSingleton, etc.).
-
-USAGE: get_di_registrations()
-USAGE: get_di_registrations(projectName: ""MyApi"")
-
-OUTPUT: List of DI registrations with lifetime, service type, implementation type, and location.
-Use for: understanding service wiring, finding missing registrations, auditing lifetimes.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        projectName = new { type = "string", description = "Filter to specific project" }
-                    }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:find_reflection_usage",
-                description = @"Detect dynamic/reflection-based type and method usage that is invisible to static reference searches.
-
-USAGE: find_reflection_usage()
-USAGE: find_reflection_usage(projectName: ""MyApp"", maxResults: 50)
-
-OUTPUT: List of reflection API calls with the API used, context, and location.
-Use for: finding hidden dependencies before refactoring, security audits, understanding dynamic behavior.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        projectName = new { type = "string", description = "Filter to specific project" },
-                        maxResults = new { type = "integer", description = "Maximum results (default: 100)" }
-                    }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:find_circular_dependencies",
-                description = @"Detect cycles in project or namespace dependency graphs.
-
-USAGE: find_circular_dependencies() — project-level cycles
-USAGE: find_circular_dependencies(level: ""namespace"") — namespace-level cycles
-
-OUTPUT: Dependency graph with any detected cycles listed.
-Use for: architecture analysis, identifying tightly coupled components.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        level = new { type = "string", description = "'project' (default) or 'namespace'" }
-                    }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_nuget_dependencies",
-                description = @"List NuGet package references per project with versions.
-
-USAGE: get_nuget_dependencies()
-USAGE: get_nuget_dependencies(projectName: ""MyApp"")
-
-OUTPUT: List of projects with their NuGet packages, versions, and asset settings.
-Use for: dependency audits, version checks, understanding external dependencies.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        projectName = new { type = "string", description = "Filter to specific project" }
-                    }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_source_generators",
-                description = @"List active source generators and their generated output per project.
-
-USAGE: get_source_generators()
-USAGE: get_source_generators(projectName: ""MyApp"")
-
-OUTPUT: List of generators with their assembly info and generated files.
-Use for: understanding generated code, debugging generator issues.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        projectName = new { type = "string", description = "Filter to specific project" }
-                    }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_generated_code",
-                description = @"View the source code produced by a source generator.
-
-USAGE: get_generated_code(projectName: ""MyApp"", generatedFileName: ""MyType.g.cs"")
-
-OUTPUT: Full source code of the generated file.
-Use get_source_generators first to discover available generated files.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        projectName = new { type = "string", description = "Project containing the generated file" },
-                        generatedFileName = new { type = "string", description = "Name of the generated file" }
-                    },
-                    required = new[] { "projectName", "generatedFileName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_project_health",
-                description = "Composite audit dashboard for one project: aggregates diagnostics (with analyzers), unused code, god-object candidates, and untested public surface. Returns counts + top-N hotspots per dimension. One call replaces 4+ separate tool calls for a project audit overview.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        projectName = new { type = "string", description = "Project to audit. Required." },
-                        includeAnalyzers = new { type = "boolean", description = "Run configured DiagnosticAnalyzers in addition to compiler diagnostics (default: true)." },
-                        topN = new { type = "integer", description = "Hotspots per dimension (default: 5)." }
-                    },
-                    required = new[] { "projectName" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:find_god_objects",
-                description = "Detect over-coupled types ('god objects'). For each type computes efferent coupling (distinct types it depends on), afferent coupling (distinct types that depend on it), and member count; reports types meeting both threshold filters, scored as efferent*0.4 + members*0.4 + afferent*0.2. AUDIT-TIME tool — O(types*references); don't call in tight agent loops.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        projectName = new { type = "string", description = "Limit scan to one project (default: scan all projects)" },
-                        minEfferentCoupling = new { type = "integer", description = "Minimum outbound type dependencies to qualify (default: 20)" },
-                        minMembers = new { type = "integer", description = "Minimum member count to qualify (default: 20)" },
-                        maxResults = new { type = "integer", description = "Cap on candidates returned (default: 20). totalCount reflects unbounded match count." }
-                    }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:find_untested_code",
-                description = "Find public/internal surface in a project that no test method (xUnit [Fact]/[Theory], NUnit [Test]/[TestCase], MSTest [TestMethod]) transitively reaches. Sorted by cyclomatic complexity so the riskiest untested code is reported first. Audit-time tool; runs solution-wide BFS.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        projectName = new { type = "string", description = "Project to audit (default: first project in solution)" },
-                        includeProperties = new { type = "boolean", description = "Include properties (default: true)" },
-                        includeInternal = new { type = "boolean", description = "Include internal members (default: false; only public)" },
-                        maxResults = new { type = "integer", description = "Cap on reported items (default: 50). totalCount reflects the true unbounded count." }
-                    }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_call_graph",
-                description = "Multi-hop transitive call graph (callers, callees, or both) from a method. Replaces N round-trips of find_callers/get_outgoing_calls when tracing impact or understanding a subsystem. Returns nodes + edges (not a nested tree, to handle diamond shapes), with cycle detection and a mandatory maxDepth bound. IMPORTANT: Uses ZERO-BASED coordinates.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        filePath = new { type = "string", description = "File containing the root method" },
-                        line = new { type = "integer", description = "Zero-based line of the method declaration or invocation" },
-                        column = new { type = "integer", description = "Zero-based column" },
-                        direction = new { type = "string", description = "'callees' (default), 'callers', or 'both'" },
-                        maxDepth = new { type = "integer", description = "Max BFS depth, 1-10 (default: 3). Required bound; depths above 10 explode on connected graphs." },
-                        maxNodes = new { type = "integer", description = "Max total nodes (default: 100). Sets truncatedByNodes when hit." }
-                    },
-                    required = new[] { "filePath", "line", "column" }
-                }
-            },
-            (object)new
-            {
-                name = "roslyn:get_external_type_info",
-                description = "Inspect types from external assemblies (NuGet packages, BCL, closed-source) the solution references. Returns members, signatures, and XML docs for types whose source isn't in the solution. Eliminates the need for agents to guess at dependency APIs.",
-                inputSchema = new
-                {
-                    type = "object",
-                    properties = new
-                    {
-                        typeName = new { type = "string", description = "Fully-qualified type name. Use backtick-arity for generics, e.g. 'System.Collections.Generic.List`1'." },
-                        assemblyName = new { type = "string", description = "Optional: restrict resolution to a specific assembly when the type name is ambiguous." },
-                        includeInherited = new { type = "boolean", description = "Include members from base types (default: true). Stops before System.Object." },
-                        includeXmlDocs = new { type = "boolean", description = "Include XML doc summaries when available (default: true)." },
-                        maxMembers = new { type = "integer", description = "Cap on member entries (default: 200). totalCount reflects the unbounded member count." }
-                    },
-                    required = new[] { "typeName" }
-                }
-            }
-        };
-
-        return Task.FromResult(CreateSuccessResponse(id, new { tools }));
+        return Task.FromResult(CreateSuccessResponse(id, new { tools = ToolRegistry.BuildToolSchemas() }));
     }
 
     private async Task<object> HandleToolCallAsync(RequestId? id, JsonObject? paramsNode)
     {
+        // Per-call timeout: SHARPLENS_TIMEOUT_SECONDS bounds every tool call. The
+        // token reaches every Roslyn call through the dispatcher, so a runaway
+        // compilation or solution-wide search cancels instead of hanging the session.
+        // Link the deterministic test-cancellation seam (None in production) and apply
+        // the timeout. A pre-cancelled seam token makes the effective token born cancelled.
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_testToolCallCancellation);
+        timeoutCts.CancelAfter(_toolCallTimeout);
+        string? name = null;
         try
         {
-            var name = paramsNode?["name"]?.GetValue<string>();
-            var arguments = paramsNode?["arguments"]?.AsObject();
+            // Read name/arguments defensively, the same way `method` is read upstream: a
+            // present-but-wrong-typed value is invalid params (-32602), not an exception
+            // that escapes to the generic catch as an in-band INTERNAL_ERROR. A non-string
+            // name reads as null and falls into the missing-tool-name path below.
+            if (paramsNode?["name"] is JsonValue nameValue) nameValue.TryGetValue<string>(out name);
 
             if (string.IsNullOrEmpty(name))
             {
                 return CreateErrorResponse(id, -32602, "Invalid params: missing tool name");
             }
 
+            JsonObject? arguments = null;
+            if (paramsNode?["arguments"] is { } argumentsNode)
+            {
+                arguments = argumentsNode as JsonObject
+                    ?? throw new JsonRpcInvalidParamsException($"Parameter 'arguments' for tool '{name}' must be an object");
+            }
+
             var p = new JsonRpcParameters(arguments, name);
 
-            var result = name switch
-            {
-                "roslyn:health_check" => await _roslynService.GetHealthCheckAsync(),
-
-                "roslyn:load_solution" => await _roslynService.LoadSolutionAsync(
-                    p.Required<string>("solutionPath")),
-
-                "roslyn:sync_documents" => await _roslynService.SyncDocumentsAsync(
-                    p.OptionalStringArray("filePaths")),
-
-                "roslyn:get_symbol_info" => await _roslynService.GetSymbolInfoAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column")),
-
-                "roslyn:go_to_definition" => await _roslynService.GoToDefinitionAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column")),
-
-                "roslyn:find_references" => await _roslynService.FindReferencesAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.OptionalStruct<int>("maxResults"),
-                    p.Optional<string>("kind")),
-
-                "roslyn:find_implementations" => await _roslynService.FindImplementationsAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.OptionalStruct<int>("maxResults")),
-
-                "roslyn:get_type_hierarchy" => await _roslynService.GetTypeHierarchyAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.OptionalStruct<int>("maxDerivedTypes")),
-
-                "roslyn:search_symbols" => await _roslynService.SearchSymbolsAsync(
-                    p.Required<string>("query"),
-                    p.Optional<string>("kind"),
-                    p.Optional("maxResults", 50),
-                    p.Optional<string>("namespaceFilter"),
-                    p.Optional("offset", 0)),
-
-                "roslyn:semantic_query" => await _roslynService.SemanticQueryAsync(
-                    p.OptionalStringArray("kinds"),
-                    p.OptionalStruct<bool>("isAsync"),
-                    p.Optional<string>("namespaceFilter"),
-                    p.Optional<string>("accessibility"),
-                    p.OptionalStruct<bool>("isStatic"),
-                    p.Optional<string>("type"),
-                    p.Optional<string>("returnType"),
-                    p.OptionalStringArray("attributes"),
-                    p.OptionalStringArray("parameterIncludes"),
-                    p.OptionalStringArray("parameterExcludes"),
-                    p.OptionalStruct<int>("maxResults")),
-
-                "roslyn:get_diagnostics" => await _roslynService.GetDiagnosticsAsync(
-                    p.Optional<string>("filePath"),
-                    p.Optional<string>("projectPath"),
-                    p.Optional<string>("severity"),
-                    p.Optional("includeHidden", false),
-                    p.Optional("runAnalyzers", true)),
-
-                "roslyn:get_code_fixes" => await _roslynService.GetCodeFixesAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<string>("diagnosticId"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column")),
-
-                "roslyn:apply_code_fix" => await _roslynService.ApplyCodeFixAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<string>("diagnosticId"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.OptionalStruct<int>("fixIndex"),
-                    p.Optional("preview", true)),
-
-                "roslyn:get_project_structure" => await _roslynService.GetProjectStructureAsync(
-                    p.Optional("includeReferences", true),
-                    p.Optional("includeDocuments", false),
-                    p.Optional<string>("projectNamePattern"),
-                    p.OptionalStruct<int>("maxProjects"),
-                    p.Optional("summaryOnly", false)),
-
-                "roslyn:organize_usings" => await _roslynService.OrganizeUsingsAsync(
-                    p.Required<string>("filePath")),
-
-                "roslyn:organize_usings_batch" => await _roslynService.OrganizeUsingsBatchAsync(
-                    p.Optional<string>("projectName"),
-                    p.Optional<string>("filePattern"),
-                    p.Optional("preview", true)),
-
-                "roslyn:format_document_batch" => await _roslynService.FormatDocumentBatchAsync(
-                    p.Optional<string>("projectName"),
-                    p.Optional("includeTests", true),
-                    p.Optional("preview", true),
-                    p.Optional<string>("filePattern")),
-
-                "roslyn:get_method_overloads" => await _roslynService.GetMethodOverloadsAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column")),
-
-                "roslyn:get_containing_member" => await _roslynService.GetContainingMemberAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column")),
-
-                "roslyn:find_callers" => await _roslynService.FindCallersAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.OptionalStruct<int>("maxResults")),
-
-                "roslyn:find_unused_code" => await _roslynService.FindUnusedCodeAsync(
-                    p.Optional<string>("projectName"),
-                    p.Optional("includePrivate", true),
-                    p.Optional("includeInternal", false),
-                    p.Optional<string>("symbolKindFilter"),
-                    p.OptionalStruct<int>("maxResults")),
-
-                "roslyn:rename_symbol" => await _roslynService.RenameSymbolAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.Required<string>("newName"),
-                    p.Optional("preview", true),
-                    p.OptionalStruct<int>("maxFiles"),
-                    p.Optional<string>("verbosity")),
-
-                "roslyn:extract_interface" => await _roslynService.ExtractInterfaceAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.Required<string>("interfaceName"),
-                    p.OptionalStringArray("includeMemberNames")),
-
-                "roslyn:dependency_graph" => await _roslynService.GetDependencyGraphAsync(
-                    p.Optional<string>("format")),
-
-                // ============ NEW TOOLS: Name-Based Type Discovery ============
-
-                "roslyn:get_type_members" => await _roslynService.GetTypeMembersAsync(
-                    p.Required<string>("typeName"),
-                    p.Optional("includeInherited", false),
-                    p.Optional<string>("memberKind"),
-                    p.Optional("verbosity", "compact"),
-                    p.Optional("maxResults", 100)),
-
-                "roslyn:get_method_signature" => await _roslynService.GetMethodSignatureAsync(
-                    p.Required<string>("typeName"),
-                    p.Required<string>("methodName"),
-                    p.OptionalStruct<int>("overloadIndex")),
-
-                "roslyn:get_attributes" => await _roslynService.GetAttributesAsync(
-                    p.Required<string>("attributeName"),
-                    p.Optional<string>("scope"),
-                    p.Optional("parseGodotHints", true),
-                    p.Optional("maxResults", 100)),
-
-                "roslyn:get_derived_types" => await _roslynService.GetDerivedTypesAsync(
-                    p.Required<string>("baseTypeName"),
-                    p.Optional("includeTransitive", true),
-                    p.Optional("maxResults", 100)),
-
-                "roslyn:get_base_types" => await _roslynService.GetBaseTypesAsync(
-                    p.Required<string>("typeName")),
-
-                "roslyn:analyze_data_flow" => await _roslynService.AnalyzeDataFlowAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("startLine"),
-                    p.Required<int>("endLine")),
-
-                "roslyn:analyze_control_flow" => await _roslynService.AnalyzeControlFlowAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("startLine"),
-                    p.Required<int>("endLine")),
-
-                // ============ COMPOUND TOOLS ============
-
-                "roslyn:get_type_overview" => await _roslynService.GetTypeOverviewAsync(
-                    p.Required<string>("typeName")),
-
-                "roslyn:analyze_method" => await _roslynService.AnalyzeMethodAsync(
-                    p.Required<string>("typeName"),
-                    p.Required<string>("methodName"),
-                    p.Optional("includeCallers", true),
-                    p.Optional("includeOutgoingCalls", false),
-                    p.Optional("maxCallers", 20),
-                    p.Optional("maxOutgoingCalls", 50)),
-
-                "roslyn:get_file_overview" => await _roslynService.GetFileOverviewAsync(
-                    p.Required<string>("filePath")),
-
-                // Phase 2: AI-Focused Tools
-                "roslyn:get_missing_members" => await _roslynService.GetMissingMembersAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column")),
-
-                "roslyn:get_outgoing_calls" => await _roslynService.GetOutgoingCallsAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.OptionalStruct<int>("maxDepth")),
-
-                "roslyn:validate_code" => await _roslynService.ValidateCodeAsync(
-                    p.Required<string>("code"),
-                    p.Optional<string>("contextFilePath"),
-                    p.Optional("standalone", false)),
-
-                "roslyn:check_type_compatibility" => await _roslynService.CheckTypeCompatibilityAsync(
-                    p.Required<string>("sourceType"),
-                    p.Required<string>("targetType")),
-
-                "roslyn:get_instantiation_options" => await _roslynService.GetInstantiationOptionsAsync(
-                    p.Required<string>("typeName")),
-
-                "roslyn:analyze_change_impact" => await _roslynService.AnalyzeChangeImpactAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.Required<string>("changeType"),
-                    p.Optional<string>("newValue")),
-
-                "roslyn:get_method_source" => await _roslynService.GetMethodSourceAsync(
-                    p.Required<string>("typeName"),
-                    p.Required<string>("methodName"),
-                    p.OptionalStruct<int>("overloadIndex")),
-
-                "roslyn:get_method_source_batch" => await _roslynService.GetMethodSourceBatchAsync(
-                    ParseMethodBatchRequests(arguments?["methods"]),
-                    p.Optional("maxMethods", 20)),
-
-                "roslyn:generate_constructor" => await _roslynService.GenerateConstructorAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.Optional("includeProperties", false),
-                    p.Optional("initializeToDefault", false)),
-
-                "roslyn:change_signature" => await _roslynService.ChangeSignatureAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    ParseSignatureChanges(arguments?["changes"]),
-                    p.Optional("preview", true)),
-
-                "roslyn:extract_method" => await _roslynService.ExtractMethodAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("startLine"),
-                    p.Required<int>("endLine"),
-                    p.Required<string>("methodName"),
-                    p.Optional("accessibility", "private"),
-                    p.Optional("preview", true)),
-
-                "roslyn:get_code_actions_at_position" => await _roslynService.GetCodeActionsAtPositionAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.OptionalStruct<int>("endLine"),
-                    p.OptionalStruct<int>("endColumn"),
-                    p.Optional("includeCodeFixes", true),
-                    p.Optional("includeRefactorings", true)),
-
-                "roslyn:apply_code_action_by_title" => await _roslynService.ApplyCodeActionByTitleAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.Required<string>("title"),
-                    p.OptionalStruct<int>("endLine"),
-                    p.OptionalStruct<int>("endColumn"),
-                    p.Optional("preview", true)),
-
-                "roslyn:implement_missing_members" => await _roslynService.ImplementMissingMembersAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.Optional("preview", true)),
-
-                "roslyn:encapsulate_field" => await _roslynService.EncapsulateFieldAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.Optional("preview", true)),
-
-                "roslyn:inline_variable" => await _roslynService.InlineVariableAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.Optional("preview", true)),
-
-                "roslyn:extract_variable" => await _roslynService.ExtractVariableAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.OptionalStruct<int>("endLine"),
-                    p.OptionalStruct<int>("endColumn"),
-                    p.Optional("preview", true)),
-
-                "roslyn:get_complexity_metrics" => await _roslynService.GetComplexityMetricsAsync(
-                    p.Required<string>("filePath"),
-                    p.OptionalStruct<int>("line"),
-                    p.OptionalStruct<int>("column"),
-                    p.OptionalStringArray("metrics")),
-
-                "roslyn:add_null_checks" => await _roslynService.AddNullChecksAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.Optional("preview", true)),
-
-                "roslyn:generate_equality_members" => await _roslynService.GenerateEqualityMembersAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.Optional("includeOperators", true),
-                    p.Optional("preview", true)),
-
-                "roslyn:get_type_members_batch" => await _roslynService.GetTypeMembersBatchAsync(
-                    p.RequiredStringArray("typeNames"),
-                    p.Optional("includeInherited", false),
-                    p.Optional<string>("memberKind"),
-                    p.Optional("verbosity", "compact"),
-                    p.Optional("maxResultsPerType", 50)),
-
-                "roslyn:find_attribute_usages" => await _roslynService.FindAttributeUsagesAsync(
-                    p.Required<string>("attributeName"),
-                    p.Optional<string>("projectName"),
-                    p.Optional("maxResults", 100)),
-
-                "roslyn:get_di_registrations" => await _roslynService.GetDiRegistrationsAsync(
-                    p.Optional<string>("projectName")),
-
-                "roslyn:find_reflection_usage" => await _roslynService.FindReflectionUsageAsync(
-                    p.Optional<string>("projectName"),
-                    p.Optional("maxResults", 100)),
-
-                "roslyn:find_circular_dependencies" => await _roslynService.FindCircularDependenciesAsync(
-                    p.Optional<string>("level")),
-
-                "roslyn:get_nuget_dependencies" => await _roslynService.GetNuGetDependenciesAsync(
-                    p.Optional<string>("projectName")),
-
-                "roslyn:get_source_generators" => await _roslynService.GetSourceGeneratorsAsync(
-                    p.Optional<string>("projectName")),
-
-                "roslyn:get_generated_code" => await _roslynService.GetGeneratedCodeAsync(
-                    p.Required<string>("projectName"),
-                    p.Required<string>("generatedFileName")),
-
-                "roslyn:get_external_type_info" => await _roslynService.GetExternalTypeInfoAsync(
-                    p.Required<string>("typeName"),
-                    p.Optional<string>("assemblyName"),
-                    p.Optional("includeInherited", true),
-                    p.Optional("includeXmlDocs", true),
-                    p.Optional("maxMembers", 200)),
-
-                "roslyn:get_call_graph" => await _roslynService.GetCallGraphAsync(
-                    p.Required<string>("filePath"),
-                    p.Required<int>("line"),
-                    p.Required<int>("column"),
-                    p.Optional("direction", "callees"),
-                    p.Optional("maxDepth", 3),
-                    p.Optional("maxNodes", 100)),
-
-                "roslyn:find_untested_code" => await _roslynService.FindUntestedCodeAsync(
-                    p.Optional<string>("projectName"),
-                    p.Optional("includeProperties", true),
-                    p.Optional("includeInternal", false),
-                    p.Optional("maxResults", 50)),
-
-                "roslyn:find_god_objects" => await _roslynService.FindGodObjectsAsync(
-                    p.Optional<string>("projectName"),
-                    p.Optional("minEfferentCoupling", 20),
-                    p.Optional("minMembers", 20),
-                    p.Optional("maxResults", 20)),
-
-                "roslyn:get_project_health" => await _roslynService.GetProjectHealthAsync(
-                    p.Required<string>("projectName"),
-                    p.Optional("includeAnalyzers", true),
-                    p.Optional("topN", 5)),
-
-                _ => throw new JsonRpcInvalidParamsException($"Unknown tool: {name}")
-            };
-
-            // Wrap result in MCP content format
-            var mpcResult = new
-            {
-                content = new[]
-                {
-                    new
-                    {
-                        type = "text",
-                        text = JsonSerializer.Serialize(result, _jsonOptions)
-                    }
-                }
-            };
-
-            return CreateSuccessResponse(id, mpcResult);
+            // Check cancellation before the synchronous prelude / dispatch, so an
+            // already-cancelled budget surfaces as TIMEOUT deterministically rather than
+            // depending on the first Roslyn call to observe the token.
+            timeoutCts.Token.ThrowIfCancellationRequested();
+
+            var result = await ToolRegistry.DispatchAsync(name, p, _roslynService, timeoutCts.Token);
+
+            // A tool that RETURNS a {success:false} envelope (every CreateErrorResponse
+            // and every raw error object — not just the exception catches below) is a
+            // failed call. Surface it in-band with isError:true, matching
+            // CreateToolErrorResult, so the model reads it as an error rather than a
+            // successful result. Detected from the serialized envelope so it covers both
+            // the typed ToolErrorResponse and the raw anonymous {success:false} returns.
+            //
+            // An apply tool that introduced compile errors is the second isError trigger:
+            // it reports success:true / applied:true (the edit WAS applied — disclosed so
+            // the caller can revert) but lists the new errors in data.postApplyErrors. A
+            // client keying on isError must still see that broken state, so a non-empty
+            // postApplyErrors flips isError too (R4).
+            var resultNode = JsonSerializer.SerializeToNode(result, _jsonOptions);
+            // A present-but-non-bool (or absent) success is treated as NOT an error
+            // rather than throwing on GetValue<bool>() into the generic catch.
+            var isError = (resultNode?["success"] is JsonValue successValue
+                    && successValue.TryGetValue<bool>(out var success) && !success)
+                || resultNode?["data"]?["postApplyErrors"] is JsonArray { Count: > 0 };
+            // Reuse the node for the wire text instead of serializing `result` a second time.
+            var resultText = resultNode?.ToJsonString(_jsonOptions) ?? "null";
+            var content = new[] { new { type = "text", text = resultText } };
+
+            return CreateSuccessResponse(id, isError
+                ? (object)new { content, isError = true }
+                : new { content });
         }
         catch (JsonRpcInvalidParamsException ex)
         {
@@ -1966,16 +339,84 @@ Use get_source_generators first to discover available generated files.",
             await LogAsync("Debug", $"Invalid params: {ex.Message}");
             return CreateErrorResponse(id, -32602, ex.Message);
         }
+        catch (SolutionNotLoadedException)
+        {
+            // A caller-ordering mistake, not a server failure: surface the same
+            // structured envelope every tool error uses so the agent can recover
+            // (call load_solution) instead of seeing an opaque internal error.
+            var notLoaded = RoslynService.CreateSolutionNotLoadedResponse();
+            return CreateSuccessResponse(id, new
+            {
+                content = new[]
+                {
+                    new
+                    {
+                        type = "text",
+                        text = JsonSerializer.Serialize(notLoaded, _jsonOptions)
+                    }
+                },
+                // Match every other in-band tool error (CreateToolErrorResult): a
+                // {success:false} envelope is surfaced with isError so the model reads
+                // it as a failed call rather than a successful result.
+                isError = true
+            });
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
+            await LogAsync("Error", $"Tool call '{name}' timed out after {_toolCallTimeout.TotalSeconds:0}s");
+            return CreateToolErrorResult(id, ErrorCodes.Timeout,
+                $"Tool call '{name}' exceeded the {_toolCallTimeout.TotalSeconds:0}-second timeout",
+                hint: "Raise SHARPLENS_TIMEOUT_SECONDS, or narrow the request (single file or project, smaller maxResults).");
+        }
         catch (FileNotFoundException ex)
         {
             await LogAsync("Error", $"File not found: {ex.Message}");
-            return CreateErrorResponse(id, -32602, $"File not found: {ex.Message}");
+            return CreateToolErrorResult(id, ErrorCodes.FileNotFound,
+                $"File not found: {ex.Message}",
+                hint: "Check the file path; use get_project_structure to list known documents.");
         }
         catch (Exception ex)
         {
             await LogAsync("Error", $"Error executing tool: {ex}");
-            return CreateErrorResponse(id, -32603, $"Internal error: {ex.Message}");
+            // An exception escaping a tool handler is a TOOL failure, not a
+            // protocol failure: per MCP it belongs in-band as a CallToolResult
+            // with isError, where the model can read it and recover. JSON-RPC
+            // errors (-32602/-32601/-32700) stay reserved for protocol-level
+            // problems like malformed requests and unknown methods.
+            return CreateToolErrorResult(id, ErrorCodes.InternalError,
+                $"Unhandled error executing tool: {ex.Message}",
+                hint: "This is a server-side failure. Retry once; if it persists, adjust the arguments or report the message.");
         }
+    }
+
+    // Wraps a structured tool-error envelope as an in-band CallToolResult with
+    // isError set, mirroring the {success:false, error:{...}} shape every
+    // tool-level error already uses.
+    private object CreateToolErrorResult(RequestId? id, string code, string message, string? hint = null)
+    {
+        var envelope = new
+        {
+            success = false,
+            error = new RoslynError
+            {
+                Code = code,
+                Message = message,
+                Hint = hint
+            }
+        };
+
+        return CreateSuccessResponse(id, new
+        {
+            content = new[]
+            {
+                new
+                {
+                    type = "text",
+                    text = JsonSerializer.Serialize(envelope, _jsonOptions)
+                }
+            },
+            isError = true
+        });
     }
 
     private object CreateSuccessResponse(RequestId? id, object result)
@@ -2002,59 +443,6 @@ Use get_source_generators first to discover available generated files.",
         };
     }
 
-    private List<SignatureChange> ParseSignatureChanges(JsonNode? changesNode)
-    {
-        var changes = new List<SignatureChange>();
-        if (changesNode is JsonArray array)
-        {
-            foreach (var item in array)
-            {
-                if (item is JsonObject obj)
-                {
-                    var change = new SignatureChange
-                    {
-                        Action = obj["action"]?.GetValue<string>() ?? "",
-                        Name = obj["name"]?.GetValue<string>(),
-                        Type = obj["type"]?.GetValue<string>(),
-                        NewName = obj["newName"]?.GetValue<string>(),
-                        DefaultValue = obj["defaultValue"]?.GetValue<string>(),
-                        Position = obj["position"]?.GetValue<int>()
-                    };
-
-                    if (obj["order"] is JsonArray orderArray)
-                    {
-                        change.Order = orderArray.Select(o => o?.GetValue<string>() ?? "").ToList();
-                    }
-
-                    changes.Add(change);
-                }
-            }
-        }
-        return changes;
-    }
-
-    private List<Dictionary<string, object>> ParseMethodBatchRequests(JsonNode? methodsNode)
-    {
-        var methods = new List<Dictionary<string, object>>();
-        if (methodsNode is JsonArray array)
-        {
-            foreach (var item in array)
-            {
-                if (item is JsonObject obj)
-                {
-                    var method = new Dictionary<string, object>();
-                    if (obj["typeName"] != null)
-                        method["typeName"] = obj["typeName"]!.GetValue<string>();
-                    if (obj["methodName"] != null)
-                        method["methodName"] = obj["methodName"]!.GetValue<string>();
-                    if (obj["overloadIndex"] != null)
-                        method["overloadIndex"] = obj["overloadIndex"]!.GetValue<int>();
-                    methods.Add(method);
-                }
-            }
-        }
-        return methods;
-    }
 
     private async Task LogAsync(string level, string message)
     {
@@ -2064,10 +452,19 @@ Use get_source_generators first to discover available generated files.",
         }
     }
 
-    private bool ShouldLog(string messageLevel)
+    private bool ShouldLog(string messageLevel) => ShouldLog(messageLevel, _logLevel);
+
+    // Pure level comparison, internal for unit tests. An unrecognized configured
+    // level falls back to Information — Array.IndexOf's -1 used to make any typo
+    // (or the then-missing "Trace") log everything.
+    internal static bool ShouldLog(string messageLevel, string configuredLevel)
     {
         var messageIndex = Array.IndexOf(LogLevels, messageLevel);
-        var configuredIndex = Array.IndexOf(LogLevels, _logLevel);
+        var configuredIndex = Array.IndexOf(LogLevels, configuredLevel);
+        if (configuredIndex < 0)
+        {
+            configuredIndex = Array.IndexOf(LogLevels, "Information");
+        }
         return messageIndex >= configuredIndex;
     }
 }

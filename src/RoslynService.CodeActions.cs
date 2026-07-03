@@ -20,48 +20,29 @@ public partial class RoslynService
         int? endLine = null,
         int? endColumn = null,
         bool includeCodeFixes = true,
-        bool includeRefactorings = true)
+        bool includeRefactorings = true,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
+        var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
+        if (pos == null) return posError!;
 
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var startPosition = GetPosition(syntaxTree, line, column);
         int? endPosition = null;
         if (endLine.HasValue && endColumn.HasValue)
         {
-            endPosition = GetPosition(syntaxTree, endLine.Value, endColumn.Value);
+            var (endPos, endError) = await ResolvePositionAsync(filePath, endLine.Value, endColumn.Value, cancellationToken);
+            if (endPos == null) return endError!;
+            endPosition = endPos.Position;
         }
 
         var allActions = await GetAllCodeActionsAtPositionAsync(
-            document,
-            startPosition,
+            pos.Document,
+            pos.Position,
             endPosition,
             includeCodeFixes,
-            includeRefactorings);
+            includeRefactorings,
+            cancellationToken);
 
         if (allActions.Count == 0)
         {
@@ -124,58 +105,59 @@ public partial class RoslynService
         string title,
         int? endLine = null,
         int? endColumn = null,
-        bool preview = true)
+        bool preview = true,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
+        var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
+        if (pos == null) return posError!;
+        var document = pos.Document;
 
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var startPosition = GetPosition(syntaxTree, line, column);
         int? endPosition = null;
         if (endLine.HasValue && endColumn.HasValue)
         {
-            endPosition = GetPosition(syntaxTree, endLine.Value, endColumn.Value);
+            var (endPos, endError) = await ResolvePositionAsync(filePath, endLine.Value, endColumn.Value, cancellationToken);
+            if (endPos == null) return endError!;
+            endPosition = endPos.Position;
         }
 
         var allActions = await GetAllCodeActionsAtPositionAsync(
             document,
-            startPosition,
+            pos.Position,
             endPosition,
             includeCodeFixes: true,
-            includeRefactorings: true);
+            includeRefactorings: true,
+            cancellationToken);
 
-        // Find action by title (case-insensitive)
+        // Find action by title (case-insensitive): exact first; a partial match is
+        // accepted only when it identifies ONE distinct title. Applying the first of
+        // several partial matches would pick an arbitrary action — and with
+        // preview:false write it to disk.
         var matchingAction = allActions.FirstOrDefault(a =>
             a.action.Title.Equals(title, StringComparison.OrdinalIgnoreCase));
 
         if (matchingAction.action == null)
         {
-            // Try partial match
-            matchingAction = allActions.FirstOrDefault(a =>
-                a.action.Title.Contains(title, StringComparison.OrdinalIgnoreCase));
+            var partialMatches = allActions
+                .Where(a => a.action.Title.Contains(title, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            var candidateTitles = partialMatches
+                .Select(a => a.action.Title)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (candidateTitles.Count > 1)
+            {
+                return CreateErrorResponse(
+                    ErrorCodes.AmbiguousMatch,
+                    $"Title '{title}' partially matches {candidateTitles.Count} different code actions",
+                    hint: "Repeat the call with one of the candidate titles verbatim.",
+                    context: new { title, candidates = candidateTitles.Take(10).ToList() }
+                );
+            }
+
+            matchingAction = partialMatches.FirstOrDefault();
         }
 
         if (matchingAction.action == null)
@@ -200,22 +182,21 @@ public partial class RoslynService
 
         // Roslyn surfaces some refactorings as CodeActionWithNestedActions — a menu
         // wrapper with no operations of its own. Calling GetOperationsAsync on one
-        // throws NotSupportedException. Descend into NestedCodeActions and pick the
-        // first leaf action whose title still matches the caller's request (so a
-        // request for "Introduce local" doesn't accidentally apply "Introduce constant").
-        // NestedCodeActions is internal in Roslyn 5.0; reach it via reflection.
-        while (true)
+        // throws NotSupportedException, so descend into NestedCodeActions to a leaf.
+        var (leaf, ambiguousCandidates) = ResolveLeafAction(selectedAction, title);
+        if (leaf == null)
         {
-            var nested = GetNestedActionsOrEmpty(selectedAction);
-            if (nested.Length == 0) break;
-            var leaf = nested.FirstOrDefault(child =>
-                child.Title.Contains(title, StringComparison.OrdinalIgnoreCase))
-                ?? nested[0];
-            selectedAction = leaf;
+            return CreateErrorResponse(
+                ErrorCodes.AmbiguousMatch,
+                $"'{title}' resolves to a menu of actions; no single leaf matches that title",
+                hint: "Repeat the call with one of the listed sub-action titles verbatim.",
+                context: new { title, candidates = ambiguousCandidates!.Take(10).ToList() }
+            );
         }
+        selectedAction = leaf;
 
         // Apply the code action
-        var operations = await selectedAction.GetOperationsAsync(CancellationToken.None);
+        var operations = await selectedAction.GetOperationsAsync(cancellationToken);
         var changedSolution = _solution;
 
         foreach (var operation in operations)
@@ -237,107 +218,66 @@ public partial class RoslynService
             );
         }
 
-        // Collect all changed documents (reuse pattern from ApplyCodeFixAsync)
-        var changedDocuments = new List<object>();
-        var solutionChanges = changedSolution.GetChanges(_solution!);
-
-        foreach (var projectChanges in solutionChanges.GetProjectChanges())
+        if (preview)
         {
-            // Added documents
-            foreach (var addedDocId in projectChanges.GetAddedDocuments())
-            {
-                var addedDoc = changedSolution.GetDocument(addedDocId);
-                if (addedDoc == null) continue;
-
-                var text = await addedDoc.GetTextAsync();
-                changedDocuments.Add(new
+            var changedDocuments = await BuildPreviewChangeDetailsAsync(changedSolution, cancellationToken);
+            return CreateSuccessResponse(
+                data: new
                 {
-                    filePath = FormatPath(addedDoc.FilePath) ?? $"NewFile_{addedDoc.Name}",
-                    fileName = addedDoc.Name,
-                    isNewFile = true,
-                    newText = preview ? text.ToString() : null,
-                    changeType = "Added"
-                });
-
-                if (!preview && addedDoc.FilePath != null)
-                {
-                    await File.WriteAllTextAsync(addedDoc.FilePath, text.ToString());
-                }
-            }
-
-            // Changed documents
-            foreach (var changedDocId in projectChanges.GetChangedDocuments())
-            {
-                var oldDoc = _solution!.GetDocument(changedDocId);
-                var newDoc = changedSolution.GetDocument(changedDocId);
-                if (oldDoc == null || newDoc == null) continue;
-
-                var oldText = await oldDoc.GetTextAsync();
-                var newText = await newDoc.GetTextAsync();
-                var changes = newText.GetTextChanges(oldText).ToList();
-
-                changedDocuments.Add(new
-                {
-                    filePath = FormatPath(newDoc.FilePath),
-                    fileName = newDoc.Name,
-                    isNewFile = false,
-                    changeCount = changes.Count,
-                    newText = preview ? newText.ToString() : null,
-                    changes = preview ? changes.Select(c => new
-                    {
-                        span = new { start = c.Span.Start, end = c.Span.End, length = c.Span.Length },
-                        oldText = oldText.ToString(c.Span),
-                        newText = c.NewText
-                    }).ToList() : null,
-                    changeType = "Modified"
-                });
-
-                if (!preview && newDoc.FilePath != null)
-                {
-                    await File.WriteAllTextAsync(newDoc.FilePath, newText.ToString());
-                    _solution = changedSolution;
-                }
-            }
-
-            // Removed documents
-            foreach (var removedDocId in projectChanges.GetRemovedDocuments())
-            {
-                var removedDoc = _solution!.GetDocument(removedDocId);
-                if (removedDoc == null) continue;
-
-                changedDocuments.Add(new
-                {
-                    filePath = FormatPath(removedDoc.FilePath),
-                    fileName = removedDoc.Name,
-                    isNewFile = false,
-                    changeType = "Removed"
-                });
-
-                if (!preview && removedDoc.FilePath != null && File.Exists(removedDoc.FilePath))
-                {
-                    File.Delete(removedDoc.FilePath);
-                }
-            }
+                    applied = false,
+                    actionTitle = selectedAction.Title,
+                    actionKind = matchingAction.kind,
+                    changedFiles = changedDocuments,
+                    preview = true
+                },
+                suggestedNextTools: new[] { "apply_code_action_by_title with preview=false to apply changes to disk" },
+                totalCount: changedDocuments.Count,
+                returnedCount: changedDocuments.Count
+            );
         }
+
+        var (ok, applyError, applyReport, introducedErrors) = await ApplyAndReportAsync(changedSolution, cancellationToken);
+        if (!ok) return applyError!;
 
         return CreateSuccessResponse(
             data: new
             {
-                applied = !preview,
+                applied = true,
                 actionTitle = selectedAction.Title,
                 actionKind = matchingAction.kind,
-                changedFiles = changedDocuments,
-                preview
+                changedFiles = FormatAppliedChanges(applyReport),
+                preview = false,
+                postApplyErrors = introducedErrors.Count > 0 ? introducedErrors : null
             },
-            suggestedNextTools: preview
-                ? new[] { $"apply_code_action_by_title with preview=false to apply changes to disk" }
-                : new[] { "get_diagnostics to verify the action resolved any issues" },
-            totalCount: changedDocuments.Count,
-            returnedCount: changedDocuments.Count
+            suggestedNextTools: new[] { "get_diagnostics to verify the action resolved any issues" },
+            totalCount: applyReport.Count,
+            returnedCount: applyReport.Count
         );
     }
 
 
+
+    // Tries each candidate title until one applies. A title that simply isn't
+    // offered (SYMBOL_NOT_FOUND) or matches several actions (AMBIGUOUS_MATCH) is
+    // skipped to the next candidate; any OTHER error means a title WAS selected
+    // but applying it failed — that is surfaced distinctly instead of being masked
+    // as the generic "no action found at this position".
+    private async Task<object> ApplyFirstMatchingActionAsync(
+        IEnumerable<string> titles, Func<string, Task<object>> apply, object notFound)
+    {
+        object? applyFailure = null;
+        foreach (var title in titles)
+        {
+            var result = await apply(title);
+            if (IsSuccessResponse(result)) return result;
+            var code = GetResponseErrorCode(result);
+            if (code is not (ErrorCodes.SymbolNotFound or ErrorCodes.AmbiguousMatch))
+            {
+                applyFailure ??= result;
+            }
+        }
+        return applyFailure ?? notFound;
+    }
 
     /// <summary>
     /// Implement missing interface/abstract members.
@@ -346,14 +286,16 @@ public partial class RoslynService
         string filePath,
         int line,
         int column,
-        bool preview = true)
+        bool preview = true,
+        CancellationToken cancellationToken = default)
     {
         // This is a convenience wrapper around apply_code_action_by_title
         // Looking for actions like "Implement interface", "Implement abstract class"
         var actionsResult = await GetCodeActionsAtPositionAsync(
             filePath, line, column,
             includeCodeFixes: true,
-            includeRefactorings: true);
+            includeRefactorings: true,
+            cancellationToken: cancellationToken);
 
         // Check if we got actions
         if (!IsSuccessResponse(actionsResult))
@@ -371,24 +313,14 @@ public partial class RoslynService
             "Implement missing members"
         };
 
-        foreach (var title in implementTitles)
-        {
-            var result = await ApplyCodeActionByTitleAsync(
-                filePath, line, column, title,
-                preview: preview);
-
-            if (IsSuccessResponse(result))
-            {
-                return result;
-            }
-        }
-
-        return CreateErrorResponse(
-            ErrorCodes.SymbolNotFound,
-            "No 'implement members' action found at this position",
-            hint: "Position cursor on a class that implements an interface or extends an abstract class",
-            context: new { filePath, line, column }
-        );
+        return await ApplyFirstMatchingActionAsync(
+            implementTitles,
+            t => ApplyCodeActionByTitleAsync(filePath, line, column, t, preview: preview, cancellationToken: cancellationToken),
+            CreateErrorResponse(
+                ErrorCodes.SymbolNotFound,
+                "No 'implement members' action found at this position",
+                hint: "Position cursor on a class that implements an interface or extends an abstract class",
+                context: new { filePath, line, column }));
     }
 
     /// <summary>
@@ -398,34 +330,28 @@ public partial class RoslynService
         string filePath,
         int line,
         int column,
-        bool preview = true)
+        bool preview = true,
+        CancellationToken cancellationToken = default)
     {
-        // Look for encapsulate field actions
+        // Roslyn titles the two variants "Encapsulate field: 'X' (and use property)"
+        // and "Encapsulate field: 'X' (but still use field)", so a bare
+        // "Encapsulate field" probe matches both and is ambiguous. Probe the
+        // preferred property variant by its unique suffix first; the generic probe
+        // still resolves offerings with a single variant.
         var encapsulateTitles = new[]
         {
-            "Encapsulate field",
-            "Encapsulate field (and use property)",
-            "Encapsulate field (but still use field)"
+            "(and use property)",
+            "Encapsulate field"
         };
 
-        foreach (var title in encapsulateTitles)
-        {
-            var result = await ApplyCodeActionByTitleAsync(
-                filePath, line, column, title,
-                preview: preview);
-
-            if (IsSuccessResponse(result))
-            {
-                return result;
-            }
-        }
-
-        return CreateErrorResponse(
-            ErrorCodes.SymbolNotFound,
-            "No 'encapsulate field' action found at this position",
-            hint: "Position cursor on a field declaration",
-            context: new { filePath, line, column }
-        );
+        return await ApplyFirstMatchingActionAsync(
+            encapsulateTitles,
+            t => ApplyCodeActionByTitleAsync(filePath, line, column, t, preview: preview, cancellationToken: cancellationToken),
+            CreateErrorResponse(
+                ErrorCodes.SymbolNotFound,
+                "No 'encapsulate field' action found at this position",
+                hint: "Position cursor on a field declaration",
+                context: new { filePath, line, column }));
     }
 
     /// <summary>
@@ -435,43 +361,25 @@ public partial class RoslynService
         string filePath,
         int line,
         int column,
-        bool preview = true)
+        bool preview = true,
+        CancellationToken cancellationToken = default)
     {
         var inlineTitles = new[]
         {
             "Inline variable",
             "Inline temporary variable",
-            "Inline 'temp'"
+            "Inline 'temp'",
+            "Inline" // broadest partial probe, tried last
         };
 
-        foreach (var title in inlineTitles)
-        {
-            var result = await ApplyCodeActionByTitleAsync(
-                filePath, line, column, title,
-                preview: preview);
-
-            if (IsSuccessResponse(result))
-            {
-                return result;
-            }
-        }
-
-        // Try partial match with "Inline"
-        var inlineResult = await ApplyCodeActionByTitleAsync(
-            filePath, line, column, "Inline",
-            preview: preview);
-
-        if (IsSuccessResponse(inlineResult))
-        {
-            return inlineResult;
-        }
-
-        return CreateErrorResponse(
-            ErrorCodes.SymbolNotFound,
-            "No 'inline variable' action found at this position",
-            hint: "Position cursor on a variable that can be inlined",
-            context: new { filePath, line, column }
-        );
+        return await ApplyFirstMatchingActionAsync(
+            inlineTitles,
+            t => ApplyCodeActionByTitleAsync(filePath, line, column, t, preview: preview, cancellationToken: cancellationToken),
+            CreateErrorResponse(
+                ErrorCodes.SymbolNotFound,
+                "No 'inline variable' action found at this position",
+                hint: "Position cursor on a variable that can be inlined",
+                context: new { filePath, line, column }));
     }
 
     /// <summary>
@@ -483,46 +391,26 @@ public partial class RoslynService
         int column,
         int? endLine = null,
         int? endColumn = null,
-        bool preview = true)
+        bool preview = true,
+        CancellationToken cancellationToken = default)
     {
         var extractTitles = new[]
         {
             "Introduce local",
             "Extract local variable",
             "Introduce variable for",
-            "Extract variable"
+            "Extract variable",
+            "Introduce" // broadest partial probe, tried last
         };
 
-        foreach (var title in extractTitles)
-        {
-            var result = await ApplyCodeActionByTitleAsync(
-                filePath, line, column, title,
-                endLine, endColumn,
-                preview: preview);
-
-            if (IsSuccessResponse(result))
-            {
-                return result;
-            }
-        }
-
-        // Try partial match
-        var extractResult = await ApplyCodeActionByTitleAsync(
-            filePath, line, column, "Introduce",
-            endLine, endColumn,
-            preview: preview);
-
-        if (IsSuccessResponse(extractResult))
-        {
-            return extractResult;
-        }
-
-        return CreateErrorResponse(
-            ErrorCodes.SymbolNotFound,
-            "No 'extract variable' action found at this position",
-            hint: "Select an expression to extract",
-            context: new { filePath, line, column, endLine, endColumn }
-        );
+        return await ApplyFirstMatchingActionAsync(
+            extractTitles,
+            t => ApplyCodeActionByTitleAsync(filePath, line, column, t, endLine, endColumn, preview: preview, cancellationToken: cancellationToken),
+            CreateErrorResponse(
+                ErrorCodes.SymbolNotFound,
+                "No 'extract variable' action found at this position",
+                hint: "Select an expression to extract",
+                context: new { filePath, line, column, endLine, endColumn }));
     }
 
     // Reach Roslyn's internal CodeAction.NestedCodeActions via reflection. The property
@@ -543,5 +431,28 @@ public partial class RoslynService
         return value is System.Collections.Immutable.ImmutableArray<CodeAction> arr
             ? arr
             : System.Collections.Immutable.ImmutableArray<CodeAction>.Empty;
+    }
+
+    // Descends a (possibly nested) code action to the leaf the caller's title
+    // selects. A one-child menu unwraps; in a multi-child menu the first child whose
+    // title matches the request is taken (Roslyn lists the most-relevant variant
+    // first). When no child matches, returns no leaf and the child titles so the
+    // caller can choose.
+    internal static (CodeAction? leaf, IReadOnlyList<string>? candidates) ResolveLeafAction(
+        CodeAction action, string title)
+    {
+        var selected = action;
+        for (var depth = 0; depth < 32; depth++)
+        {
+            var nested = GetNestedActionsOrEmpty(selected);
+            if (nested.Length == 0) return (selected, null);
+            if (nested.Length == 1) { selected = nested[0]; continue; }
+
+            var match = nested.FirstOrDefault(child =>
+                child.Title.Contains(title, StringComparison.OrdinalIgnoreCase));
+            if (match == null) return (null, nested.Select(n => n.Title).ToList());
+            selected = match;
+        }
+        return (selected, null);
     }
 }

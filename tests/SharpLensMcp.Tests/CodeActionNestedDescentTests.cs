@@ -58,6 +58,43 @@ public class CodeActionNestedDescentTests
     }
 
     [Fact]
+    public void ResolveLeaf_PicksTheFirstChildMatchingTheTitle()
+    {
+        var wanted = new LeafAction("Introduce local for 'x'");
+        var other = new LeafAction("Introduce constant for 'x'");
+        var menu = new MenuAction("Introduce...", ImmutableArray.Create<CodeAction>(other, wanted));
+
+        var (leaf, candidates) = RoslynService.ResolveLeafAction(menu, "Introduce local");
+        leaf.Should().BeSameAs(wanted, "the first child whose title contains the request is chosen");
+        candidates.Should().BeNull();
+    }
+
+    [Fact]
+    public void ResolveLeaf_ReturnsAmbiguous_WhenNoChildMatchesTheTitle()
+    {
+        var a = new LeafAction("Align argument list");
+        var b = new LeafAction("Indent all arguments");
+        var menu = new MenuAction("Wrap...", ImmutableArray.Create<CodeAction>(a, b));
+
+        // No child contains the request title — the old code applied nested[0]
+        // silently; now the caller is asked to choose among the children.
+        var (leaf, candidates) = RoslynService.ResolveLeafAction(menu, "Wrap expression");
+        leaf.Should().BeNull("no leaf matches, so no action may be applied silently");
+        candidates.Should().BeEquivalentTo(new[] { "Align argument list", "Indent all arguments" });
+    }
+
+    [Fact]
+    public void ResolveLeaf_UnwrapsSingleChildMenu_RegardlessOfTitle()
+    {
+        var leaf = new LeafAction("Wrap and align argument list");
+        var menu = new MenuAction("Wrap...", ImmutableArray.Create<CodeAction>(leaf));
+
+        var (resolved, candidates) = RoslynService.ResolveLeafAction(menu, "totally different");
+        resolved.Should().BeSameAs(leaf, "a one-child menu is just a wrapper and unwraps unconditionally");
+        candidates.Should().BeNull();
+    }
+
+    [Fact]
     public void Descends_AcrossMultipleLevelsOfNesting()
     {
         // The production loop is `while (true) { nested = ...; if empty break; pick leaf }`.

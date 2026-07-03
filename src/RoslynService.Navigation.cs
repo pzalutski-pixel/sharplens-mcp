@@ -8,78 +8,13 @@ namespace SharpLensMcp;
 
 public partial class RoslynService
 {
-    public async Task<object> GetSymbolInfoAsync(string filePath, int line, int column)
+    public async Task<object> GetSymbolInfoAsync(
+        string filePath, int line, int column, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
-
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                hint: "Check for syntax errors with get_diagnostics",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var position = GetPosition(syntaxTree, line, column);
-        var token = syntaxTree.GetRoot().FindToken(position);
-        var node = token.Parent;
-
-        if (node == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Try adjusting the line/column or use search_symbols to find symbols by name",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var symbolInfo = semanticModel.GetSymbolInfo(node);
-        var symbol = symbolInfo.Symbol;
-
-        if (symbol == null)
-        {
-            // Try getting the declared symbol if we're on a declaration
-            symbol = semanticModel.GetDeclaredSymbol(node);
-        }
-
-        if (symbol == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Try adjusting the line/column or use search_symbols to find symbols by name",
-                context: new { filePath, line, column }
-            );
-        }
+        var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
+        if (symbol == null) return error!;
 
         var symbolData = await FormatSymbolInfoAsync(symbol);
 
@@ -94,102 +29,58 @@ public partial class RoslynService
         );
     }
 
-    public async Task<object> FindReferencesAsync(string filePath, int line, int column, int? maxResults = null, string? kindFilter = null)
+    public async Task<object> FindReferencesAsync(
+        string filePath, int line, int column, int? maxResults = null, string? kindFilter = null,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
         var maxResultsToReturn = maxResults ?? 100;
         var filterKind = string.IsNullOrWhiteSpace(kindFilter) ? null : kindFilter!.ToLowerInvariant();
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
+        var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
+        if (symbol == null) return error!;
 
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                hint: "Check for syntax errors with get_diagnostics",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var position = GetPosition(syntaxTree, line, column);
-        var token = syntaxTree.GetRoot().FindToken(position);
-        var node = token.Parent;
-
-        if (node == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Try adjusting the line/column or use search_symbols to find symbols by name",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var symbolInfo = semanticModel.GetSymbolInfo(node);
-        var symbol = symbolInfo.Symbol ?? semanticModel.GetDeclaredSymbol(node);
-
-        if (symbol == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Try adjusting the line/column or use search_symbols to find symbols by name",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var references = await SymbolFinder.FindReferencesAsync(symbol, _solution!);
+        var references = await SymbolFinder.FindReferencesAsync(symbol, _solution!, cancellationToken);
         var allLocations = references
             .SelectMany(r => r.Locations)
             .Where(loc => loc.Location.IsInSource)
             .ToList();
 
-        var totalReferences = allLocations.Count;
+        // The generated scan is authoritative for references inside generator output:
+        // SymbolFinder now also returns them (the workspace compilation carries generated
+        // trees), so the SymbolFinder loop is deduped against the scan by (file, line,
+        // column) and the scan supplies the flagged entries — each generated reference once.
+        var generatedHits = await ScanGeneratedReferencesAsync(symbol, cancellationToken);
+        var generatedSites = new HashSet<(string?, int, int)>(
+            generatedHits.Select(h => ((string?)h.HintPath, h.Line, h.Column)));
+
+        var totalReferences = 0;
         var totalAfterFilter = 0;
         var referenceList = new List<object>();
 
         foreach (var loc in allLocations)
         {
-            var refDocument = _solution!.GetDocument(loc.Document.Id);
-            if (refDocument == null) continue;
-
-            var refTree = await refDocument.GetSyntaxTreeAsync();
+            var refTree = loc.Location.SourceTree;
             if (refTree == null) continue;
 
             var refSpan = loc.Location.SourceSpan;
-            var lineSpan = refTree.GetLineSpan(refSpan);
-            var text = refTree.GetText();
+            var lineSpan = refTree.GetLineSpan(refSpan, cancellationToken);
+            if (generatedSites.Contains((refTree.FilePath,
+                lineSpan.StartLinePosition.Line, lineSpan.StartLinePosition.Character)))
+                continue;
+
+            var refDocument = _solution!.GetDocument(loc.Document.Id);
+            if (refDocument == null) continue;
+
+            var text = refTree.GetText(cancellationToken);
             var lineText = text.Lines[lineSpan.StartLinePosition.Line].ToString().Trim();
 
-            var refRoot = await refTree.GetRootAsync();
+            var refRoot = await refTree.GetRootAsync(cancellationToken);
             var refNode = refRoot.FindNode(refSpan);
-            var kind = ClassifyReferenceKind(loc, refNode);
+            var kind = ClassifyReferenceKind(refNode);
+
+            totalReferences++;
 
             // Apply kind filter (case-insensitive); count distinct filtered-but-not-paginated total.
             if (filterKind != null && !string.Equals(kind, filterKind, StringComparison.OrdinalIgnoreCase))
@@ -206,6 +97,25 @@ public partial class RoslynService
                 column = lineSpan.StartLinePosition.Character,
                 lineText,
                 kind
+            });
+        }
+
+        // References inside generator output, surfaced once (deduped against above).
+        foreach (var hit in generatedHits)
+        {
+            totalReferences++;
+            if (filterKind != null && !string.Equals(hit.Kind, filterKind, StringComparison.OrdinalIgnoreCase))
+                continue;
+            totalAfterFilter++;
+            if (referenceList.Count >= maxResultsToReturn) continue;
+            referenceList.Add(new
+            {
+                filePath = FormatPath(hit.HintPath),
+                line = hit.Line,
+                column = hit.Column,
+                lineText = hit.LineText,
+                kind = hit.Kind,
+                inGeneratedCode = true
             });
         }
 
@@ -242,72 +152,13 @@ public partial class RoslynService
         );
     }
 
-    public async Task<object> GoToDefinitionAsync(string filePath, int line, int column)
+    public async Task<object> GoToDefinitionAsync(
+        string filePath, int line, int column, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
-
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                hint: "Check for syntax errors with get_diagnostics",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var position = GetPosition(syntaxTree, line, column);
-        var token = syntaxTree.GetRoot().FindToken(position);
-        var node = token.Parent;
-
-        if (node == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Ensure cursor is on a symbol name (class, method, variable, etc.)",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var symbolInfo = semanticModel.GetSymbolInfo(node);
-        var symbol = symbolInfo.Symbol ?? semanticModel.GetDeclaredSymbol(node);
-
-        if (symbol == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Position may be on whitespace or non-symbol token. Try positioning on an identifier.",
-                context: new { filePath, line, column, tokenText = token.Text, nodeKind = node.Kind().ToString() }
-            );
-        }
+        var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
+        if (symbol == null) return error!;
 
         var definitionLocation = symbol.Locations.FirstOrDefault(loc => loc.IsInSource);
 
@@ -352,74 +203,16 @@ public partial class RoslynService
         );
     }
 
-    public async Task<object> FindImplementationsAsync(string filePath, int line, int column, int? maxResults = null)
+    public async Task<object> FindImplementationsAsync(
+        string filePath, int line, int column, int? maxResults = null,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
         var maxResultsToReturn = maxResults ?? 50;
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
-
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                hint: "Check for syntax errors with get_diagnostics",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var position = GetPosition(syntaxTree, line, column);
-        var token = syntaxTree.GetRoot().FindToken(position);
-        var node = token.Parent;
-
-        if (node == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Try adjusting the line/column or use search_symbols to find symbols by name",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var symbolInfo = semanticModel.GetSymbolInfo(node);
-        var symbol = symbolInfo.Symbol ?? semanticModel.GetDeclaredSymbol(node);
-
-        if (symbol == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Try adjusting the line/column or use search_symbols to find symbols by name",
-                context: new { filePath, line, column }
-            );
-        }
+        var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
+        if (symbol == null) return error!;
 
         if (symbol is not INamedTypeSymbol typeSymbol)
         {
@@ -431,9 +224,16 @@ public partial class RoslynService
             );
         }
 
-        var implementations = await SymbolFinder.FindImplementationsAsync(typeSymbol, _solution!);
+        var implementations = await SymbolFinder.FindImplementationsAsync(
+            typeSymbol, _solution!, cancellationToken: cancellationToken);
         var allImplementations = implementations.ToList();
         var totalImplementations = allImplementations.Count;
+
+        // The generated scan is authoritative for implementers declared in generator output.
+        // SymbolFinder now also returns them, so flag the SymbolFinder entry whose name the
+        // scan reports as generated; the scan then only adds implementers SymbolFinder missed.
+        var generatedImpls = await ScanGeneratedImplementationsAsync(typeSymbol, cancellationToken);
+        var generatedImplNames = new HashSet<string>(generatedImpls.Select(h => h.Name), StringComparer.Ordinal);
 
         var implementationList = new List<object>();
         foreach (var impl in allImplementations)
@@ -455,12 +255,43 @@ public partial class RoslynService
                 })
                 .ToList();
 
+            // Flag a SymbolFinder implementer the scan reports as generated, matching
+            // find_references/find_callers; the scan below then adds only the rest.
+            if (generatedImplNames.Contains(impl.ToDisplayString()))
+                implementationList.Add(new
+                {
+                    name = impl.ToDisplayString(),
+                    kind = GetTypeKindString(impl),
+                    containingNamespace = impl.ContainingNamespace?.ToDisplayString(),
+                    locations,
+                    inGeneratedCode = true
+                });
+            else
+                implementationList.Add(new
+                {
+                    name = impl.ToDisplayString(),
+                    kind = GetTypeKindString(impl),
+                    containingNamespace = impl.ContainingNamespace?.ToDisplayString(),
+                    locations
+                });
+        }
+
+        // Implementers declared in generator output that SymbolFinder did NOT return,
+        // deduped by name against the SymbolFinder results above.
+        var seenImplementations = new HashSet<string>(
+            allImplementations.Select(i => i.ToDisplayString()), StringComparer.Ordinal);
+        foreach (var hit in generatedImpls)
+        {
+            if (!seenImplementations.Add(hit.Name)) continue;
+            totalImplementations++;
+            if (implementationList.Count >= maxResultsToReturn) continue;
             implementationList.Add(new
             {
-                name = impl.ToDisplayString(),
-                kind = GetTypeKindString(impl),
-                containingNamespace = impl.ContainingNamespace?.ToDisplayString(),
-                locations
+                name = hit.Name,
+                kind = hit.Kind,
+                containingNamespace = hit.ContainingNamespace,
+                locations = new[] { new { filePath = FormatPath(hit.HintPath), line = hit.Line, column = hit.Column } }.Cast<object>().ToList(),
+                inGeneratedCode = true
             });
         }
 
@@ -481,74 +312,16 @@ public partial class RoslynService
         );
     }
 
-    public async Task<object> GetTypeHierarchyAsync(string filePath, int line, int column, int? maxDerivedTypes = null)
+    public async Task<object> GetTypeHierarchyAsync(
+        string filePath, int line, int column, int? maxDerivedTypes = null,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
         var maxDerivedToReturn = maxDerivedTypes ?? 50; // Default to 50
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
-
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                hint: "Check for syntax errors with get_diagnostics",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var position = GetPosition(syntaxTree, line, column);
-        var token = syntaxTree.GetRoot().FindToken(position);
-        var node = token.Parent;
-
-        if (node == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Try adjusting the line/column or use search_symbols to find symbols by name",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var symbolInfo = semanticModel.GetSymbolInfo(node);
-        var symbol = symbolInfo.Symbol ?? semanticModel.GetDeclaredSymbol(node);
-
-        if (symbol == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No symbol found at position",
-                hint: "Try adjusting the line/column or use search_symbols to find symbols by name",
-                context: new { filePath, line, column }
-            );
-        }
+        var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
+        if (symbol == null) return error!;
 
         if (symbol is not INamedTypeSymbol typeSymbol)
         {
@@ -569,13 +342,16 @@ public partial class RoslynService
             currentBase = currentBase.BaseType;
         }
 
-        // Get interfaces
-        var interfaces = typeSymbol.AllInterfaces
+        // Get interfaces (capped like derivedTypes, with the true total reported).
+        var allInterfaces = typeSymbol.AllInterfaces;
+        var interfaces = allInterfaces
+            .Take(maxDerivedToReturn)
             .Select(i => FormatTypeInfo(i))
             .ToList();
 
         // Get derived types
-        var derivedTypes = await SymbolFinder.FindDerivedClassesAsync(typeSymbol, _solution!, transitive: false);
+        var derivedTypes = await SymbolFinder.FindDerivedClassesAsync(
+            typeSymbol, _solution!, transitive: false, cancellationToken: cancellationToken);
         var allDerived = derivedTypes.ToList();
         var totalDerived = allDerived.Count;
 
@@ -590,7 +366,9 @@ public partial class RoslynService
                 typeName = typeSymbol.ToDisplayString(),
                 baseTypes,
                 interfaces,
-                derivedTypes = derivedList
+                totalInterfaces = allInterfaces.Length,
+                derivedTypes = derivedList,
+                totalDerivedTypes = totalDerived
             },
             suggestedNextTools: new[]
             {
@@ -603,9 +381,21 @@ public partial class RoslynService
         );
     }
 
-    public async Task<object> SearchSymbolsAsync(string query, string? kind, int maxResults, string? namespaceFilter = null, int offset = 0)
+    public async Task<object> SearchSymbolsAsync(
+        string query, string? kind, int maxResults, string? namespaceFilter = null, int offset = 0,
+        string matchMode = "glob",
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
+
+        var mode = matchMode?.ToLowerInvariant() ?? "glob";
+        if (mode is not ("glob" or "fuzzy"))
+        {
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                $"matchMode must be 'glob' or 'fuzzy' (got '{matchMode}')",
+                context: new { matchMode });
+        }
 
         var allResults = new List<object>();
 
@@ -614,12 +404,24 @@ public partial class RoslynService
 
         foreach (var project in _solution!.Projects)
         {
-            var compilation = await GetProjectCompilationAsync(project);
-            if (compilation == null) continue;
-
-            var symbols = compilation.GetSymbolsWithName(
-                name => isGlobPattern ? MatchesGlobPattern(name, query) : name.Contains(query, StringComparison.OrdinalIgnoreCase),
-                SymbolFilter.All);
+            IEnumerable<ISymbol> symbols;
+            if (mode == "fuzzy")
+            {
+                // Roslyn's IDE pattern matcher: camel-hump ("RSvc" finds
+                // RoslynService), substring, and fuzzy matching — the search
+                // shape agents actually attempt.
+                symbols = await SymbolFinder.FindSourceDeclarationsWithPatternAsync(
+                    project, query, SymbolFilter.All, cancellationToken);
+            }
+            else
+            {
+                var compilation = await GetProjectCompilationAsync(project, cancellationToken);
+                if (compilation == null) continue;
+                symbols = compilation.GetSymbolsWithName(
+                    name => isGlobPattern ? MatchesGlobPattern(name, query) : name.Contains(query, StringComparison.OrdinalIgnoreCase),
+                    SymbolFilter.All,
+                    cancellationToken);
+            }
 
             foreach (var symbol in symbols)
             {
@@ -685,6 +487,7 @@ public partial class RoslynService
             data: new
             {
                 query,
+                matchMode = mode,
                 offset,
                 hasMore,
                 results = paginatedResults,
@@ -704,8 +507,8 @@ public partial class RoslynService
         );
     }
 
-    // Maps a reference location to one of: write, invocation, cast, typeof, nameof, attribute, read.
-    private static string ClassifyReferenceKind(ReferenceLocation loc, SyntaxNode? node)
+    // Maps a reference node to one of: write, invocation, cast, typeof, nameof, attribute, read.
+    private static string ClassifyReferenceKind(SyntaxNode? node)
     {
         if (node == null) return "read";
 
@@ -729,9 +532,12 @@ public partial class RoslynService
                 case InvocationExpressionSyntax inv:
                     if (inv.Expression is IdentifierNameSyntax id && id.Identifier.Text == "nameof")
                         return "nameof";
-                    // Only call it an invocation if this node is on the call's expression side,
-                    // not buried inside one of the arguments.
-                    return inv.Expression == node || inv.Expression.Span.Contains(node.Span)
+                    // "invocation" only when this node IS the invoked target — the whole
+                    // call expression, or the member name of `receiver.Member(...)`. The
+                    // receiver of a call (a read of it) and argument sub-expressions are not
+                    // invocations, even though they sit spatially inside the call.
+                    return inv.Expression == node
+                        || (inv.Expression is MemberAccessExpressionSyntax ma && ma.Name == node)
                         ? "invocation"
                         : "read";
             }

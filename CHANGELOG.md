@@ -1,5 +1,58 @@
 # Changelog
 
+## [1.6.0] - 2026-06-14
+
+### Added
+Tool count: 67 → 91. 24 new tools:
+
+- `move_type_to_file` — compute the file split that moves a type into its own correctly-named file
+- `split_type` — compute the partial-class split that moves named members into a new file
+- `remove_unused_code` — bulk cleanup for `find_unused_code` results, with the using directives the removals make unnecessary
+- `add_missing_imports` — the `using` directives that resolve a file's CS0246/CS0103, compiler-accurate
+- `fix_all` — apply a code fix to every instance of a diagnostic id across a file, project, or solution
+- `generate_test_stub` — a compilable test skeleton for a method, framework detected from the test projects
+- `diff_api_surface` — public-API breaking-change report against a git ref
+- `get_exception_flow` — which exception types can escape a method (transitively) and where each is caught
+- `find_similar_code` — methods structurally similar to a query method or snippet (anti-duplication)
+- `resolve_stack_trace` — map a .NET stack trace to file/line/symbol with mangling undone
+- `check_architecture` — enforce dependency rules over the real type-dependency graph
+- `find_unused_dependencies` — PackageReference/ProjectReference entries the compiler never needs
+- `find_dead_branches` — unreachable basic blocks per method from the real control-flow graph
+- `find_naming_violations` — naming-convention audit honoring `.editorconfig`, with conventional defaults
+- `find_async_issues` — async-hygiene audit: `async void`, blocking on async, unforwarded `CancellationToken`
+- `get_super_method` — navigate from an override/implementation to what it overrides or implements
+- `get_extension_methods` — extension members applicable to a type, classic and C# 14 `extension` blocks
+- `get_documentation` — full XML docs for a symbol with `<inheritdoc>` resolved recursively
+- `find_interceptors` — surface `[InterceptsLocation]` call rerouting, generated code included
+- `find_tests` — which tests cover a symbol (the inverse of `find_untested_code`)
+- `find_type_instantiations` — every `new T(...)` / target-typed `new(...)` construction site
+- `find_pattern_usages` — `is`/`as`/declaration/type/recursive patterns against a type
+- `find_throw_sites` — `throw new T(...)` sites for an exception type (optionally including derived)
+- `find_catch_blocks` — `catch (T ...)` clauses for an exception type (optionally including base types)
+
+### Changed
+- Upgraded `Microsoft.CodeAnalysis.*` to 5.3.0 with C# 14 readiness (`extension` blocks, the `field` keyword, null-conditional assignment)
+- `rename_symbol`, `change_signature`, `add_null_checks`, `generate_constructor`, `generate_equality_members`, and `extract_interface` accept `typeName`(+`memberName`) name-based addressing as an alternative to zero-based file/line/column
+- `search_symbols` adds `matchMode: "fuzzy"` for IDE-grade camel-hump matching (`RSvc` → `RoslynService`); glob remains the default
+- `get_file_overview` lists each type's members with signatures and line ranges
+- `find_references`, `find_callers`, and `find_implementations` now also report references inside generator output, flagged `inGeneratedCode`
+- Tool names dropped the `roslyn:` prefix to satisfy the MCP tool-name pattern; the prefixed spellings remain accepted as aliases for one release
+- Tools carry `readOnlyHint`/`destructiveHint` annotations derived from whether they mutate source
+- `SHARPLENS_TIMEOUT_SECONDS` is enforced per call via a cancellation token threaded into the Roslyn calls (previously a no-op)
+- The code-generation tools build syntax with `SyntaxGenerator` instead of concatenating strings
+
+### Fixed
+- `format_document_batch` default mode (`whitespace`) preserves the author's structure — null-suppression spacing, blank lines, single-line auto-properties; the whole-tree re-printer that expands minified code is opt-in via `mode: "canonical"`
+- Unified, atomic apply path: a rejected `TryApplyChanges` leaves files and in-memory state untouched; `rename_symbol` and `apply_code_action_by_title` no longer leave stale state; refactoring tools no longer need a follow-up `sync_documents`
+- Unexpected tool-handler exceptions return an in-band `isError` result instead of a JSON-RPC `-32603`, so the model sees the failure; `-32602`/`-32601`/`-32700` stay reserved for protocol-level faults
+- `initialize` negotiates the client's `protocolVersion` from the supported set instead of answering with a hardcoded version
+- `get_diagnostics` computes error/warning counts before the result cap; `find_unused_code` reports a symbol unused only at zero references and no longer skips disposable types
+- `extract_method` keeps only statements from the selection's own block (no nested-block duplication) and emits an `async Task` signature when the selection awaits
+- `add_null_checks` skips already-nullable-annotated and already-guarded parameters; `generate_equality_members` filters compiler backing fields and hashes all members consistently
+- `check_type_compatibility` resolves both types within one compilation; `analyze_data_flow` / `analyze_control_flow` honor a sub-range instead of the whole block
+- `get_method_signature` errors on an out-of-range overload index; `get_project_structure` reports the real target framework; `validate_code` maps error lines back to the submitted snippet
+- `find_attribute_usages` and `find_untested_code` scan only the project's own assembly; `apply_code_action_by_title` requires an exact or unique title match; ambiguous `typeName` resolution returns a structured `AMBIGUOUS_TYPE` error listing candidates
+
 ## [1.5.3] - 2026-05-19
 
 ### Added

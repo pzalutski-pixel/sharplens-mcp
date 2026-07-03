@@ -11,12 +11,15 @@ namespace SharpLensMcp.Tests;
 /// </summary>
 public class CodeActionTests : RoslynServiceTestBase
 {
-    private async Task<(string file, int startLine, int endLine)> LocateSumExtractableSelectionAsync()
+    private async Task<(string file, int startLine, int endLine, int endColumn)> LocateSumExtractableSelectionAsync()
     {
-        // RefactoringTarget.Sum body has two `var` statements ("var partial = a + b;"
-        // and "var total = partial + c;"). Roslyn's extract-method provider reliably
-        // offers an Extract-method refactoring over this span — it's the most
-        // deterministic positive position in our fixture set.
+        // RefactoringTarget.Sum's body is three liftable statements: two `var`
+        // declarations and the `return total;` that follows. The selection spans all
+        // three so Roslyn's extract-method provider offers its full-body extraction
+        // (the apply test asserts the `return NewMethod(a, b, c);` call-site shape).
+        // endColumn is the end line's real length: positions are strictly validated,
+        // so the old past-end-of-line shortcut (a fixed 50, which silently overflowed
+        // into the return line) is rejected as INVALID_PARAMETER.
         var searchResult = await Service.SearchSymbolsAsync("Sum", kind: "Method", maxResults: 50);
         var symbols = GetData(searchResult)["results"] as JArray;
         var sum = symbols!.First(s =>
@@ -24,20 +27,27 @@ public class CodeActionTests : RoslynServiceTestBase
         var loc = sum["location"]!;
         var file = loc["filePath"]!.Value<string>()!;
         var methodLine = loc["line"]!.Value<int>();
-        return (file, methodLine + 2, methodLine + 3);
+        var endLine = methodLine + 4;
+
+        var absolutePath = Path.IsPathRooted(file)
+            ? file
+            : Path.Combine(Path.GetDirectoryName(SolutionPath)!, file);
+        var endColumn = File.ReadAllLines(absolutePath)[endLine].Length;
+
+        return (file, methodLine + 2, endLine, endColumn);
     }
 
     [Fact]
     public async Task GetCodeActionsAtPosition_OverTwoStatementsInSumBody_OffersExtractMethod()
     {
-        var (file, startLine, endLine) = await LocateSumExtractableSelectionAsync();
+        var (file, startLine, endLine, endColumn) = await LocateSumExtractableSelectionAsync();
 
         var result = await Service.GetCodeActionsAtPositionAsync(
             file,
             line: startLine,
             column: 0,
             endLine: endLine,
-            endColumn: 50,
+            endColumn: endColumn,
             includeRefactorings: true);
 
         AssertSuccess(result);
@@ -47,10 +57,12 @@ public class CodeActionTests : RoslynServiceTestBase
             "a multi-statement selection inside a method body must offer at least an extract-method refactoring");
         actions!.Any(a => a["title"]?.Value<string>()?.Contains("Extract", StringComparison.OrdinalIgnoreCase) == true)
             .Should().BeTrue("the actions list must include an Extract-method title");
-        data["refactoringCount"]?.Value<int>().Should().BeGreaterThan(0,
+        data["refactoringCount"].Should().NotBeNull();
+        data["refactoringCount"]!.Value<int>().Should().BeGreaterThan(0,
             "the extract-method offering must be classified as a refactoring");
-        // fixCount field is always emitted alongside refactoringCount (CodeActions.cs:105).
-        data["fixCount"]?.Type.Should().Be(JTokenType.Integer,
+        // fixCount field is always emitted alongside refactoringCount.
+        data["fixCount"].Should().NotBeNull();
+        data["fixCount"]!.Type.Should().Be(JTokenType.Integer,
             "fixCount must be present as an integer even when 0");
         // Sum of buckets equals total actions returned.
         var fix = data["fixCount"]!.Value<int>();
@@ -62,11 +74,11 @@ public class CodeActionTests : RoslynServiceTestBase
     [Fact]
     public async Task GetCodeActionsAtPosition_IncludeOnlyFixes_StripsRefactoringActionsFromSumSelection()
     {
-        var (file, startLine, endLine) = await LocateSumExtractableSelectionAsync();
+        var (file, startLine, endLine, endColumn) = await LocateSumExtractableSelectionAsync();
 
         // Baseline: unfiltered must include at least one refactoring or there's nothing to filter.
         var unfiltered = await Service.GetCodeActionsAtPositionAsync(
-            file, startLine, 0, endLine, 50);
+            file, startLine, 0, endLine, endColumn);
         var baselineData = GetData(unfiltered);
         var baselineActions = baselineData["actions"] as JArray;
         baselineActions.Should().NotBeNullOrEmpty();
@@ -78,7 +90,7 @@ public class CodeActionTests : RoslynServiceTestBase
         // Filtered: same span with includeRefactorings:false. Every surviving action
         // must be kind="fix"; the strict count drop proves filtering actually fired.
         var filtered = await Service.GetCodeActionsAtPositionAsync(
-            file, startLine, 0, endLine, 50,
+            file, startLine, 0, endLine, endColumn,
             includeCodeFixes: true,
             includeRefactorings: false);
         AssertSuccess(filtered);
@@ -87,29 +99,38 @@ public class CodeActionTests : RoslynServiceTestBase
         actions.Should().NotBeNull("the actions array must be present on success");
         foreach (var action in actions!)
         {
-            action["kind"]?.Value<string>().Should().Be("fix",
+            action["kind"].Should().NotBeNull();
+            action["kind"]!.Value<string>().Should().Be("fix",
                 "includeRefactorings:false must filter out every action whose kind is not 'fix'");
         }
         actions!.Count.Should().BeLessThan(baselineActions!.Count,
             "filtering refactorings out must produce strictly fewer actions than the unfiltered baseline");
-        // Fixes shouldn't be affected by toggling the refactorings flag — the same
-        // diagnostics are still in play. fixCount must match the baseline's.
-        data["fixCount"]?.Value<int>().Should().Be(baselineFixCount,
-            "toggling the refactorings flag must not change the fix count");
-        data["refactoringCount"]?.Value<int>().Should().Be(0,
-            "with includeRefactorings:false, refactoringCount must be 0");
+        // The Sum selection offers only refactorings (extract method) and no code
+        // fixes, so the unfiltered fix count is 0 and includeRefactorings:false strips
+        // everything: the impl returns the empty-actions branch, which omits
+        // fixCount/refactoringCount and carries a message instead. The old
+        // `data["fixCount"]?...` / `["refactoringCount"]?...` reads silently passed
+        // against those absent fields.
+        baselineFixCount.Should().Be(0,
+            "the Sum selection offers no code fixes, so the unfiltered fix count is 0");
+        actions!.Count.Should().Be(0,
+            "stripping the only-offered refactorings leaves no actions");
+        data["fixCount"].Should().BeNull("the empty-actions branch omits fixCount");
+        data["refactoringCount"].Should().BeNull("the empty-actions branch omits refactoringCount");
+        data["message"].Should().NotBeNull("the empty-actions branch carries a message");
+        data["message"]!.Value<string>().Should().Contain("No code actions available");
     }
 
     [Fact]
     public async Task GetCodeActionsAtPosition_BothFiltersOff_ReturnsEmptyActionsBranchWithMessage()
     {
         // includeCodeFixes:false + includeRefactorings:false sends the impl through the
-        // empty-actions branch (CodeActions.cs:66-83) — different response shape (no
+        // empty-actions branch — different response shape (no
         // fixCount / refactoringCount) and a documented `message` string.
-        var (file, startLine, endLine) = await LocateSumExtractableSelectionAsync();
+        var (file, startLine, endLine, endColumn) = await LocateSumExtractableSelectionAsync();
 
         var result = await Service.GetCodeActionsAtPositionAsync(
-            file, startLine, 0, endLine, 50,
+            file, startLine, 0, endLine, endColumn,
             includeCodeFixes: false,
             includeRefactorings: false);
 
@@ -119,7 +140,8 @@ public class CodeActionTests : RoslynServiceTestBase
         actions.Should().NotBeNull();
         actions!.Count.Should().Be(0,
             "with both filters off, no actions can survive");
-        data["message"]?.Value<string>().Should().Contain("No code actions available",
+        data["message"].Should().NotBeNull();
+        data["message"]!.Value<string>().Should().Contain("No code actions available",
             "the empty-actions branch uses this exact phrase");
     }
 
@@ -128,10 +150,10 @@ public class CodeActionTests : RoslynServiceTestBase
     {
         // Symmetric to the include-only-fixes test: every returned action must be
         // kind="refactoring" when includeCodeFixes=false.
-        var (file, startLine, endLine) = await LocateSumExtractableSelectionAsync();
+        var (file, startLine, endLine, endColumn) = await LocateSumExtractableSelectionAsync();
 
         var result = await Service.GetCodeActionsAtPositionAsync(
-            file, startLine, 0, endLine, 50,
+            file, startLine, 0, endLine, endColumn,
             includeCodeFixes: false,
             includeRefactorings: true);
 
@@ -141,12 +163,15 @@ public class CodeActionTests : RoslynServiceTestBase
         actions.Should().NotBeNullOrEmpty();
         foreach (var action in actions!)
         {
-            action["kind"]?.Value<string>().Should().Be("refactoring",
+            action["kind"].Should().NotBeNull();
+            action["kind"]!.Value<string>().Should().Be("refactoring",
                 "includeCodeFixes:false must drop every non-refactoring action");
         }
-        data["fixCount"]?.Value<int>().Should().Be(0,
+        data["fixCount"].Should().NotBeNull();
+        data["fixCount"]!.Value<int>().Should().Be(0,
             "with includeCodeFixes:false, fixCount must be 0");
-        data["refactoringCount"]?.Value<int>().Should().Be(actions.Count);
+        data["refactoringCount"].Should().NotBeNull();
+        data["refactoringCount"]!.Value<int>().Should().Be(actions.Count);
     }
 
     [Fact]
@@ -158,13 +183,93 @@ public class CodeActionTests : RoslynServiceTestBase
 
         AssertError(result, ErrorCodes.SymbolNotFound);
         // Line 10/col 10 sits inside the using directives and surfaces "Sort Usings".
-        // The non-matching title triggers CodeActions.cs:192-193 where availableTitles
+        // The non-matching title hits the not-found branch where availableTitles
         // count > 0 — the hint becomes "Available actions: ..." listing what IS offered.
+        // (JObject.FromObject keeps RoslynError's property casing: "Hint", not "hint".)
         var json = JObject.FromObject(result);
-        json["error"]?["hint"]?.Value<string>().Should().Contain("Available actions:",
+        var hint = json["error"]!["Hint"]!.Value<string>()!;
+        hint.Should().Contain("Available actions:",
             "when titles exist at the position, hint must list them rather than say 'No actions available'");
-        json["error"]?["hint"]?.Value<string>().Should().Contain("Sort Usings",
+        hint.Should().Contain("Sort Usings",
             "Sort Usings is the deterministic refactoring offered in a using directive");
+    }
+
+    [Fact]
+    public async Task ApplyCodeActionByTitle_AmbiguousPartialTitle_ErrorsListingCandidatesWithoutWriting()
+    {
+        var (file, startLine, endLine, endColumn) = await LocateSumExtractableSelectionAsync();
+
+        // Precondition: the selection offers several distinct Extract-flavored
+        // titles (extract method, extract local function) — otherwise the
+        // ambiguity probe below proves nothing.
+        var actionsResult = await Service.GetCodeActionsAtPositionAsync(
+            file, startLine, 0, endLine, endColumn);
+        var extractTitles = (GetData(actionsResult)["actions"] as JArray)!
+            .Select(a => a["title"]!.Value<string>()!)
+            .Where(t => t.Contains("Extract", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        extractTitles.Count.Should().BeGreaterThan(1,
+            "the Sum selection must offer more than one Extract-flavored refactoring");
+
+        var absoluteFile = Path.Combine(Path.GetDirectoryName(SolutionPath)!, file);
+        var snapshot = File.ReadAllText(absoluteFile);
+        try
+        {
+            var result = await Service.ApplyCodeActionByTitleAsync(
+                file, startLine, 0,
+                title: "Extract",
+                endLine: endLine, endColumn: endColumn,
+                preview: false);
+
+            AssertError(result, ErrorCodes.AmbiguousMatch);
+            var json = JObject.FromObject(result);
+            var candidates = (json["error"]!["Context"]!["candidates"] as JArray)!
+                .Select(c => c.Value<string>()!)
+                .ToList();
+            candidates.Count.Should().BeGreaterThan(1,
+                "the error must list the competing titles so the caller can repeat with one verbatim");
+            candidates.Should().OnlyContain(c => c.Contains("Extract", StringComparison.OrdinalIgnoreCase));
+
+            File.ReadAllText(absoluteFile).Should().Be(snapshot,
+                "an ambiguous title must never reach the apply path, let alone disk");
+        }
+        finally
+        {
+            File.WriteAllText(absoluteFile, snapshot);
+        }
+    }
+
+    [Fact]
+    public async Task ApplyCodeActionByTitle_UniquePartialTitle_ResolvesToTheSingleCandidate()
+    {
+        var (file, startLine, endLine, endColumn) = await LocateSumExtractableSelectionAsync();
+
+        // Precondition: exactly one offered title contains "local function" —
+        // the unique-partial probe — while other Extract titles exist alongside it.
+        var actionsResult = await Service.GetCodeActionsAtPositionAsync(
+            file, startLine, 0, endLine, endColumn);
+        var allTitles = (GetData(actionsResult)["actions"] as JArray)!
+            .Select(a => a["title"]!.Value<string>()!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var localFunctionTitles = allTitles
+            .Where(t => t.Contains("local function", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        localFunctionTitles.Should().HaveCount(1,
+            "the probe must identify exactly one candidate or this test proves nothing");
+
+        var result = await Service.ApplyCodeActionByTitleAsync(
+            file, startLine, 0,
+            title: "local function",
+            endLine: endLine, endColumn: endColumn,
+            preview: true);
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["actionTitle"]!.Value<string>().Should().Be(localFunctionTitles[0],
+            "a unique partial match must resolve to its single candidate");
+        data["applied"]!.Value<bool>().Should().BeFalse();
     }
 
     [Fact]
@@ -173,10 +278,10 @@ public class CodeActionTests : RoslynServiceTestBase
         // Discover the extract-method title Roslyn offers for the Sum selection — Roslyn
         // versions vary ("Extract method", "Extract Method", "Extract local function"),
         // so we read it back and apply that exact title rather than guessing.
-        var (file, startLine, endLine) = await LocateSumExtractableSelectionAsync();
+        var (file, startLine, endLine, endColumn) = await LocateSumExtractableSelectionAsync();
 
         var actionsResult = await Service.GetCodeActionsAtPositionAsync(
-            file, startLine, 0, endLine, 50);
+            file, startLine, 0, endLine, endColumn);
         var actions = GetData(actionsResult)["actions"] as JArray;
         actions.Should().NotBeNullOrEmpty();
         var extractTitle = actions!
@@ -191,15 +296,18 @@ public class CodeActionTests : RoslynServiceTestBase
             var result = await Service.ApplyCodeActionByTitleAsync(
                 file, startLine, 0,
                 title: extractTitle!,
-                endLine: endLine, endColumn: 50,
+                endLine: endLine, endColumn: endColumn,
                 preview: true);
 
             AssertSuccess(result);
             var data = GetData(result);
-            data["actionTitle"]?.Value<string>().Should().Be(extractTitle);
-            data["preview"]?.Value<bool>().Should().BeTrue();
-            data["applied"]?.Value<bool>().Should().BeFalse(
-                "preview=true must report applied=false per CodeActions.cs:310");
+            data["actionTitle"].Should().NotBeNull();
+            data["actionTitle"]!.Value<string>().Should().Be(extractTitle);
+            data["preview"].Should().NotBeNull();
+            data["preview"]!.Value<bool>().Should().BeTrue();
+            data["applied"].Should().NotBeNull();
+            data["applied"]!.Value<bool>().Should().BeFalse(
+                "preview=true must report applied=false");
             var changed = data["changedFiles"] as JArray;
             changed.Should().NotBeNullOrEmpty(
                 "extract-method preview must report at least one changed file");
@@ -232,7 +340,7 @@ public class CodeActionTests : RoslynServiceTestBase
     [Fact]
     public async Task ApplyCodeActionByTitle_OnFileNotInSolution_ReturnsFileNotInSolution()
     {
-        // Path that won't resolve to any document — exercises CodeActions.cs:137-143
+        // Path that won't resolve to any document — exercises the document-not-found path
         // FileNotInSolution branch.
         var fakePath = Path.Combine(Path.GetTempPath(), $"not-in-solution-{Guid.NewGuid():N}.cs");
         var result = await Service.ApplyCodeActionByTitleAsync(
@@ -245,11 +353,11 @@ public class CodeActionTests : RoslynServiceTestBase
     [Fact]
     public async Task EncapsulateField_OnBareCounter_AppliesPreviewWithEncapsulatedProperty()
     {
-        // POSITIVE case for the EncapsulateField wrapper. The wrapper at
-        // CodeActions.cs:381-413 iterates hardcoded titles ("Encapsulate field",
-        // "Encapsulate field (and use property)", "Encapsulate field (but still use
-        // field)"); the underlying ApplyCodeActionByTitleAsync does a Contains-substring
-        // match, so any Roslyn-offered title containing "Encapsulate field" succeeds.
+        // POSITIVE case for the EncapsulateField wrapper. The wrapper iterates
+        // hardcoded titles ("Encapsulate field", "Encapsulate field (and use property)",
+        // "Encapsulate field (but still use field)"); the underlying
+        // ApplyCodeActionByTitleAsync does a Contains-substring match, so any
+        // Roslyn-offered title containing "Encapsulate field" succeeds.
         var searchResult = await Service.SearchSymbolsAsync("BareCounter", kind: "Field", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
         symbols.Should().NotBeNullOrEmpty(
@@ -270,8 +378,10 @@ public class CodeActionTests : RoslynServiceTestBase
 
             AssertSuccess(result);
             var data = GetData(result);
-            data["preview"]?.Value<bool>().Should().BeTrue();
-            data["actionTitle"]?.Value<string>().Should()
+            data["preview"].Should().NotBeNull();
+            data["preview"]!.Value<bool>().Should().BeTrue();
+            data["actionTitle"].Should().NotBeNull();
+            data["actionTitle"]!.Value<string>().Should()
                 .Contain("Encapsulate", "the offered title must match the wrapper's iteration");
             var changed = data["changedFiles"] as JArray;
             changed.Should().NotBeNullOrEmpty();
@@ -335,10 +445,13 @@ public class IncompleteDisposable : IDisposable
             preview: true);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
         var data = json["data"]!;
-        data["preview"]?.Value<bool>().Should().BeTrue();
-        data["actionTitle"]?.Value<string>().Should().Contain("Implement",
+        data["preview"].Should().NotBeNull();
+        data["preview"]!.Value<bool>().Should().BeTrue();
+        data["actionTitle"].Should().NotBeNull();
+        data["actionTitle"]!.Value<string>().Should().Contain("Implement",
             "the matched title must contain 'Implement' (one of the wrapper's iteration strings)");
 
         var changed = data["changedFiles"] as JArray;
@@ -375,8 +488,10 @@ public class IncompleteDisposable : IDisposable
 
             AssertSuccess(result);
             var data = GetData(result);
-            data["preview"]?.Value<bool>().Should().BeTrue();
-            data["actionTitle"]?.Value<string>().Should().Contain("Inline",
+            data["preview"].Should().NotBeNull();
+            data["preview"]!.Value<bool>().Should().BeTrue();
+            data["actionTitle"].Should().NotBeNull();
+            data["actionTitle"]!.Value<string>().Should().Contain("Inline",
                 "the matched title must contain 'Inline'");
             var changed = data["changedFiles"] as JArray;
             changed.Should().NotBeNullOrEmpty();
@@ -430,8 +545,10 @@ public class IncompleteDisposable : IDisposable
 
             AssertSuccess(result);
             var data = GetData(result);
-            data["preview"]?.Value<bool>().Should().BeTrue();
-            data["actionTitle"]?.Value<string>().Should().Match(t =>
+            data["preview"].Should().NotBeNull();
+            data["preview"]!.Value<bool>().Should().BeTrue();
+            data["actionTitle"].Should().NotBeNull();
+            data["actionTitle"]!.Value<string>().Should().Match(t =>
                 t!.Contains("Introduce", StringComparison.OrdinalIgnoreCase) ||
                 t!.Contains("Extract", StringComparison.OrdinalIgnoreCase));
             var changed = data["changedFiles"] as JArray;
@@ -459,15 +576,19 @@ public class IncompleteDisposable : IDisposable
     public async Task ImplementMissingMembers_OnUsingsLine_ReturnsSymbolNotFound()
     {
         // Line 10 of RoslynService.cs sits inside `using` directives — there's no
-        // type at this position, so the wrapper at CodeActions.cs:370-375 returns
+        // type at this position, so the wrapper returns
         // SymbolNotFound with the "No 'implement members' action found at this
         // position" message.
         var result = await Service.ImplementMissingMembersAsync(
             RoslynServicePath, line: 10, column: 10,
             preview: true);
         AssertError(result, ErrorCodes.SymbolNotFound);
+        // In-process JObject.FromObject keeps RoslynError's PascalCase Message; the old
+        // lowercase `["message"]` read was always null and silently passed.
         var json = JObject.FromObject(result);
-        json["error"]?["message"]?.Value<string>().Should().Contain("implement members");
+        json["error"].Should().NotBeNull();
+        json["error"]!["Message"].Should().NotBeNull();
+        json["error"]!["Message"]!.Value<string>().Should().Contain("implement members");
     }
 
     [Fact]
@@ -479,7 +600,9 @@ public class IncompleteDisposable : IDisposable
             RoslynServicePath, line: 10, column: 10, preview: true);
         AssertError(result, ErrorCodes.SymbolNotFound);
         var json = JObject.FromObject(result);
-        json["error"]?["message"]?.Value<string>().Should().Contain("encapsulate field");
+        json["error"].Should().NotBeNull();
+        json["error"]!["Message"].Should().NotBeNull();
+        json["error"]!["Message"]!.Value<string>().Should().Contain("encapsulate field");
     }
 
     [Fact]
@@ -489,7 +612,9 @@ public class IncompleteDisposable : IDisposable
             RoslynServicePath, line: 10, column: 10, preview: true);
         AssertError(result, ErrorCodes.SymbolNotFound);
         var json = JObject.FromObject(result);
-        json["error"]?["message"]?.Value<string>().Should().Contain("inline variable");
+        json["error"].Should().NotBeNull();
+        json["error"]!["Message"].Should().NotBeNull();
+        json["error"]!["Message"]!.Value<string>().Should().Contain("inline variable");
     }
 
     [Fact]
@@ -502,6 +627,8 @@ public class IncompleteDisposable : IDisposable
             preview: true);
         AssertError(result, ErrorCodes.SymbolNotFound);
         var json = JObject.FromObject(result);
-        json["error"]?["message"]?.Value<string>().Should().Contain("extract variable");
+        json["error"].Should().NotBeNull();
+        json["error"]!["Message"].Should().NotBeNull();
+        json["error"]!["Message"]!.Value<string>().Should().Contain("extract variable");
     }
 }

@@ -23,14 +23,14 @@ public class NavigationToolsViaMcpTests : McpTestBase
         var classLine = Array.FindIndex(lines, l => l.Contains("class RoslynService"));
         classLine.Should().BeGreaterThan(-1);
 
-        var data = await CallAndGetDataAsync("roslyn:get_symbol_info", new
+        var data = await CallAndGetDataAsync("get_symbol_info", new
         {
             filePath = Fixture.RoslynServicePath, line = classLine, column = 20
         });
         data["kind"]!.Value<string>().Should().Be("NamedType");
         data["name"]!.Value<string>().Should().Be("RoslynService");
         data["typeKind"]!.Value<string>().Should().Be("Class");
-        // Impl emits the Dictionary key "containingNamespace" (RoslynService.cs:930);
+        // Impl emits the Dictionary key "containingNamespace";
         // the prior `data["namespace"]?.Value<string>().Should().Be(...)` was a silent-
         // pass against a non-existent field.
         data["containingNamespace"]!.Value<string>().Should().Be("SharpLensMcp",
@@ -44,7 +44,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task GetSymbolInfo_AtFileTop_ReturnsSymbolNotFound()
     {
         var error = await CallAndGetErrorAsync(
-            "roslyn:get_symbol_info",
+            "get_symbol_info",
             new { filePath = Fixture.RoslynServicePath, line = 0, column = 0 },
             codeContains: ErrorCodes.SymbolNotFound);
         // Helper already enforced codeContains; lock message contains the position
@@ -62,17 +62,17 @@ public class NavigationToolsViaMcpTests : McpTestBase
         var (file, line, col) = await LocateSymbolAsync(
             "CreateSuccessResponse", kind: "Method",
             r => r["containingType"]?.Value<string>()?.Contains("RoslynService") == true);
-        var data = await CallAndGetDataAsync("roslyn:go_to_definition", new
+        var data = await CallAndGetDataAsync("go_to_definition", new
         {
             filePath = file, line, column = col
         });
-        // The impl nests filePath/line under data["definition"] (Navigation.cs:337-339);
+        // The impl nests filePath/line under data["definition"];
         // the prior `data["filePath"]?.Value<string>()...` silent-passed against a
         // non-existent top-level field.
         var definition = data["definition"]!;
         definition["filePath"]!.Value<string>()!.Should().EndWith("RoslynService.cs");
-        definition["line"]!.Value<int>().Should().BeGreaterThan(0,
-            "the declaration is well past the file header");
+        definition["line"]!.Value<int>().Should().Be(line,
+            "go_to_definition must resolve to the same declaration line search_symbols reported");
 
         var symbol = data["symbol"]!;
         symbol["name"]!.Value<string>().Should().Be("CreateSuccessResponse");
@@ -80,28 +80,29 @@ public class NavigationToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
-    public async Task FindReferences_OnCreateSuccessResponse_LocksTotalAndRefShape()
+    public async Task FindReferences_OnFixtureAnchor_LocksExactTotalAndRefShape()
     {
+        // ReferenceCountFixture.Anchor is invoked exactly five times, so the total is a
+        // fixed 5 rather than a `>= 2` inequality against the live RoslynService source.
         var (file, line, col) = await LocateSymbolAsync(
-            "CreateSuccessResponse", kind: "Method");
-        var data = await CallAndGetDataAsync("roslyn:find_references", new
+            "Anchor", kind: "Method",
+            r => r["containingType"]?.Value<string>()?.EndsWith("ReferenceCountTarget") == true);
+        var data = await CallAndGetDataAsync("find_references", new
         {
             filePath = file, line, column = col
         });
-        data["symbolName"]!.Value<string>().Should().Be("CreateSuccessResponse");
+        data["symbolName"]!.Value<string>().Should().Be("Anchor");
         data["symbolKind"]!.Value<string>().Should().Be("Method");
 
         var refs = (data["references"] as JArray)!;
-        refs.Should().NotBeEmpty();
-        data["totalReferences"]!.Value<int>().Should().BeGreaterOrEqualTo(2);
+        refs.Should().HaveCount(5, "Anchor is invoked five times in ReferenceCountFixture");
+        data["totalReferences"]!.Value<int>().Should().Be(5);
 
-        // Every reference must conform to the documented shape — filePath is a .cs
-        // file and kind is one of the documented classifier values.
-        var validKinds = new[] { "read", "write", "invocation", "cast", "typeof", "nameof", "attribute" };
+        // Every reference is an invocation of Anchor located in the fixture file.
         foreach (var r in refs)
         {
-            r["filePath"]!.Value<string>()!.Should().EndWith(".cs");
-            r["kind"]!.Value<string>().Should().BeOneOf(validKinds);
+            r["filePath"]!.Value<string>()!.Should().EndWith("ReferenceCountFixture.cs");
+            r["kind"]!.Value<string>().Should().Be("invocation");
         }
     }
 
@@ -111,13 +112,13 @@ public class NavigationToolsViaMcpTests : McpTestBase
         var (file, line, col) = await LocateSymbolAsync("TrackedField", kind: "Field");
 
         // Unfiltered for the comparison.
-        var unfiltered = await CallAndGetDataAsync("roslyn:find_references", new
+        var unfiltered = await CallAndGetDataAsync("find_references", new
         {
             filePath = file, line, column = col
         });
         var totalUnfiltered = unfiltered["totalReferences"]!.Value<int>();
 
-        var data = await CallAndGetDataAsync("roslyn:find_references", new
+        var data = await CallAndGetDataAsync("find_references", new
         {
             filePath = file, line, column = col, kind = "write"
         });
@@ -136,7 +137,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task FindReferences_KindFilterCast_OnTrackedTarget_ReturnsAtLeastOneCast()
     {
         var (file, line, col) = await LocateSymbolAsync("TrackedTarget", kind: "Class");
-        var data = await CallAndGetDataAsync("roslyn:find_references", new
+        var data = await CallAndGetDataAsync("find_references", new
         {
             filePath = file, line, column = col, kind = "cast"
         });
@@ -150,7 +151,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task FindReferences_KindFilterInvocation_OnTrackedField_OnlyReturnsInvocations()
     {
         var (file, line, col) = await LocateSymbolAsync("TrackedField", kind: "Field");
-        var data = await CallAndGetDataAsync("roslyn:find_references", new
+        var data = await CallAndGetDataAsync("find_references", new
         {
             filePath = file, line, column = col, kind = "invocation"
         });
@@ -164,7 +165,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task FindReferences_KindFilterTypeof_OnTrackedTarget_OnlyReturnsTypeofRefs()
     {
         var (file, line, col) = await LocateSymbolAsync("TrackedTarget", kind: "Class");
-        var data = await CallAndGetDataAsync("roslyn:find_references", new
+        var data = await CallAndGetDataAsync("find_references", new
         {
             filePath = file, line, column = col, kind = "typeof"
         });
@@ -178,7 +179,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task FindReferences_KindFilterNameof_OnTrackedField_OnlyReturnsNameofRefs()
     {
         var (file, line, col) = await LocateSymbolAsync("TrackedField", kind: "Field");
-        var data = await CallAndGetDataAsync("roslyn:find_references", new
+        var data = await CallAndGetDataAsync("find_references", new
         {
             filePath = file, line, column = col, kind = "nameof"
         });
@@ -192,7 +193,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task FindReferences_KindFilterAttribute_OnTrackedMarker_OnlyReturnsAttributeRefs()
     {
         var (file, line, col) = await LocateSymbolAsync("TrackedMarker", kind: "Field");
-        var data = await CallAndGetDataAsync("roslyn:find_references", new
+        var data = await CallAndGetDataAsync("find_references", new
         {
             filePath = file, line, column = col, kind = "attribute"
         });
@@ -206,7 +207,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task FindReferences_KindFilterRead_OnTrackedField_OnlyReturnsReadRefs()
     {
         var (file, line, col) = await LocateSymbolAsync("TrackedField", kind: "Field");
-        var data = await CallAndGetDataAsync("roslyn:find_references", new
+        var data = await CallAndGetDataAsync("find_references", new
         {
             filePath = file, line, column = col, kind = "read"
         });
@@ -220,27 +221,27 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task GoToDefinition_OnMetadataSymbol_ReturnsSymbolNotFound()
     {
         // GoToDefinition on a BCL type's usage: the symbol resolves but its
-        // definition is in metadata, not source (Navigation.cs:314-322).
+        // definition is in metadata, not source.
         // Position cursor on a `using System;` line — actually no, that's the
         // using directive. Need to find a usage of a BCL type in source.
         // The line `using System;` at the top of RoslynService.cs has a reference
         // to the System namespace (no source location for namespace?). Instead use
         // a Type usage like `Console.Error` — first find the line.
         var lines = File.ReadAllLines(Fixture.RoslynServicePath);
-        // Look for a Console.Error reference. RoslynService.cs:281 uses Console.Error.WriteLine.
+        // Look for a Console.Error reference. The impl uses Console.Error.WriteLine.
         var consoleLine = Array.FindIndex(lines, l =>
             l.Contains("Console.Error.WriteLine"));
         consoleLine.Should().BeGreaterThan(-1, "RoslynService.cs uses Console.Error");
         var consoleCol = lines[consoleLine].IndexOf("Console", StringComparison.Ordinal);
 
-        var error = await CallAndGetErrorAsync("roslyn:go_to_definition", new
+        var error = await CallAndGetErrorAsync("go_to_definition", new
         {
             filePath = Fixture.RoslynServicePath,
             line = consoleLine,
             column = consoleCol
         }, codeContains: ErrorCodes.SymbolNotFound);
         error["hint"]!.Value<string>()!.Should().Contain("metadata",
-            "the metadata-only branch hint at Navigation.cs:319 mentions metadata");
+            "the metadata-only branch hint mentions metadata");
     }
 
     [Fact]
@@ -248,18 +249,18 @@ public class NavigationToolsViaMcpTests : McpTestBase
     {
         var (file, line, col) = await LocateSymbolAsync(
             "IShapeFixture", kind: "Interface");
-        var data = await CallAndGetDataAsync("roslyn:find_implementations", new
+        var data = await CallAndGetDataAsync("find_implementations", new
         {
             filePath = file, line, column = col
         });
-        // Lock the response shape (Navigation.cs:467-473).
+        // Lock the find_implementations response shape.
         data["baseType"]!.Value<string>()!.Should().EndWith("IShapeFixture");
-        data["totalImplementations"]!.Value<int>().Should().BeGreaterOrEqualTo(3,
-            "InterfaceHierarchyFixture declares Circle, Rectangle, AND transitively Square");
+        data["totalImplementations"]!.Value<int>().Should().Be(3,
+            "InterfaceHierarchyFixture has exactly three implementers: Circle, Rectangle, and (transitively) Square");
 
         var impls = (data["implementations"] as JArray)!;
         impls.Should().NotBeEmpty();
-        // find_implementations returns fully-qualified names per Navigation.cs:460.
+        // find_implementations returns fully-qualified names.
         var names = impls.Select(i => i["name"]!.Value<string>()!).ToList();
         names.Should().Contain(n => n.EndsWith(".FixtureCircle"));
         names.Should().Contain(n => n.EndsWith(".FixtureRectangle"));
@@ -275,40 +276,37 @@ public class NavigationToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
-    public async Task FindCallers_OnEnsureSolutionLoaded_HasManyCallersIncludingKnownOnes()
+    public async Task FindCallers_OnFixtureAnchor_FindsExactlyFiveNamedCallers()
     {
+        // ReferenceCountFixture.Anchor is called from exactly five distinct methods, so
+        // the caller set is a fixed list rather than a `>= 20` inequality against the
+        // live RoslynService source.
         var (file, line, col) = await LocateSymbolAsync(
-            "EnsureSolutionLoaded", kind: "Method");
-        var data = await CallAndGetDataAsync("roslyn:find_callers", new
+            "Anchor", kind: "Method",
+            r => r["containingType"]?.Value<string>()?.EndsWith("ReferenceCountTarget") == true);
+        var data = await CallAndGetDataAsync("find_callers", new
         {
             filePath = file, line, column = col
         });
         var callers = (data["callers"] as JArray)!;
-        callers.Should().NotBeEmpty();
-        // EnsureSolutionLoaded is invoked from virtually every public tool method
-        // EXCEPT LoadSolutionAsync (which is the one that loads the solution).
-        callers.Count.Should().BeGreaterOrEqualTo(20,
-            "almost every tool method calls EnsureSolutionLoaded at the top");
+        callers.Should().HaveCount(5, "Anchor is called from CallerOne through CallerFive");
 
-        // Per-caller shape (Inspection.cs:350-366): callingSymbol {name, kind,
+        // Per-caller shape: callingSymbol {name, kind,
         // containingType, signature}, location {filePath, line, column, lineText}.
         foreach (var c in callers)
         {
             var callingSymbol = c["callingSymbol"]!;
             callingSymbol["name"]!.Value<string>().Should().NotBeNullOrEmpty();
-            callingSymbol["kind"]!.Value<string>().Should().NotBeNullOrEmpty();
+            callingSymbol["kind"]!.Value<string>().Should().Be("Method");
             callingSymbol["signature"]!.Value<string>().Should().NotBeNullOrEmpty();
-            c["location"]!["filePath"]!.Value<string>()!.Should().EndWith(".cs");
+            c["location"]!["filePath"]!.Value<string>()!.Should().EndWith("ReferenceCountFixture.cs");
         }
 
         var callerNames = callers
             .Select(c => c["callingSymbol"]!["name"]!.Value<string>()!)
             .ToList();
-        callerNames.Should().Contain("SearchSymbolsAsync");
-        callerNames.Should().Contain("GetDiagnosticsAsync");
-        callerNames.Should().Contain("RenameSymbolAsync");
-        callerNames.Should().NotContain("LoadSolutionAsync",
-            "LoadSolutionAsync is the loader — it must NOT call EnsureSolutionLoaded itself");
+        callerNames.Should().BeEquivalentTo(
+            new[] { "CallerOne", "CallerTwo", "CallerThree", "CallerFour", "CallerFive" });
     }
 
     [Fact]
@@ -316,7 +314,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     {
         var (file, line, col) = await LocateSymbolAsync(
             "ChainA", kind: "Method");
-        var data = await CallAndGetDataAsync("roslyn:get_call_graph", new
+        var data = await CallAndGetDataAsync("get_call_graph", new
         {
             filePath = file, line, column = col,
             direction = "callees", maxDepth = 2, maxNodes = 50
@@ -341,7 +339,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     {
         var (file, line, col) = await LocateSymbolAsync(
             "ChainA", kind: "Method");
-        var data = await CallAndGetDataAsync("roslyn:get_call_graph", new
+        var data = await CallAndGetDataAsync("get_call_graph", new
         {
             filePath = file, line, column = col,
             direction = "callees", maxDepth = 1, maxNodes = 50
@@ -361,10 +359,10 @@ public class NavigationToolsViaMcpTests : McpTestBase
         var (file, line, col) = await LocateSymbolAsync(
             "ChainA", kind: "Method");
         var error = await CallAndGetErrorAsync(
-            "roslyn:get_call_graph",
+            "get_call_graph",
             new { filePath = file, line, column = col, maxDepth = 100 },
             codeContains: ErrorCodes.InvalidParameter);
-        // Lock the message wording (Inspection.cs:1523) instead of the redundant
+        // Lock the message wording instead of the redundant
         // silent-pass error.code re-check.
         error["message"]!.Value<string>()!.Should().Contain("maxDepth must be between 1 and 10",
             "the impl enumerates the allowed range in the error message");
@@ -373,14 +371,14 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetCallGraph_BadDirection_ReturnsInvalidParameterWithAllowedValues()
     {
-        // Inspection.cs:1529-1535 explicitly rejects directions other than
+        // The impl explicitly rejects directions other than
         // 'callees', 'callers', or 'both'. Locks the branch — without this, a
         // regression treating unknown values as 'callees' (the prior default
         // behavior) would slip past.
         var (file, line, col) = await LocateSymbolAsync(
             "ChainA", kind: "Method");
         var error = await CallAndGetErrorAsync(
-            "roslyn:get_call_graph",
+            "get_call_graph",
             new { filePath = file, line, column = col, direction = "sideways" },
             codeContains: ErrorCodes.InvalidParameter);
         error["message"]!.Value<string>()!.Should().Contain("direction must be",
@@ -394,7 +392,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     {
         var (file, line, col) = await LocateSymbolAsync(
             "FixtureSquare", kind: "Class");
-        var data = await CallAndGetDataAsync("roslyn:get_type_hierarchy", new
+        var data = await CallAndGetDataAsync("get_type_hierarchy", new
         {
             filePath = file, line, column = col
         });
@@ -414,7 +412,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task SearchSymbols_OnRoslynService_FindsClassEntry()
     {
-        var data = await CallAndGetDataAsync("roslyn:search_symbols", new
+        var data = await CallAndGetDataAsync("search_symbols", new
         {
             query = "RoslynService", maxResults = 10
         });
@@ -437,7 +435,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task SearchSymbols_Pagination_Page2AdvancesOffset()
     {
         // Page 1 with small cap forces hasMore=true and nextOffset=5.
-        var page1 = await CallAndGetDataAsync("roslyn:search_symbols", new
+        var page1 = await CallAndGetDataAsync("search_symbols", new
         {
             query = "*Async", kind = "Method", maxResults = 5, offset = 0
         });
@@ -448,7 +446,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
         nextOffset.Should().Be(5);
 
         // Page 2 must report offset==nextOffset and return a different page.
-        var page2 = await CallAndGetDataAsync("roslyn:search_symbols", new
+        var page2 = await CallAndGetDataAsync("search_symbols", new
         {
             query = "*Async", kind = "Method", maxResults = 5, offset = nextOffset
         });
@@ -457,6 +455,10 @@ public class NavigationToolsViaMcpTests : McpTestBase
             .Select(r => r["fullyQualifiedName"]!.Value<string>()!).ToList();
         var page2Names = (page2["results"] as JArray)!
             .Select(r => r["fullyQualifiedName"]!.Value<string>()!).ToList();
+        // Each page must honor the maxResults cap exactly — page 1 is a full page,
+        // and page 2 (still not exhausting the dozens of *Async methods) is too.
+        page1Names.Should().HaveCount(5, "page 1 must return a full page of maxResults=5");
+        page2Names.Should().HaveCount(5, "page 2 must also return a full page of 5");
         page1Names.Intersect(page2Names).Should().BeEmpty(
             "page 2 must not overlap with page 1");
     }
@@ -466,7 +468,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     {
         var (file, line, col) = await LocateSymbolAsync(
             "ChainB", kind: "Method");
-        var data = await CallAndGetDataAsync("roslyn:get_call_graph", new
+        var data = await CallAndGetDataAsync("get_call_graph", new
         {
             filePath = file, line, column = col,
             direction = "both", maxDepth = 2, maxNodes = 50
@@ -488,14 +490,14 @@ public class NavigationToolsViaMcpTests : McpTestBase
         // Discover the actual containing assembly of System.String via a no-filter
         // call (it varies across runtimes: System.Private.CoreLib vs System.Runtime
         // vs others). Then call with that exact name and assert the assembly matches.
-        var discovered = await CallAndGetDataAsync("roslyn:get_external_type_info", new
+        var discovered = await CallAndGetDataAsync("get_external_type_info", new
         {
             typeName = "System.String"
         });
         var actualAssembly = discovered["assembly"]!.Value<string>()!;
         actualAssembly.Should().NotBeNullOrEmpty();
 
-        var filtered = await CallAndGetDataAsync("roslyn:get_external_type_info", new
+        var filtered = await CallAndGetDataAsync("get_external_type_info", new
         {
             typeName = "System.String",
             assemblyName = actualAssembly
@@ -508,7 +510,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task GetExternalTypeInfo_WrongAssemblyName_ReturnsTypeNotFound()
     {
         var error = await CallAndGetErrorAsync(
-            "roslyn:get_external_type_info",
+            "get_external_type_info",
             new
             {
                 typeName = "System.String",
@@ -528,7 +530,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
         // with includeInherited=false we get only Side.
         // (System.String / List<T> can't be used because their immediate base IS
         // System.Object which the impl excludes from the walk per ExternalApi.cs.)
-        var included = await CallAndGetDataAsync("roslyn:get_external_type_info", new
+        var included = await CallAndGetDataAsync("get_external_type_info", new
         {
             typeName = "SharpLensMcp.Tests.Fixtures.FixtureSquare",
             includeInherited = true,
@@ -540,7 +542,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
         includedNames.Should().Contain("Width", "Width is inherited from FixtureRectangle");
         includedNames.Should().Contain("Side", "Side is FixtureSquare's own member");
 
-        var excluded = await CallAndGetDataAsync("roslyn:get_external_type_info", new
+        var excluded = await CallAndGetDataAsync("get_external_type_info", new
         {
             typeName = "SharpLensMcp.Tests.Fixtures.FixtureSquare",
             includeInherited = false,
@@ -558,7 +560,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task SearchSymbols_GlobPatternAsync_LocksEveryResultIsAsyncMethod()
     {
-        var data = await CallAndGetDataAsync("roslyn:search_symbols", new
+        var data = await CallAndGetDataAsync("search_symbols", new
         {
             query = "*Async", kind = "Method", maxResults = 100
         });
@@ -575,7 +577,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task SemanticQuery_AsyncFilter_EveryMethodResultIsAsync()
     {
-        var data = await CallAndGetDataAsync("roslyn:semantic_query", new
+        var data = await CallAndGetDataAsync("semantic_query", new
         {
             isAsync = true,
             maxResults = 100
@@ -585,7 +587,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
         results.Count.Should().BeGreaterThan(5,
             "the solution has many async methods");
 
-        // The impl's isAsync filter applies ONLY to method symbols (RoslynService.cs:1083);
+        // The impl's isAsync filter applies ONLY to method symbols;
         // non-method results pass through unfiltered and don't carry an `isAsync` field.
         // Per-method invariant: every method result must have isAsync=true. Sanity
         // check: at least some results must be methods (otherwise the filter is a no-op).
@@ -597,16 +599,19 @@ public class NavigationToolsViaMcpTests : McpTestBase
         foreach (var r in methodResults)
         {
             r["isAsync"]!.Value<bool>().Should().BeTrue(
-                "every method result must have isAsync=true after filtering by isAsync:true (RoslynService.cs:1083)");
+                "every method result must have isAsync=true after filtering by isAsync:true");
         }
     }
 
     [Fact]
     public async Task GetTypeMembers_OnRoslynService_IncludesLoadSolutionAndWorkspace()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_type_members", new
+        // RoslynService's partial surface now exceeds the default 100-member
+        // page, so request a wide page to reach _workspace / LoadSolutionAsync.
+        var data = await CallAndGetDataAsync("get_type_members", new
         {
-            typeName = "RoslynService"
+            typeName = "RoslynService",
+            maxResults = 1000
         });
         data["totalMembers"]!.Value<int>().Should().BeGreaterThan(50);
 
@@ -624,11 +629,11 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetTypeMembersBatch_ReturnsTwoNamedResultsWithBatchMetadata()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_type_members_batch", new
+        var data = await CallAndGetDataAsync("get_type_members_batch", new
         {
             typeNames = new[] { "RoslynService", "McpServer" }
         });
-        // Lock the batch-tool metadata shape (TypeDiscovery.cs:169-171).
+        // Lock the batch-tool metadata shape.
         data["totalRequested"]!.Value<int>().Should().Be(2);
         data["successCount"]!.Value<int>().Should().Be(2);
         data["errorCount"]!.Value<int>().Should().Be(0);
@@ -643,7 +648,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetMethodSignature_OnLoadSolutionAsync_LocksParametersAndReturnType()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_method_signature", new
+        var data = await CallAndGetDataAsync("get_method_signature", new
         {
             typeName = "RoslynService",
             methodName = "LoadSolutionAsync"
@@ -655,16 +660,19 @@ public class NavigationToolsViaMcpTests : McpTestBase
         data["containingType"]!.Value<string>()!.Should().Contain("RoslynService");
 
         var parameters = (data["parameters"] as JArray)!;
-        parameters.Count.Should().Be(1);
+        parameters.Count.Should().Be(2,
+            "solutionPath plus the cancellationToken every tool method carries");
         parameters[0]["name"]!.Value<string>().Should().Be("solutionPath");
         parameters[0]["type"]!.Value<string>().Should().Be("string");
         parameters[0]["isOptional"]!.Value<bool>().Should().BeFalse();
+        parameters[1]["name"]!.Value<string>().Should().Be("cancellationToken");
+        parameters[1]["isOptional"]!.Value<bool>().Should().BeTrue();
     }
 
     [Fact]
     public async Task GetDerivedTypes_OnFixtureRectangle_ReturnsExactlyFixtureSquare()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_derived_types", new
+        var data = await CallAndGetDataAsync("get_derived_types", new
         {
             baseTypeName = "FixtureRectangle",
             includeTransitive = true
@@ -678,7 +686,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetBaseTypes_OnFixtureSquare_ReturnsRectangleAsImmediateBase()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_base_types", new
+        var data = await CallAndGetDataAsync("get_base_types", new
         {
             typeName = "FixtureSquare"
         });
@@ -697,7 +705,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetAttributes_FactAttribute_FindsManyXunitFactMembers()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_attributes", new
+        var data = await CallAndGetDataAsync("get_attributes", new
         {
             attributeName = "Fact"
         });
@@ -726,7 +734,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
         bodyLine.Should().BeGreaterThan(-1,
             "MatchesGlobPattern's body contains the regexPattern initialization");
 
-        var data = await CallAndGetDataAsync("roslyn:get_containing_member", new
+        var data = await CallAndGetDataAsync("get_containing_member", new
         {
             filePath = Fixture.RoslynServicePath, line = bodyLine, column = 10
         });
@@ -740,7 +748,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     {
         var (file, line, col) = await LocateSymbolAsync(
             "CreateErrorResponse", kind: "Method");
-        var data = await CallAndGetDataAsync("roslyn:get_method_overloads", new
+        var data = await CallAndGetDataAsync("get_method_overloads", new
         {
             filePath = file, line, column = col
         });
@@ -761,7 +769,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
         // totalCount lives in the meta envelope, not on data — so use CallToolAsync
         // and pull it from inner["meta"]. The prior `data["totalCount"]?.Value<int>()`
         // silent-passed against a non-existent data-level field.
-        var inner = await CallToolAsync("roslyn:find_attribute_usages", new
+        var inner = await CallToolAsync("find_attribute_usages", new
         {
             attributeName = "Fact",
             maxResults = 200
@@ -774,15 +782,15 @@ public class NavigationToolsViaMcpTests : McpTestBase
         usages.Should().NotBeEmpty();
         meta["totalCount"]!.Value<int>().Should().BeGreaterThan(100,
             "the test project has well over 100 [Fact]-decorated methods");
-        // Lock the documented data shape (Discovery.cs:66): attributeFilter, usages[].
+        // Lock the documented data shape: attributeFilter, usages[].
         data["attributeFilter"]!.Value<string>().Should().Be("Fact");
 
         foreach (var u in usages)
         {
             u["attributeName"]!.Value<string>().Should().Be("FactAttribute");
             // Test methods or types — the impl tags type-level decorations as
-            // "Type" (Discovery.cs:36) and member-level as the member's Kind
-            // (Discovery.cs:54). For [Fact] in xUnit, decorations are on methods.
+            // "Type" and member-level as the member's Kind.
+            // For [Fact] in xUnit, decorations are on methods.
             u["symbolKind"]!.Value<string>().Should().Be("Method",
                 "[Fact] is applied to test methods");
         }
@@ -791,7 +799,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetExternalTypeInfo_OnSystemString_ReturnsCoreMembersWithDocs()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_external_type_info", new
+        var data = await CallAndGetDataAsync("get_external_type_info", new
         {
             typeName = "System.String"
         });
@@ -807,15 +815,15 @@ public class NavigationToolsViaMcpTests : McpTestBase
         names.Should().Contain("Substring");
         names.Should().Contain("Trim");
 
-        // At least one well-known member must have an XML doc summary.
-        members.Any(m => !string.IsNullOrEmpty(m["xmlDoc"]?.Value<string>()))
+        // At least one well-known member must have a structured XML doc summary.
+        members.Any(m => !string.IsNullOrEmpty(m["xmlDoc"]?["summary"]?.Value<string>()))
             .Should().BeTrue("System.String members ship with XML docs in the runtime reference assemblies");
     }
 
     [Fact]
     public async Task GetTypeMembers_EmptyTypeName_ReturnsInvalidParameter()
     {
-        var error = await CallAndGetErrorAsync("roslyn:get_type_members", new
+        var error = await CallAndGetErrorAsync("get_type_members", new
         {
             typeName = ""
         }, codeContains: ErrorCodes.InvalidParameter);
@@ -825,7 +833,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetTypeMembers_UnknownType_ReturnsTypeNotFound()
     {
-        var error = await CallAndGetErrorAsync("roslyn:get_type_members", new
+        var error = await CallAndGetErrorAsync("get_type_members", new
         {
             typeName = "DoesNotExist_12345"
         }, codeContains: ErrorCodes.TypeNotFound);
@@ -836,7 +844,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task GetTypeMembers_IncludeInheritedTrue_OnFixtureSquare_IncludesRectangleMembers()
     {
         // FixtureSquare adds Side; FixtureRectangle (base) adds Width/Height/Area.
-        var data = await CallAndGetDataAsync("roslyn:get_type_members", new
+        var data = await CallAndGetDataAsync("get_type_members", new
         {
             typeName = "FixtureSquare",
             includeInherited = true
@@ -852,7 +860,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetTypeMembers_MemberKindMethod_FiltersToMethodsOnly()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_type_members", new
+        var data = await CallAndGetDataAsync("get_type_members", new
         {
             typeName = "RoslynService",
             memberKind = "Method"
@@ -868,7 +876,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetMethodSignature_UnknownType_ReturnsTypeNotFound()
     {
-        var error = await CallAndGetErrorAsync("roslyn:get_method_signature", new
+        var error = await CallAndGetErrorAsync("get_method_signature", new
         {
             typeName = "DoesNotExist_12345",
             methodName = "DoesNotMatter"
@@ -879,7 +887,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetMethodSignature_UnknownMethod_ReturnsSymbolNotFound()
     {
-        var error = await CallAndGetErrorAsync("roslyn:get_method_signature", new
+        var error = await CallAndGetErrorAsync("get_method_signature", new
         {
             typeName = "RoslynService",
             methodName = "DoesNotExist_12345"
@@ -893,7 +901,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
         // CreateErrorResponse on RoslynService has one overload; CreateSuccessResponse
         // has one too. Locking overloadCount lets a regression that mis-counts overloads
         // fail. Using overloadIndex=0 should be identical to default.
-        var data = await CallAndGetDataAsync("roslyn:get_method_signature", new
+        var data = await CallAndGetDataAsync("get_method_signature", new
         {
             typeName = "RoslynService",
             methodName = "CreateErrorResponse",
@@ -907,7 +915,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetAttributes_EmptyName_ReturnsInvalidParameter()
     {
-        var error = await CallAndGetErrorAsync("roslyn:get_attributes", new
+        var error = await CallAndGetErrorAsync("get_attributes", new
         {
             attributeName = ""
         }, codeContains: ErrorCodes.InvalidParameter);
@@ -919,7 +927,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     {
         // scope="project:SharpLensMcp" must drop [Fact] hits from SharpLensMcp.Tests.
         // The main project has zero [Fact] decorations, so totalFound must be 0.
-        var data = await CallAndGetDataAsync("roslyn:get_attributes", new
+        var data = await CallAndGetDataAsync("get_attributes", new
         {
             attributeName = "Fact",
             scope = "project:SharpLensMcp"
@@ -931,7 +939,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetDerivedTypes_EmptyBaseTypeName_ReturnsInvalidParameter()
     {
-        var error = await CallAndGetErrorAsync("roslyn:get_derived_types", new
+        var error = await CallAndGetErrorAsync("get_derived_types", new
         {
             baseTypeName = ""
         }, codeContains: ErrorCodes.InvalidParameter);
@@ -940,7 +948,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetDerivedTypes_UnknownBase_ReturnsTypeNotFound()
     {
-        var error = await CallAndGetErrorAsync("roslyn:get_derived_types", new
+        var error = await CallAndGetErrorAsync("get_derived_types", new
         {
             baseTypeName = "DoesNotExist_12345"
         }, codeContains: ErrorCodes.TypeNotFound);
@@ -950,11 +958,11 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task GetDerivedTypes_IncludeTransitiveFalse_OnRectangle_OnlyDirectDerivations()
     {
         // FixtureRectangle has FixtureSquare as direct subclass. With
-        // includeTransitive=false (Navigation.cs:538), the result still includes
+        // includeTransitive=false, the result still includes
         // direct subclasses. SymbolFinder.FindDerivedClassesAsync(transitive: false)
         // returns only immediate subclasses, which for FixtureRectangle is just
         // FixtureSquare anyway.
-        var data = await CallAndGetDataAsync("roslyn:get_derived_types", new
+        var data = await CallAndGetDataAsync("get_derived_types", new
         {
             baseTypeName = "FixtureRectangle",
             includeTransitive = false
@@ -968,7 +976,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetBaseTypes_EmptyTypeName_ReturnsInvalidParameter()
     {
-        var error = await CallAndGetErrorAsync("roslyn:get_base_types", new
+        var error = await CallAndGetErrorAsync("get_base_types", new
         {
             typeName = ""
         }, codeContains: ErrorCodes.InvalidParameter);
@@ -977,7 +985,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task GetBaseTypes_UnknownType_ReturnsTypeNotFound()
     {
-        var error = await CallAndGetErrorAsync("roslyn:get_base_types", new
+        var error = await CallAndGetErrorAsync("get_base_types", new
         {
             typeName = "DoesNotExist_12345"
         }, codeContains: ErrorCodes.TypeNotFound);
@@ -987,7 +995,7 @@ public class NavigationToolsViaMcpTests : McpTestBase
     public async Task GetExternalTypeInfo_UnknownType_ReturnsExactTypeNotFoundWithFqnHint()
     {
         var error = await CallAndGetErrorAsync(
-            "roslyn:get_external_type_info",
+            "get_external_type_info",
             new { typeName = "System.Garbage.NoSuchType" },
             codeContains: ErrorCodes.TypeNotFound);
         // Helper already enforced codeContains; lock the FQN hint instead of

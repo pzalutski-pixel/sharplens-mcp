@@ -4,7 +4,7 @@ using Xunit;
 
 namespace SharpLensMcp.Tests;
 
-// Verifies get_project_health (Quality.cs:501-621) returns every documented
+// Verifies get_project_health returns every documented
 // section, honors topN, exercises the includeAnalyzers gate, matches project
 // names case-insensitively, and returns InvalidParameter with a guiding hint
 // for unknown projects.
@@ -22,7 +22,7 @@ public class ProjectHealthTests : RoslynServiceTestBase
         // is missing.
         data["projectName"]!.Value<string>().Should().Be("SharpLensMcp");
 
-        // Every documented section must be present (Quality.cs:572-612).
+        // Every documented section must be present.
         var diagnostics = data["diagnostics"]!;
         var unusedCode = data["unusedCode"]!;
         var coupling = data["coupling"]!;
@@ -42,44 +42,71 @@ public class ProjectHealthTests : RoslynServiceTestBase
         foreach (var entry in topDiagsByCount!)
         {
             entry["id"]!.Value<string>().Should().NotBeNullOrEmpty(
-                "each topByCount entry must carry the diagnostic id (Quality.cs:530)");
+                "each topByCount entry must carry the diagnostic id");
             entry["count"]!.Value<int>().Should().BeGreaterThan(0,
                 "a grouped diagnostic must have at least one occurrence");
         }
 
-        // SharpLensMcp has no analyzer-flagged god objects under default thresholds
-        // (no class has 20+ efferent coupling AND 20+ members).
-        coupling["godObjectCandidates"]!.Value<int>().Should().Be(0,
-            "no SharpLensMcp type meets the god-object thresholds");
+        // RoslynService — a 13k-line partial class — meets the default god-object
+        // thresholds (20+ efferent coupling AND 20+ members) since the shared
+        // resolution layer was added. The audit flagging it is correct; lock the
+        // exact candidate so any NEW god object sneaking in also fails this test.
+        coupling["godObjectCandidates"]!.Value<int>().Should().Be(1,
+            "RoslynService is the single type expected to meet the god-object thresholds");
         var couplingHotspots = coupling["hotspots"] as JArray;
         couplingHotspots.Should().NotBeNull("coupling.hotspots must always be an array");
+        couplingHotspots!.Select(h => h["typeName"]!.Value<string>())
+            .Should().ContainSingle(n => n!.EndsWith("RoslynService"),
+                "the sole expected god-object candidate is RoslynService");
+        // Lock each hotspot's metrics to find_god_objects — the tool get_project_health
+        // aggregates — instead of a tautological >= 0 that no count can fail. Same project
+        // and default thresholds (20/20), so the candidate sets match.
+        var godData = GetData(await Service.FindGodObjectsAsync("SharpLensMcp"));
+        var godByType = (godData["candidates"] as JArray)!
+            .ToDictionary(c => c["typeName"]!.Value<string>()!);
         foreach (var h in couplingHotspots!)
         {
-            // Per-hotspot shape (Quality.cs:591-598).
-            h["typeName"]!.Value<string>().Should().NotBeNullOrEmpty();
-            h["efferentCoupling"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
-            h["afferentCoupling"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
-            h["memberCount"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
+            var typeName = h["typeName"]!.Value<string>()!;
+            typeName.Should().NotBeNullOrEmpty();
+            godByType.Should().ContainKey(typeName,
+                "every coupling hotspot must correspond to a find_god_objects candidate");
+            var expected = godByType[typeName];
+            h["efferentCoupling"]!.Value<int>().Should().Be(expected["efferentCoupling"]!.Value<int>(),
+                "get_project_health must report the same efferent coupling as find_god_objects");
+            h["afferentCoupling"]!.Value<int>().Should().Be(expected["afferentCoupling"]!.Value<int>(),
+                "get_project_health must report the same afferent coupling as find_god_objects");
+            h["memberCount"]!.Value<int>().Should().Be(expected["memberCount"]!.Value<int>(),
+                "get_project_health must report the same member count as find_god_objects");
             h["score"].Should().NotBeNull();
             h["location"].Should().NotBeNull();
         }
 
-        // coverage.uncoveredPublicSurface is the int from FindUntestedCode total
-        // (Quality.cs:602). hotspots is always emitted as an array.
-        coverage["uncoveredPublicSurface"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
+        // uncoveredPublicSurface must equal find_untested_code's total for the SAME
+        // filters get_project_health uses (includeProperties:false, includeInternal:false)
+        // — a real consistency lock, not a >= 0 tautology.
+        var untestedTotal = GetMeta(await Service.FindUntestedCodeAsync(
+            "SharpLensMcp", includeProperties: false, includeInternal: false))["TotalCount"]!.Value<int>();
+        coverage["uncoveredPublicSurface"]!.Value<int>().Should().Be(untestedTotal,
+            "the composite count must match the find_untested_code tool it aggregates");
         var coverageHotspots = coverage["hotspots"] as JArray;
         coverageHotspots.Should().NotBeNull("coverage.hotspots must always be an array");
         foreach (var h in coverageHotspots!)
         {
-            // Per-hotspot shape (Quality.cs:604-610).
+            // Per-hotspot shape.
             h["fullName"]!.Value<string>().Should().NotBeNullOrEmpty();
             h["kind"]!.Value<string>().Should().NotBeNullOrEmpty();
             h["accessibility"].Should().NotBeNull();
             h["location"].Should().NotBeNull();
         }
 
-        // unusedCode.count + topByKind are always emitted (Quality.cs:582-586).
-        unusedCode["count"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
+        // unusedCode.count must equal find_unused_code's total for the same filters AND
+        // the same maxResults the composite passes (topN here), since both go through the
+        // same Core. A real consistency lock, not a >= 0 tautology.
+        var unusedTotal = GetMeta(await Service.FindUnusedCodeAsync(
+            "SharpLensMcp", includePrivate: false, includeInternal: false,
+            symbolKindFilter: null, maxResults: 5))["TotalCount"]!.Value<int>();
+        unusedCode["count"]!.Value<int>().Should().Be(unusedTotal,
+            "the composite count must match the find_unused_code tool it aggregates");
         var topByKind = unusedCode["topByKind"] as JArray;
         topByKind.Should().NotBeNull("unusedCode.topByKind must always be emitted as an array");
         foreach (var entry in topByKind!)
@@ -98,7 +125,7 @@ public class ProjectHealthTests : RoslynServiceTestBase
         var data = GetData(result);
 
         // topN caps three different arrays inside the response. The impl always emits
-        // these arrays (Quality.cs:590, 603, 580) — never null — so the prior
+        // these arrays — never null — so the prior
         // `if (array != null)` guards were dead code that would have skipped the cap
         // verification on a regression that dropped a field.
         var topDiags = data["diagnostics"]!["topByCount"] as JArray;
@@ -108,12 +135,12 @@ public class ProjectHealthTests : RoslynServiceTestBase
         var godHotspots = data["coupling"]!["hotspots"] as JArray;
         godHotspots.Should().NotBeNull();
         godHotspots!.Count.Should().BeLessOrEqualTo(2,
-            "topN must cap the coupling hotspots list (Quality.cs:550 passes maxResults: topN)");
+            "topN must cap the coupling hotspots list (passed as maxResults)");
 
         var coverageHotspots = data["coverage"]!["hotspots"] as JArray;
         coverageHotspots.Should().NotBeNull();
         coverageHotspots!.Count.Should().BeLessOrEqualTo(2,
-            "topN must cap the coverage hotspots list (Quality.cs:559 passes maxResults: topN)");
+            "topN must cap the coverage hotspots list (passed as maxResults)");
     }
 
     [Fact]
@@ -124,21 +151,21 @@ public class ProjectHealthTests : RoslynServiceTestBase
 
         var data = GetData(result);
         // includeAnalyzers=false is forwarded as runAnalyzers=false to
-        // GetDiagnosticsDataAsync (Quality.cs:524) — analyzerCount must be 0.
+        // GetDiagnosticsDataAsync — analyzerCount must be 0.
         data["diagnostics"]!["analyzerCount"]!.Value<int>().Should().Be(0,
             "includeAnalyzers=false must skip analyzer execution");
 
-        // Per Quality.cs:569 the summary format is exactly:
+        // The summary format is exactly:
         //   "{n} errors, {n} warnings, {n} god-object candidates, {n} uncovered public methods, {n} unused symbols"
-        // SharpLensMcp is clean → "0 errors, 0 warnings, 0 god-object candidates".
-        // Locks both the format AND the known-zero counts.
+        // SharpLensMcp compiles clean → "0 errors, 0 warnings"; RoslynService is the
+        // one known god-object candidate. Locks both the format AND the known counts.
         var summary = data["summary"]!.Value<string>()!;
         summary.Should().Contain("0 errors",
             "the clean SharpLensMcp project must report 0 errors");
         summary.Should().Contain("0 warnings",
             "the clean SharpLensMcp project must report 0 warnings");
-        summary.Should().Contain("0 god-object candidates",
-            "no type meets god-object thresholds in SharpLensMcp");
+        summary.Should().Contain("1 god-object candidates",
+            "RoslynService is the single known god-object candidate");
         summary.Should().Contain("uncovered public methods",
             "the uncovered-public-methods bucket must appear in the summary string");
         summary.Should().Contain("unused symbols",
@@ -148,7 +175,7 @@ public class ProjectHealthTests : RoslynServiceTestBase
     [Fact]
     public async Task GetProjectHealth_MatchesProjectNameCaseInsensitively()
     {
-        // Quality.cs:509 uses StringComparison.OrdinalIgnoreCase. Lock that branch —
+        // The project lookup uses StringComparison.OrdinalIgnoreCase. Lock that branch —
         // a regression to case-sensitive would silently break callers that pass the
         // project name in different casing.
         var result = await Service.GetProjectHealthAsync("sharplensmcp", includeAnalyzers: false, topN: 5);
@@ -163,12 +190,12 @@ public class ProjectHealthTests : RoslynServiceTestBase
     {
         var result = await Service.GetProjectHealthAsync("DoesNotExist_12345");
         AssertError(result, ErrorCodes.InvalidParameter);
-        // Lock the error contract (Quality.cs:512-516). RoslynError uses PascalCase
+        // Lock the error contract. RoslynError uses PascalCase
         // (Hint/Message); the prior test used lowercase ["hint"]/["message"] and the
         // `?.` chain silently skipped both assertions.
         var json = JObject.FromObject(result);
-        json["error"]!["Hint"]!.Value<string>().Should().Contain("get_project_structure",
-            "the hint must point at get_project_structure for project name discovery");
+        json["error"]!["Hint"]!.Value<string>().Should().Contain("Available projects",
+            "the unified unknown-project hint lists the valid project names");
         json["error"]!["Message"]!.Value<string>().Should().Contain("DoesNotExist_12345",
             "the error message must echo the bad project name for caller correlation");
     }

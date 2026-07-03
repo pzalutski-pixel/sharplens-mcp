@@ -14,5 +14,8 @@ public static class ErrorCodes
     public const string NotAMethod = "NOT_A_METHOD";
     public const string AnalysisFailed = "ANALYSIS_FAILED";
     public const string InvalidParameter = "INVALID_PARAMETER";
+    public const string AmbiguousMatch = "AMBIGUOUS_MATCH";
+    public const string AmbiguousType = "AMBIGUOUS_TYPE";
+    public const string InternalError = "INTERNAL_ERROR";
     public const string Timeout = "TIMEOUT";
 }

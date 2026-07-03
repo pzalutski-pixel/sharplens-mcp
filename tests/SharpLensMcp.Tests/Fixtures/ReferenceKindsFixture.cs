@@ -45,4 +45,14 @@ public class TrackedTarget
     // TrackedAttribute lacks AllowMultiple, so we can't stack two on Use().
     [Tracked(TrackedMarker)]
     public void UseMarker() { }
+
+    // A field used only as the RECEIVER of a call. `Receiver.Use()` reads the field to
+    // invoke Use(); the reference to Receiver must classify as "read", not "invocation"
+    // (the call invokes Use, not Receiver). Never executed — analysis-only.
+    public TrackedTarget Receiver = null!;
+
+    public void CallViaReceiver()
+    {
+        Receiver.Use();
+    }
 }

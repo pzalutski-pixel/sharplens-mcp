@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using System.Collections.Immutable;
 using System.Xml.Linq;
 
 namespace SharpLensMcp;
@@ -8,7 +9,9 @@ namespace SharpLensMcp;
 public partial class RoslynService
 {
 
-    public async Task<object> FindAttributeUsagesAsync(string attributeName, string? projectName = null, int maxResults = 100)
+    public async Task<object> FindAttributeUsagesAsync(
+        string attributeName, string? projectName = null, int maxResults = 100,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -20,11 +23,18 @@ public partial class RoslynService
 
         foreach (var project in projects)
         {
-            var compilation = await GetProjectCompilationAsync(project);
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
 
             foreach (var type in GetAllNamedTypes(compilation))
             {
+                cancellationToken.ThrowIfCancellationRequested();
+                // GetAllNamedTypes walks the merged global namespace, which includes
+                // every referenced assembly — restrict to this project's own source
+                // types so the BCL isn't scanned and sibling projects aren't double-
+                // counted by their referencing projects' iterations.
+                if (!SymbolEqualityComparer.Default.Equals(type.ContainingAssembly, compilation.Assembly)) continue;
+
                 foreach (var attr in type.GetAttributes())
                 {
                     if (!MatchesAttribute(attr, attributeName)) continue;
@@ -43,6 +53,9 @@ public partial class RoslynService
 
                 foreach (var member in type.GetMembers())
                 {
+                    // Nested types are reported by the outer type walk, not as members
+                    // of their container.
+                    if (member is INamedTypeSymbol) continue;
                     foreach (var attr in member.GetAttributes())
                     {
                         if (!MatchesAttribute(attr, attributeName)) continue;
@@ -70,7 +83,8 @@ public partial class RoslynService
         );
     }
 
-    public async Task<object> GetDiRegistrationsAsync(string? projectName = null)
+    public async Task<object> GetDiRegistrationsAsync(
+        string? projectName = null, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -88,22 +102,25 @@ public partial class RoslynService
 
         foreach (var project in projects)
         {
-            var compilation = await GetProjectCompilationAsync(project);
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
 
             foreach (var document in project.Documents)
             {
-                var syntaxTree = await document.GetSyntaxTreeAsync();
+                cancellationToken.ThrowIfCancellationRequested();
+                var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
                 if (syntaxTree == null) continue;
 
                 var semanticModel = compilation.GetSemanticModel(syntaxTree);
-                var root = await syntaxTree.GetRootAsync();
+                var root = await syntaxTree.GetRootAsync(cancellationToken);
 
                 var invocations = root.DescendantNodes().OfType<InvocationExpressionSyntax>();
                 foreach (var invocation in invocations)
                 {
                     var methodName = GetInvocationMethodName(invocation);
-                    if (methodName == null || !diMethodPatterns.Any(p => methodName.StartsWith(p))) continue;
+                    // Exact match: a `StartsWith` test would also catch a user's own
+                    // AddSingletonCache / AddScopedFactory helpers.
+                    if (methodName == null || !diMethodPatterns.Contains(methodName)) continue;
 
                     var symbolInfo = semanticModel.GetSymbolInfo(invocation);
                     if (symbolInfo.Symbol is not IMethodSymbol methodSymbol) continue;
@@ -118,8 +135,53 @@ public partial class RoslynService
                         : "Unknown";
 
                     var typeArgs = methodSymbol.TypeArguments;
-                    var serviceType = typeArgs.Length > 0 ? typeArgs[0].ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat) : null;
-                    var implementationType = typeArgs.Length > 1 ? typeArgs[1].ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat) : serviceType;
+                    var serviceType = typeArgs.Length > 0
+                        ? typeArgs[0].ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat) : null;
+                    var implementationType = typeArgs.Length > 1
+                        ? typeArgs[1].ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)
+                        : typeArgs.Length == 1 ? serviceType : null;
+
+                    if (methodName == "AddHostedService" && typeArgs.Length >= 1)
+                    {
+                        // AddHostedService<T> registers T as the IHostedService service,
+                        // not as its own service type.
+                        implementationType = typeArgs[0].ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
+                        serviceType = "IHostedService";
+                    }
+
+                    // Non-generic registrations carry the types as typeof(...) arguments
+                    // or a factory lambda whose produced type is the implementation.
+                    if (serviceType == null || implementationType == null)
+                    {
+                        var systemType = compilation.GetTypeByMetadataName("System.Type");
+                        var typeofTypes = new List<string>();
+                        string? factoryType = null;
+                        var args = invocation.ArgumentList.Arguments;
+                        for (var i = 0; i < args.Count; i++)
+                        {
+                            var expr = args[i].Expression;
+                            // Only typeof arguments bound to a System.Type parameter are
+                            // service/implementation types; a keyed overload's object key
+                            // is skipped. argument[i] aligns with Parameters[i] for both
+                            // the reduced-extension and static-call symbol shapes.
+                            var param = i < methodSymbol.Parameters.Length ? methodSymbol.Parameters[i] : null;
+                            var paramIsType = param == null
+                                || (systemType != null && SymbolEqualityComparer.Default.Equals(param.Type, systemType));
+
+                            if (expr is TypeOfExpressionSyntax typeOf && paramIsType
+                                && semanticModel.GetTypeInfo(typeOf.Type, cancellationToken).Type is { } resolvedType)
+                            {
+                                typeofTypes.Add(resolvedType.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat));
+                            }
+                            else if (expr is LambdaExpressionSyntax lambda
+                                && FactoryProducedType(lambda, semanticModel, cancellationToken) is { } producedType)
+                            {
+                                factoryType = producedType.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
+                            }
+                        }
+                        serviceType ??= typeofTypes.ElementAtOrDefault(0);
+                        implementationType ??= typeofTypes.ElementAtOrDefault(1) ?? factoryType ?? serviceType;
+                    }
 
                     var lineSpan = invocation.GetLocation().GetLineSpan();
                     registrations.Add(new
@@ -147,12 +209,34 @@ public partial class RoslynService
         );
     }
 
-    public async Task<object> FindReflectionUsageAsync(string? projectName = null, int maxResults = 100)
+    // The type a DI factory lambda produces: the body expression for an
+    // expression-bodied lambda, or the last return in a block-bodied one (skipping
+    // returns that belong to nested lambdas/local functions).
+    private static ITypeSymbol? FactoryProducedType(
+        LambdaExpressionSyntax lambda, SemanticModel semanticModel, CancellationToken cancellationToken)
+    {
+        if (lambda.Body is ExpressionSyntax expr)
+            return semanticModel.GetTypeInfo(expr, cancellationToken).Type;
+        if (lambda.Body is BlockSyntax block)
+        {
+            var returned = block
+                .DescendantNodes(n => n is not AnonymousFunctionExpressionSyntax
+                                   && n is not LocalFunctionStatementSyntax)
+                .OfType<ReturnStatementSyntax>()
+                .Select(r => r.Expression)
+                .LastOrDefault(e => e != null);
+            if (returned != null)
+                return semanticModel.GetTypeInfo(returned, cancellationToken).Type;
+        }
+        return null;
+    }
+
+    public async Task<object> FindReflectionUsageAsync(
+        string? projectName = null, int maxResults = 100, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var usages = new List<object>();
-        var totalFound = 0;
+        var hits = new List<(bool lowSignal, object entry)>();
         var reflectionApis = new[]
         {
             "GetType", "GetMethod", "GetProperty", "GetField", "GetEvent",
@@ -167,16 +251,17 @@ public partial class RoslynService
 
         foreach (var project in projects)
         {
-            var compilation = await GetProjectCompilationAsync(project);
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
 
             foreach (var document in project.Documents)
             {
-                var syntaxTree = await document.GetSyntaxTreeAsync();
+                cancellationToken.ThrowIfCancellationRequested();
+                var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
                 if (syntaxTree == null) continue;
 
                 var semanticModel = compilation.GetSemanticModel(syntaxTree);
-                var root = await syntaxTree.GetRootAsync();
+                var root = await syntaxTree.GetRootAsync(cancellationToken);
 
                 var invocations = root.DescendantNodes().OfType<InvocationExpressionSyntax>();
                 foreach (var invocation in invocations)
@@ -187,41 +272,55 @@ public partial class RoslynService
                     var containingNamespace = methodSymbol.ContainingType?.ContainingNamespace?.ToDisplayString();
                     if (containingNamespace == null) continue;
 
+                    // System.Type members (Type.GetType, GetMethod, …), Activator,
+                    // Delegate.DynamicInvoke, everything in System.Reflection, and the
+                    // instance Object.GetType() runtime-type query. The last is the
+                    // highest-volume and lowest-signal of these; it stays distinguishable
+                    // by the "Object.GetType" reflectionApi so callers can filter it out.
                     var isReflection = containingNamespace.StartsWith("System.Reflection")
                         || (containingNamespace == "System" && methodSymbol.ContainingType?.Name == "Type" && reflectionApis.Contains(methodSymbol.Name))
+                        || (containingNamespace == "System" && methodSymbol.ContainingType?.Name == "Object" && methodSymbol.Name == "GetType")
                         || (containingNamespace == "System" && methodSymbol.ContainingType?.Name == "Activator")
                         || (containingNamespace == "System" && methodSymbol.ContainingType?.Name == "Delegate" && methodSymbol.Name == "DynamicInvoke");
 
                     if (!isReflection) continue;
 
-                    totalFound++;
-                    if (usages.Count >= maxResults) continue;
-
+                    var lowSignal = methodSymbol.ContainingType?.Name == "Object" && methodSymbol.Name == "GetType";
                     var lineSpan = invocation.GetLocation().GetLineSpan();
-                    usages.Add(new
+                    hits.Add((lowSignal, new
                     {
                         reflectionApi = $"{methodSymbol.ContainingType?.Name}.{methodSymbol.Name}",
-                        context = invocation.ToString().Length > 200 ? invocation.ToString()[..200] + "..." : invocation.ToString(),
+                        context = TruncateForSnippet(invocation.ToString(), 200, "..."),
                         location = new
                         {
                             filePath = FormatPath(lineSpan.Path),
                             line = lineSpan.StartLinePosition.Line,
                             column = lineSpan.StartLinePosition.Character
                         }
-                    });
+                    }));
                 }
             }
         }
 
+        // High-signal (string-driven) reflection is ordered ahead of the common
+        // Object.GetType() runtime-type query so the latter never crowds the
+        // meaningful hits out of a capped page (stable within each group).
+        var usages = hits
+            .OrderBy(h => h.lowSignal ? 1 : 0)
+            .Take(maxResults)
+            .Select(h => h.entry)
+            .ToList();
+
         return CreateSuccessResponse(
             data: new { usages },
             suggestedNextTools: new[] { "find_references", "get_symbol_info" },
-            totalCount: totalFound,
+            totalCount: hits.Count,
             returnedCount: usages.Count
         );
     }
 
-    public Task<object> FindCircularDependenciesAsync(string? level = null)
+    public Task<object> FindCircularDependenciesAsync(
+        string? level = null, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -244,6 +343,7 @@ public partial class RoslynService
             var projectGraph = new Dictionary<string, List<string>>();
             foreach (var project in _solution!.Projects)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var dependencies = project.ProjectReferences
                     .Select(pr => _solution!.GetProject(pr.ProjectId)?.Name)
                     .Where(name => name != null)
@@ -260,39 +360,51 @@ public partial class RoslynService
         }
 
         // Namespace level
-        return FindNamespaceCircularDependenciesAsync();
+        return FindNamespaceCircularDependenciesAsync(cancellationToken);
     }
 
-    private async Task<object> FindNamespaceCircularDependenciesAsync()
+    private async Task<object> FindNamespaceCircularDependenciesAsync(CancellationToken cancellationToken = default)
     {
         var namespaceGraph = new Dictionary<string, HashSet<string>>();
 
         foreach (var project in _solution!.Projects)
         {
-            var compilation = await GetProjectCompilationAsync(project);
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
             {
-                var root = await syntaxTree.GetRootAsync();
+                var root = await syntaxTree.GetRootAsync(cancellationToken);
                 var semanticModel = compilation.GetSemanticModel(syntaxTree);
+                var fileUsings = (root as CompilationUnitSyntax)?.Usings ?? default;
 
-                // Get namespace of this file
-                var namespaceDecl = root.DescendantNodes().OfType<BaseNamespaceDeclarationSyntax>().FirstOrDefault();
-                if (namespaceDecl == null) continue;
-                var currentNamespace = namespaceDecl.Name.ToString();
-
-                if (!namespaceGraph.ContainsKey(currentNamespace))
-                    namespaceGraph[currentNamespace] = new HashSet<string>();
-
-                // Get referenced namespaces from using directives
-                var usings = root.DescendantNodes().OfType<UsingDirectiveSyntax>();
-                foreach (var u in usings)
+                // Every namespace declared in the file — not just the first — and the
+                // usings actually in scope for each (its own + enclosing + file-level).
+                foreach (var namespaceDecl in root.DescendantNodes().OfType<BaseNamespaceDeclarationSyntax>())
                 {
-                    var referencedNamespace = u.Name?.ToString();
-                    if (referencedNamespace != null && referencedNamespace != currentNamespace)
+                    var currentNamespace =
+                        (semanticModel.GetDeclaredSymbol(namespaceDecl, cancellationToken) as INamespaceSymbol)
+                            ?.ToDisplayString() ?? namespaceDecl.Name.ToString();
+
+                    if (!namespaceGraph.ContainsKey(currentNamespace))
+                        namespaceGraph[currentNamespace] = new HashSet<string>();
+
+                    var inScopeUsings = namespaceDecl.AncestorsAndSelf()
+                        .OfType<BaseNamespaceDeclarationSyntax>()
+                        .SelectMany(n => n.Usings)
+                        .Concat(fileUsings);
+                    foreach (var u in inScopeUsings)
                     {
-                        namespaceGraph[currentNamespace].Add(referencedNamespace);
+                        if (u.Name == null) continue;
+                        // Resolve the using to its namespace symbol so aliases and
+                        // global:: prefixes map to the canonical namespace name.
+                        var referencedNamespace =
+                            (semanticModel.GetSymbolInfo(u.Name, cancellationToken).Symbol as INamespaceSymbol)
+                                ?.ToDisplayString() ?? u.Name.ToString();
+                        if (referencedNamespace != currentNamespace)
+                        {
+                            namespaceGraph[currentNamespace].Add(referencedNamespace);
+                        }
                     }
                 }
             }
@@ -320,7 +432,8 @@ public partial class RoslynService
         );
     }
 
-    public Task<object> GetNuGetDependenciesAsync(string? projectName = null)
+    public Task<object> GetNuGetDependenciesAsync(
+        string? projectName = null, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -331,47 +444,36 @@ public partial class RoslynService
 
         foreach (var project in projects)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var packages = new List<object>();
             var projectFilePath = project.FilePath;
 
+            string? parseError = null;
             if (projectFilePath != null && File.Exists(projectFilePath))
             {
-                try
+                // Effective references: merges Directory.Build.props and resolves CPM
+                // versions from Directory.Packages.props, not just the leaf csproj. A
+                // malformed props/csproj is reported via parseError, not swallowed.
+                var parseErrors = new List<string>();
+                foreach (var pkgRef in CollectEffectivePackageReferences(projectFilePath, parseErrors))
                 {
-                    var csprojContent = File.ReadAllText(projectFilePath);
-                    var doc = System.Xml.Linq.XDocument.Parse(csprojContent);
-                    var packageRefs = doc.Descendants("PackageReference");
-
-                    foreach (var pkgRef in packageRefs)
+                    packages.Add(new
                     {
-                        var name = pkgRef.Attribute("Include")?.Value;
-                        var version = pkgRef.Attribute("Version")?.Value ?? pkgRef.Element("Version")?.Value;
-                        var privateAssets = pkgRef.Attribute("PrivateAssets")?.Value ?? pkgRef.Element("PrivateAssets")?.Value;
-                        var excludeAssets = pkgRef.Attribute("ExcludeAssets")?.Value ?? pkgRef.Element("ExcludeAssets")?.Value;
-
-                        if (name != null)
-                        {
-                            packages.Add(new
-                            {
-                                packageName = name,
-                                version = version ?? "unknown",
-                                privateAssets = privateAssets,
-                                excludeAssets = excludeAssets
-                            });
-                        }
-                    }
+                        packageName = pkgRef.Name,
+                        version = pkgRef.Version ?? "unknown",
+                        privateAssets = pkgRef.PrivateAssets,
+                        excludeAssets = pkgRef.ExcludeAssets
+                    });
                 }
-                catch
-                {
-                    // Failed to parse csproj, skip
-                }
+                if (parseErrors.Count > 0) parseError = string.Join("; ", parseErrors);
             }
 
             projectDependencies.Add(new
             {
                 projectName = project.Name,
                 projectPath = FormatPath(project.FilePath ?? ""),
-                packages
+                packages,
+                parseError
             });
         }
 
@@ -383,7 +485,8 @@ public partial class RoslynService
         ));
     }
 
-    public async Task<object> GetSourceGeneratorsAsync(string? projectName = null)
+    public async Task<object> GetSourceGeneratorsAsync(
+        string? projectName = null, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -400,8 +503,40 @@ public partial class RoslynService
 
             if (generators.Count == 0) continue;
 
-            var compilation = await GetProjectCompilationAsync(project);
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
+
+            // Timing: run the SAME driver configuration once against the
+            // project's base compilation and read per-generator elapsed time.
+            // The resulting compilation is discarded — only GetTimingInfo
+            // matters — so the double-generation hazard the augmented-
+            // compilation path guards against does not apply. A misbehaving
+            // generator leaves its elapsedMs null.
+            var elapsedByGenerator = new Dictionary<ISourceGenerator, double>();
+            try
+            {
+                var baseCompilation = await project.GetCompilationAsync(cancellationToken);
+                if (baseCompilation != null)
+                {
+                    GeneratorDriver timingDriver = CreateGeneratorDriver(project, generators.ToImmutableArray());
+                    timingDriver = timingDriver.RunGenerators(baseCompilation, cancellationToken);
+                    foreach (var generatorTiming in timingDriver.GetTimingInfo().GeneratorTimes)
+                    {
+                        elapsedByGenerator[generatorTiming.Generator] =
+                            Math.Round(generatorTiming.ElapsedTime.TotalMilliseconds, 2);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // A per-call timeout during generator timing must surface as cancellation,
+                // matching ComputeAugmentedCompilationAsync — not be swallowed into a warning.
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[Warning] Generator timing failed for '{project.Name}': {ex.Message}");
+            }
 
             // Post-generator compilation has extra syntax trees for generated code.
             // Identify them as trees whose FilePath is not one of the project's own documents.
@@ -414,7 +549,7 @@ public partial class RoslynService
             {
                 if (projectDocumentPaths.Contains(tree.FilePath)) continue;
 
-                var text = await tree.GetTextAsync();
+                var text = await tree.GetTextAsync(cancellationToken);
                 generatedFiles.Add(new
                 {
                     fileName = Path.GetFileName(tree.FilePath),
@@ -432,7 +567,8 @@ public partial class RoslynService
                     return new
                     {
                         typeName = underlying.FullName,
-                        assemblyName = underlying.Assembly.GetName().Name
+                        assemblyName = underlying.Assembly.GetName().Name,
+                        elapsedMs = elapsedByGenerator.TryGetValue(g, out var ms) ? ms : (double?)null
                     };
                 }).ToList(),
                 generatedFiles
@@ -463,17 +599,18 @@ public partial class RoslynService
         return inner?.GetType() ?? t;
     }
 
-    public async Task<object> GetGeneratedCodeAsync(string projectName, string generatedFileName)
+    public async Task<object> GetGeneratedCodeAsync(
+        string projectName, string generatedFileName, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
         var project = _solution!.Projects.FirstOrDefault(p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase));
         if (project == null)
         {
-            return CreateErrorResponse(ErrorCodes.FileNotFound, $"Project '{projectName}' not found");
+            return ProjectNotFoundError(projectName);
         }
 
-        var compilation = await GetProjectCompilationAsync(project);
+        var compilation = await GetProjectCompilationAsync(project, cancellationToken);
         if (compilation == null)
         {
             return CreateErrorResponse(ErrorCodes.AnalysisFailed, "Could not get compilation");
@@ -491,7 +628,7 @@ public partial class RoslynService
             if (tree.FilePath.Contains(generatedFileName, StringComparison.OrdinalIgnoreCase) ||
                 Path.GetFileName(tree.FilePath).Contains(generatedFileName, StringComparison.OrdinalIgnoreCase))
             {
-                var text = await tree.GetTextAsync();
+                var text = await tree.GetTextAsync(cancellationToken);
                 return CreateSuccessResponse(
                     data: new
                     {
@@ -513,9 +650,14 @@ public partial class RoslynService
         var className = attr.AttributeClass?.Name;
         if (className == null) return false;
 
+        // Strip only a TRAILING "Attribute" suffix — not every occurrence — so
+        // "FooAttributeBarAttribute" reduces to "FooAttributeBar", never "FooBar".
+        var withoutSuffix = className.EndsWith("Attribute", StringComparison.Ordinal)
+            ? className[..^"Attribute".Length]
+            : className;
         return className.Equals(attributeName, StringComparison.OrdinalIgnoreCase)
             || className.Equals($"{attributeName}Attribute", StringComparison.OrdinalIgnoreCase)
-            || className.Replace("Attribute", "").Equals(attributeName, StringComparison.OrdinalIgnoreCase);
+            || withoutSuffix.Equals(attributeName, StringComparison.OrdinalIgnoreCase);
     }
 
     private static IEnumerable<INamedTypeSymbol> GetAllNamedTypes(Compilation compilation)

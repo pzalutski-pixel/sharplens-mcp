@@ -13,9 +13,7 @@ namespace SharpLensMcp.Tests.Mcp;
 //    reached only from non-test code; CoveredByTest and ChainedFromTest are
 //    reached transitively from a [Fact] method.
 //
-// Response shapes:
-//  - find_god_objects:    Quality.cs:293-309
-//  - find_untested_code:  Quality.cs:55-71
+// Response shapes covered: find_god_objects, find_untested_code.
 public class AuditToolsViaMcpTests : McpTestBase
 {
     public AuditToolsViaMcpTests(McpServerFixture fixture) : base(fixture) { }
@@ -23,14 +21,14 @@ public class AuditToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task FindGodObjects_FlagsFixtureWithExpectedMetrics()
     {
-        var data = await CallAndGetDataAsync("roslyn:find_god_objects", new
+        var data = await CallAndGetDataAsync("find_god_objects", new
         {
             projectName = "SharpLensMcp.Tests",
             minEfferentCoupling = 20,
             minMembers = 20,
             maxResults = 20
         });
-        // Lock the threshold echo (Quality.cs:296) — a regression that emitted
+        // Lock the threshold echo — a regression that emitted
         // hard-coded thresholds instead of the requested ones would be invisible
         // without this lock.
         data["threshold"]!["efferent"]!.Value<int>().Should().Be(20);
@@ -51,8 +49,8 @@ public class AuditToolsViaMcpTests : McpTestBase
             "the fixture has exactly 25 fields and no other explicit members");
         afferent.Should().Be(0,
             "nothing in the test project references GodObjectFixtureClass by type");
-        // Lock the scoring formula (Quality.cs:439): eff*0.4 + members*0.4 + aff*0.2,
-        // rounded to 2 decimals (Quality.cs:450). For 25/25/0 the expected score is 20.0.
+        // Lock the scoring formula: eff*0.4 + members*0.4 + aff*0.2,
+        // rounded to 2 decimals. For 25/25/0 the expected score is 20.0.
         var expectedScore = Math.Round(efferent * 0.4 + members * 0.4 + afferent * 0.2, 2);
         god["score"]!.Value<double>().Should().Be(expectedScore);
         god["location"].Should().NotBeNull(
@@ -62,7 +60,7 @@ public class AuditToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task FindGodObjects_DoesNotFlagSmallFocusedFixture()
     {
-        var data = await CallAndGetDataAsync("roslyn:find_god_objects", new
+        var data = await CallAndGetDataAsync("find_god_objects", new
         {
             projectName = "SharpLensMcp.Tests",
             minEfferentCoupling = 20,
@@ -81,7 +79,7 @@ public class AuditToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task FindGodObjects_ImpossibleThresholds_ReturnsExactlyZero()
     {
-        var data = await CallAndGetDataAsync("roslyn:find_god_objects", new
+        var data = await CallAndGetDataAsync("find_god_objects", new
         {
             projectName = "SharpLensMcp.Tests",
             minEfferentCoupling = 100000,
@@ -100,14 +98,14 @@ public class AuditToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task FindUntestedCode_FlagsNeverCalled_AndOnlyCalledByProduction()
     {
-        var data = await CallAndGetDataAsync("roslyn:find_untested_code", new
+        var data = await CallAndGetDataAsync("find_untested_code", new
         {
             projectName = "SharpLensMcp.Tests",
             includeProperties = false,
             includeInternal = false,
             maxResults = 200
         });
-        // Lock the metadata fields the impl emits (Quality.cs:58-61).
+        // Lock the metadata fields the impl emits.
         data["productionProject"]!.Value<string>().Should().Be("SharpLensMcp.Tests");
         data["testMethodCount"]!.Value<int>().Should().BeGreaterThan(0,
             "the Tests project has many [Fact] methods");
@@ -117,7 +115,7 @@ public class AuditToolsViaMcpTests : McpTestBase
 
         var scanned = (data["testProjectsScanned"] as JArray)!;
         scanned.Select(s => s.Value<string>()).Should().Contain("SharpLensMcp.Tests",
-            "every project where IsTestMethod found a hit must appear in testProjectsScanned (Quality.cs:90, 108)");
+            "every project where IsTestMethod found a hit must appear in testProjectsScanned");
 
         var uncovered = (data["uncoveredSymbols"] as JArray)!;
         var names = uncovered.Select(s => s["fullName"]!.Value<string>()!).ToList();
@@ -130,7 +128,7 @@ public class AuditToolsViaMcpTests : McpTestBase
     [Fact]
     public async Task FindUntestedCode_ExcludesSymbolsReachedFromTests()
     {
-        var data = await CallAndGetDataAsync("roslyn:find_untested_code", new
+        var data = await CallAndGetDataAsync("find_untested_code", new
         {
             projectName = "SharpLensMcp.Tests",
             includeProperties = false,

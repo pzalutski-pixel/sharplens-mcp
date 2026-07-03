@@ -1,0 +1,13 @@
+<Project>
+  <!-- Roslyn 5.3's transitive dev-guidance analyzers (Microsoft.CodeAnalysis.Analyzers)
+       target compiler 4.12; the .NET 8 SDK ships 4.11, so they cannot load and every
+       build warns CS9057. Remove the analyzer items instead of suppressing the warning:
+       these are optional API-usage hints for Roslyn contributors, not product
+       dependencies, and an analyzer that cannot load contributes nothing either way. -->
+  <Target Name="RemoveIncompatibleRoslynGuidanceAnalyzers" BeforeTargets="CoreCompile">
+    <ItemGroup>
+      <Analyzer Remove="@(Analyzer)"
+                Condition="$([System.String]::Copy('%(Analyzer.Identity)').Replace('\', '/').Contains('/microsoft.codeanalysis.analyzers/'))" />
+    </ItemGroup>
+  </Target>
+</Project>

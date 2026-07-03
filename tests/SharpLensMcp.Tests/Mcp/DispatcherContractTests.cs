@@ -23,11 +23,11 @@ public class DispatcherContractTests : McpTestBase
     public async Task ToolsCall_MissingRequiredString_Returns32602WithParameterAndToolName()
     {
         var msg = await CallExpectingJsonRpcErrorAsync(
-            "roslyn:search_symbols",
+            "search_symbols",
             arguments: new { kind = "Class", maxResults = 10 },
             expectedCode: -32602);
         msg.Should().Contain("query", "the missing parameter name must be in the message");
-        msg.Should().Contain("roslyn:search_symbols", "the tool name must be in the message");
+        msg.Should().Contain("search_symbols", "the tool name must be in the message");
         msg.Should().Contain("Missing required parameter", "the message must use the standard wording");
     }
 
@@ -35,36 +35,36 @@ public class DispatcherContractTests : McpTestBase
     public async Task ToolsCall_MissingRequiredInt_Returns32602WithStandardWording()
     {
         var msg = await CallExpectingJsonRpcErrorAsync(
-            "roslyn:get_symbol_info",
+            "get_symbol_info",
             arguments: new { filePath = Fixture.RoslynServicePath },
             expectedCode: -32602);
         msg.Should().Contain("line", "the first missing required int must surface");
-        msg.Should().Contain("roslyn:get_symbol_info");
+        msg.Should().Contain("get_symbol_info");
         msg.Should().Contain("Missing required parameter",
-            "the int-missing branch must use the same wording as the string-missing branch (JsonRpcParameters.cs:26)");
+            "the int-missing branch must use the same wording as the string-missing branch");
     }
 
     [Fact]
     public async Task ToolsCall_WrongTypeParameter_Returns32602WithWrongTypeWording()
     {
         var msg = await CallExpectingJsonRpcErrorAsync(
-            "roslyn:get_symbol_info",
+            "get_symbol_info",
             arguments: new { filePath = Fixture.RoslynServicePath, line = "not-a-number", column = 0 },
             expectedCode: -32602);
         msg.Should().Contain("line");
         msg.Should().Contain("wrong type", "JsonRpcParameters labels type mismatch with 'has wrong type'");
-        msg.Should().Contain("roslyn:get_symbol_info");
+        msg.Should().Contain("get_symbol_info");
     }
 
     [Fact]
     public async Task ToolsCall_UnknownTool_Returns32602WithUnknownToolWording()
     {
         var msg = await CallExpectingJsonRpcErrorAsync(
-            "roslyn:does_not_exist_12345",
+            "does_not_exist_12345",
             arguments: new { },
             expectedCode: -32602);
         msg.Should().Contain("Unknown tool", "dispatcher must surface 'Unknown tool' for unregistered names");
-        msg.Should().Contain("roslyn:does_not_exist_12345");
+        msg.Should().Contain("does_not_exist_12345");
     }
 
     [Fact]
@@ -75,50 +75,50 @@ public class DispatcherContractTests : McpTestBase
             arguments: new { },
             expectedCode: -32602);
         msg.Should().Contain("Invalid params",
-            "the dispatcher must use the standard 'Invalid params' prefix (McpServer.cs:1551)");
+            "the dispatcher must use the standard 'Invalid params' prefix");
         msg.Should().Contain("missing tool name");
     }
 
     [Fact]
     public async Task ToolsCall_MissingRequiredStringArray_Returns32602WithArrayWording()
     {
-        // get_type_members_batch's typeNames is RequiredStringArray (McpServer.cs:1878,
-        // JsonRpcParameters.cs:103-108). Missing the field must surface the array-
+        // get_type_members_batch's typeNames is RequiredStringArray.
+        // Missing the field must surface the array-
         // specific wording — distinct from the scalar 'Missing required parameter' one.
         var msg = await CallExpectingJsonRpcErrorAsync(
-            "roslyn:get_type_members_batch",
+            "get_type_members_batch",
             arguments: new { },
             expectedCode: -32602);
         msg.Should().Contain("Missing required array parameter",
             "RequiredStringArray uses a distinct error wording from scalar Required");
         msg.Should().Contain("typeNames");
-        msg.Should().Contain("roslyn:get_type_members_batch");
+        msg.Should().Contain("get_type_members_batch");
     }
 
     [Fact]
     public async Task ToolsCall_OptionalStringArrayWithNonArrayValue_Returns32602WithArrayWording()
     {
-        // semantic_query's "kinds" is OptionalStringArray (McpServer.cs:1603). Passing
+        // semantic_query's "kinds" is OptionalStringArray. Passing
         // a scalar where an array is expected must surface "must be an array of strings"
-        // (JsonRpcParameters.cs:99-100), not the generic 'has wrong type' wording.
+        // not the generic 'has wrong type' wording.
         var msg = await CallExpectingJsonRpcErrorAsync(
-            "roslyn:semantic_query",
+            "semantic_query",
             arguments: new { kinds = "Class" },
             expectedCode: -32602);
         msg.Should().Contain("kinds");
         msg.Should().Contain("must be an array of strings",
-            "the OptionalStringArray branch must surface its own wording (JsonRpcParameters.cs:99-100)");
-        msg.Should().Contain("roslyn:semantic_query");
+            "the OptionalStringArray branch must surface its own wording");
+        msg.Should().Contain("semantic_query");
     }
 
     [Fact]
     public async Task ToolsCall_StringArrayArgument_RoundTripsBothEntriesWithBatchMetadata()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_type_members_batch", new
+        var data = await CallAndGetDataAsync("get_type_members_batch", new
         {
             typeNames = new[] { "RoslynService", "McpServer" }
         });
-        // Lock the batch-tool metadata (TypeDiscovery.cs:169-171) — totalRequested,
+        // Lock the batch-tool metadata — totalRequested,
         // successCount, errorCount must match the request shape.
         data["totalRequested"]!.Value<int>().Should().Be(2);
         data["successCount"]!.Value<int>().Should().Be(2,
@@ -137,7 +137,7 @@ public class DispatcherContractTests : McpTestBase
     [Fact]
     public async Task ToolsCall_ObjectArrayArgument_RoundTripsBothEntriesWithBatchMetadata()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_method_source_batch", new
+        var data = await CallAndGetDataAsync("get_method_source_batch", new
         {
             methods = new object[]
             {
@@ -145,7 +145,7 @@ public class DispatcherContractTests : McpTestBase
                 new { typeName = "RoslynService", methodName = "GetHealthCheckAsync" }
             }
         });
-        // Lock the batch-tool metadata (Inspection.cs:1489-1491). NotBeNull-first is
+        // Lock the batch-tool metadata. NotBeNull-first is
         // redundant after the `!` bang — the bang throws on missing, so the next
         // assertion is the actual contract lock.
         data["totalRequested"]!.Value<int>().Should().Be(2);
@@ -161,7 +161,7 @@ public class DispatcherContractTests : McpTestBase
     [Fact]
     public async Task ToolsCall_BooleanArgumentFalse_PropagatesToTool()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        var data = await CallAndGetDataAsync("get_diagnostics", new
         {
             filePath = (string?)null,
             projectPath = (string?)null,
@@ -178,7 +178,7 @@ public class DispatcherContractTests : McpTestBase
     [Fact]
     public async Task ToolsCall_BooleanArgumentTrue_PropagatesToToolAndRunsAnalyzers()
     {
-        var data = await CallAndGetDataAsync("roslyn:get_diagnostics", new
+        var data = await CallAndGetDataAsync("get_diagnostics", new
         {
             filePath = (string?)null,
             projectPath = (string?)null,
@@ -199,18 +199,18 @@ public class DispatcherContractTests : McpTestBase
     [Fact]
     public async Task ToolsCall_MissingOptionalDefaults_ProducePaginatedDefault()
     {
-        var data = await CallAndGetDataAsync("roslyn:search_symbols", new
+        var data = await CallAndGetDataAsync("search_symbols", new
         {
             query = "Async"
         });
-        // Default maxResults=50, default offset=0 (per McpServer.cs:1598, 1600).
+        // Default maxResults=50, default offset=0.
         var results = (data["results"] as JArray)!;
         results.Count.Should().BeGreaterThan(10,
             "the SharpLens solution has dozens of *Async methods within the default 50-result cap");
         results.Count.Should().BeLessOrEqualTo(50,
             "the default maxResults=50 must cap the returned list");
 
-        // Top-level pagination metadata (Navigation.cs:686-694). NotBeNull-first on
+        // Top-level pagination metadata. NotBeNull-first on
         // every accessor defeats the null-conditional silent-pass.
         data["offset"]!.Value<int>().Should().Be(0, "default offset is 0");
         data["hasMore"].Should().NotBeNull("response must include hasMore field");
@@ -223,12 +223,76 @@ public class DispatcherContractTests : McpTestBase
     {
         // Explicit envelope-shape test: the harness implicitly verifies this on every
         // call, but a dedicated named test surfaces regressions clearly.
-        var inner = await CallToolAsync("roslyn:health_check");
+        var inner = await CallToolAsync("health_check");
         inner["success"]!.Value<bool>().Should().BeTrue(
             "health_check must succeed at the inner contract layer");
         inner["data"].Should().NotBeNull(
             "successful responses must carry a data object");
         inner["error"].Should().BeNull(
             "success responses must NOT carry an error object");
+    }
+
+    [Fact]
+    public async Task ToolsCall_UnexpectedHandlerException_SurfacesAsInBandIsErrorResult()
+    {
+        // analyze_data_flow with a start line far past the end of the file throws
+        // ArgumentOutOfRangeException inside the handler. An exception escaping a
+        // tool handler is a TOOL failure: it must surface as an in-band
+        // CallToolResult with isError, where the model can read and recover from
+        // it — not as a JSON-RPC -32603 protocol error.
+        var wireOptions = new System.Text.Json.JsonSerializerOptions
+        {
+            PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase,
+            Converters = { new RequestId.Converter() }
+        };
+        var request = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            jsonrpc = "2.0",
+            id = 9301,
+            method = "tools/call",
+            @params = new
+            {
+                name = "analyze_data_flow",
+                arguments = new
+                {
+                    filePath = Fixture.RoslynServicePath,
+                    startLine = 99_999_999,
+                    endLine = 99_999_999
+                }
+            }
+        });
+
+        var response = await Fixture.Server.HandleRequestAsync(request);
+        var envelope = JObject.Parse(System.Text.Json.JsonSerializer.Serialize(response, wireOptions));
+
+        envelope["error"].Should().BeNull(
+            "tool failures must not use JSON-RPC error responses");
+        envelope["result"]!["isError"]!.Value<bool>().Should().BeTrue(
+            "the CallToolResult must flag the failure in-band");
+        var inner = JObject.Parse(envelope["result"]!["content"]![0]!["text"]!.Value<string>()!);
+        inner["success"]!.Value<bool>().Should().BeFalse();
+        inner["error"]!["code"]!.Value<string>().Should().Be("INTERNAL_ERROR");
+        inner["error"]!["hint"]!.Value<string>().Should().NotBeNullOrEmpty(
+            "the envelope must carry a recovery hint like every structured tool error");
+    }
+
+    [Fact]
+    public async Task ToolsCall_BeforeSolutionLoad_ReturnsStructuredSolutionNotLoadedError()
+    {
+        // A fresh server with no solution loaded must answer with the standard
+        // structured envelope (SOLUTION_NOT_LOADED + recovery hint), not the
+        // opaque -32603 internal error a bare exception used to produce.
+        var freshServer = new McpServer();
+        var harness = new McpHarnessOps(freshServer);
+        var inner = await harness.CallToolAsync("get_type_members", new { typeName = "Anything" });
+
+        inner["success"]!.Value<bool>().Should().BeFalse(
+            "tools called before load_solution must fail in-band, not at the JSON-RPC layer");
+        inner["error"].Should().NotBeNull();
+        // Wire format is camelCase: the dispatcher serializes with the CamelCase
+        // naming policy (direct-service tests see PascalCase via JObject.FromObject).
+        inner["error"]!["code"]!.Value<string>().Should().Be("SOLUTION_NOT_LOADED");
+        inner["error"]!["hint"]!.Value<string>().Should().Contain("load_solution",
+            "the hint must tell the agent how to recover");
     }
 }

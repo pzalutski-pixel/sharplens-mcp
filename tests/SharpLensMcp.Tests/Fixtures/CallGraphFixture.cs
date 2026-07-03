@@ -25,4 +25,16 @@ public class CallGraphFixture
     public void Leaf2() { }
     public void Leaf3() { }
     public void Leaf4() { }
+
+    // Diamond: Top -> Left, Top -> Right, Left -> Bottom, Right -> Bottom.
+    // Exactly four nodes, so a node cap of 4 admits every node and must still
+    // draw the second edge into the shared Bottom.
+    public void DiamondTop()
+    {
+        DiamondLeft();
+        DiamondRight();
+    }
+    public void DiamondLeft() => DiamondBottom();
+    public void DiamondRight() => DiamondBottom();
+    public void DiamondBottom() { }
 }

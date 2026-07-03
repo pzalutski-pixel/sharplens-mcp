@@ -30,14 +30,21 @@ public class ExtractMethodApplyTests : IAsyncLifetime
 
         _service = new RoslynService();
         var result = await _service.LoadSolutionAsync(_solutionPath);
-        JObject.FromObject(result)["success"]?.Value<bool>().Should().BeTrue();
+        var loadJson = JObject.FromObject(result);
+        loadJson["success"].Should().NotBeNull();
+        loadJson["success"]!.Value<bool>().Should().BeTrue();
     }
 
     public Task DisposeAsync()
     {
-        if (_originalFixtureContent != null && _fixturePath != null && File.Exists(_fixturePath))
+        // Always restore the fixture to its committed content — recreating it even
+        // if a test deleted it — and assert the restore physically landed, so a
+        // swallowed write can't leave the tree dirty for the next serialized test.
+        if (_originalFixtureContent != null && _fixturePath != null)
         {
             File.WriteAllText(_fixturePath, _originalFixtureContent);
+            File.ReadAllText(_fixturePath).Should().Be(_originalFixtureContent,
+                "the fixture must be restored to its committed content after the test");
         }
         return Task.CompletedTask;
     }
@@ -60,25 +67,34 @@ public class ExtractMethodApplyTests : IAsyncLifetime
             preview: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
         var data = json["data"]!;
-        data["applied"]?.Value<bool>().Should().BeTrue();
-        data["methodName"]?.Value<string>().Should().Be("ComputeIntermediate");
-        data["statementsExtracted"]?.Value<int>().Should().Be(2);
+        data["applied"].Should().NotBeNull();
+        data["applied"]!.Value<bool>().Should().BeTrue();
+        data["methodName"].Should().NotBeNull();
+        data["methodName"]!.Value<string>().Should().Be("ComputeIntermediate");
+        data["statementsExtracted"].Should().NotBeNull();
+        data["statementsExtracted"]!.Value<int>().Should().Be(2);
 
         // Response shape lock: every documented field must be present and correct.
         // `total` flows out (used by `return total`), so the extracted method returns int
         // via `total`. Parameters are a, b, c (read inside the selection).
-        data["returnType"]?.Value<string>().Should().Be("int",
+        data["returnType"].Should().NotBeNull();
+        data["returnType"]!.Value<string>().Should().Be("int",
             "the extracted method returns int because `total` flows out and is int");
-        data["returnVariable"]?.Value<string>().Should().Be("total");
-        data["signature"]?.Value<string>().Should()
+        data["returnVariable"].Should().NotBeNull();
+        data["returnVariable"]!.Value<string>().Should().Be("total");
+        data["signature"].Should().NotBeNull();
+        data["signature"]!.Value<string>().Should()
             .Contain("private int ComputeIntermediate",
                 "default accessibility 'private' + int return + chosen name");
-        var filesModified = data["filesModified"] as JArray;
-        filesModified.Should().NotBeNullOrEmpty();
-        filesModified!.Any(f => f.Value<string>()?.EndsWith("ExtractMethodApplyFixture.cs") == true)
-            .Should().BeTrue("the fixture file must appear in filesModified");
+        var changedFiles = data["changedFiles"] as JArray;
+        changedFiles.Should().NotBeNullOrEmpty();
+        changedFiles!.Any(f => f["filePath"]?.Value<string>()?.EndsWith("ExtractMethodApplyFixture.cs") == true)
+            .Should().BeTrue("the fixture file must appear in changedFiles");
+        changedFiles.Should().OnlyContain(f => f["changeType"] != null && f["fileName"] != null,
+            "every changedFiles entry carries the canonical shape (changeType, fileName, …)");
 
         // The fixture file on disk must now contain the new method declaration AND
         // a call to it from the source method's body.
@@ -86,7 +102,7 @@ public class ExtractMethodApplyTests : IAsyncLifetime
         newContent.Should().Contain("ComputeIntermediate",
             "the extracted method must be inserted into the fixture file");
         newContent.Should().Contain("private",
-            "default accessibility is private (see RoslynService.Refactoring.cs:953)");
+            "default accessibility is private");
 
         // var partial = a + b; should appear exactly once now (inside the new method).
         var partialOccurrences = System.Text.RegularExpressions.Regex
@@ -131,8 +147,10 @@ public class ExtractMethodApplyTests : IAsyncLifetime
             preview: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
-        json["data"]!["signature"]?.Value<string>().Should()
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+        json["data"]!["signature"].Should().NotBeNull();
+        json["data"]!["signature"]!.Value<string>().Should()
             .Contain("public int ComputeIntermediate",
                 "the caller-supplied accessibility must appear in the signature");
         File.ReadAllText(_fixturePath).Should()
@@ -144,7 +162,7 @@ public class ExtractMethodApplyTests : IAsyncLifetime
     public async Task Apply_WithNoStatementsInRange_ReturnsAnalysisFailed()
     {
         // Pointing at line 0 (blank/namespace declaration) finds no statements.
-        // RoslynService.Refactoring.cs:1003-1011 returns AnalysisFailed.
+        // The impl returns AnalysisFailed.
         var result = await _service.ExtractMethodAsync(
             _fixturePath,
             startLine: 0,
@@ -153,24 +171,33 @@ public class ExtractMethodApplyTests : IAsyncLifetime
             preview: true);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeFalse();
-        json["error"]?["code"]?.Value<string>().Should().Be(ErrorCodes.AnalysisFailed);
-        json["error"]?["message"]?.Value<string>().Should().Contain("No statements");
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeFalse();
+        // In-process JObject.FromObject keeps RoslynError's PascalCase Code/Message;
+        // the old lowercase reads were always null and silently passed.
+        json["error"].Should().NotBeNull("a failed extract_method must carry an error");
+        json["error"]!["Code"].Should().NotBeNull();
+        json["error"]!["Code"]!.Value<string>().Should().Be(ErrorCodes.AnalysisFailed);
+        json["error"]!["Message"].Should().NotBeNull();
+        json["error"]!["Message"]!.Value<string>().Should().Contain("No statements");
     }
 
     [Fact]
     public async Task Apply_OnFileNotInSolution_ReturnsFileNotInSolution()
     {
         // A path that's nowhere in the loaded solution — exercises the
-        // FileNotInSolution branch (RoslynService.Refactoring.cs:966-971).
+        // FileNotInSolution branch.
         var fakePath = Path.Combine(Path.GetTempPath(), $"not-in-solution-{Guid.NewGuid():N}.cs");
         var result = await _service.ExtractMethodAsync(
             fakePath, startLine: 0, endLine: 1,
             methodName: "Whatever", preview: true);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeFalse();
-        json["error"]?["code"]?.Value<string>().Should().Be(ErrorCodes.FileNotInSolution);
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeFalse();
+        json["error"].Should().NotBeNull("a failed extract_method must carry an error");
+        json["error"]!["Code"].Should().NotBeNull();
+        json["error"]!["Code"]!.Value<string>().Should().Be(ErrorCodes.FileNotInSolution);
     }
 
     // Helper: extract the body of the method whose declaration contains
@@ -211,17 +238,26 @@ public class ExtractMethodApplyTests : IAsyncLifetime
             preview: true);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue();
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue();
         var data = json["data"]!;
-        data["preview"]?.Value<bool>().Should().BeTrue();
-        data["methodName"]?.Value<string>().Should().Be("ComputeIntermediate");
-        data["returnType"]?.Value<string>().Should().Be("int");
-        data["returnVariable"]?.Value<string>().Should().Be("total");
-        data["statementsExtracted"]?.Value<int>().Should().Be(2);
-        data["signature"]?.Value<string>().Should()
+        data["preview"].Should().NotBeNull();
+        data["preview"]!.Value<bool>().Should().BeTrue();
+        data["methodName"].Should().NotBeNull();
+        data["methodName"]!.Value<string>().Should().Be("ComputeIntermediate");
+        data["returnType"].Should().NotBeNull();
+        data["returnType"]!.Value<string>().Should().Be("int");
+        data["returnVariable"].Should().NotBeNull();
+        data["returnVariable"]!.Value<string>().Should().Be("total");
+        data["statementsExtracted"].Should().NotBeNull();
+        data["statementsExtracted"]!.Value<int>().Should().Be(2);
+        data["signature"].Should().NotBeNull();
+        data["signature"]!.Value<string>().Should()
             .Contain("private int ComputeIntermediate(int a, int b, int c)");
-        data["extractedCode"]?.Value<string>().Should().Contain("ComputeIntermediate");
-        data["replacementCode"]?.Value<string>().Should()
+        data["extractedCode"].Should().NotBeNull();
+        data["extractedCode"]!.Value<string>().Should().Contain("ComputeIntermediate");
+        data["replacementCode"].Should().NotBeNull();
+        data["replacementCode"]!.Value<string>().Should()
             .Be("var total = ComputeIntermediate(a, b, c);",
                 "the call-site replacement string must capture `total` and forward params");
 

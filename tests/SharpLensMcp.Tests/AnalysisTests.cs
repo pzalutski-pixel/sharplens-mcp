@@ -43,7 +43,8 @@ public class AnalysisTests : RoslynServiceTestBase
         AssertSuccess(result);
 
         var data = GetData(result);
-        data["succeeded"]?.Value<bool>().Should().BeTrue();
+        data["succeeded"].Should().NotBeNull();
+        data["succeeded"]!.Value<bool>().Should().BeTrue();
 
         var declared = (data["variablesDeclared"] as JArray)!.Select(v => v.Value<string>()).ToList();
         declared.Should().Contain("partial");
@@ -63,8 +64,10 @@ public class AnalysisTests : RoslynServiceTestBase
         AssertSuccess(result);
 
         var data = GetData(result);
-        data["startPointIsReachable"]?.Value<bool>().Should().BeTrue();
-        data["endPointIsReachable"]?.Value<bool>().Should().BeFalse(
+        data["startPointIsReachable"].Should().NotBeNull();
+        data["startPointIsReachable"]!.Value<bool>().Should().BeTrue();
+        data["endPointIsReachable"].Should().NotBeNull();
+        data["endPointIsReachable"]!.Value<bool>().Should().BeFalse(
             "the region ends with a return so the end-point isn't reachable");
     }
 
@@ -75,9 +78,14 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["filePath"]?.Value<string>().Should().Contain("RoslynService");
-        data["lineCount"]?.Value<int>().Should().BeGreaterThan(400,
-            "RoslynService.cs is hundreds of lines after the partial-class split");
+        data["filePath"].Should().NotBeNull();
+        data["filePath"]!.Value<string>().Should().Contain("RoslynService");
+        // Lock lineCount to the file's actual line count — exact and drift-proof —
+        // rather than a `> 400` inequality against the live, growing source file.
+        data["lineCount"].Should().NotBeNull();
+        data["lineCount"]!.Value<int>().Should().Be(
+            File.ReadAllText(RoslynServicePath).Count(c => c == '\n') + 1,
+            "lineCount must equal the file's line count (newlines + 1, Roslyn's convention)");
 
         var typeDecls = data["typeDeclarations"] as JArray;
         typeDecls.Should().NotBeNullOrEmpty();
@@ -92,12 +100,16 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["typeName"]?.Value<string>().Should().Contain("RoslynService");
-        data["typeKind"]?.Value<string>().Should().Be("Class");
+        data["typeName"].Should().NotBeNull();
+        data["typeName"]!.Value<string>().Should().Contain("RoslynService");
+        data["typeKind"].Should().NotBeNull();
+        data["typeKind"]!.Value<string>().Should().Be("Class");
         var memberSummary = data["memberSummary"]!;
-        memberSummary["methods"]?.Value<int>().Should().BeGreaterOrEqualTo(20,
+        memberSummary["methods"].Should().NotBeNull();
+        memberSummary["methods"]!.Value<int>().Should().BeGreaterOrEqualTo(20,
             "RoslynService has dozens of methods across partials");
-        memberSummary["fields"]?.Value<int>().Should().BeGreaterOrEqualTo(5,
+        memberSummary["fields"].Should().NotBeNull();
+        memberSummary["fields"]!.Value<int>().Should().BeGreaterOrEqualTo(5,
             "RoslynService declares at least _workspace, _solution, _solutionLoadedAt, " +
             "_documentCache, _compilationCache");
     }
@@ -113,13 +125,54 @@ public class AnalysisTests : RoslynServiceTestBase
         AssertSuccess(result);
         var data = GetData(result);
         var signature = data["signature"]!;
-        signature["name"]?.Value<string>().Should().Be("LoadSolutionAsync");
-        signature["returnType"]?.Value<string>().Should().Contain("Task<object>");
-        signature["isAsync"]?.Value<bool>().Should().BeTrue();
+        signature["name"].Should().NotBeNull();
+        signature["name"]!.Value<string>().Should().Be("LoadSolutionAsync");
+        signature["returnType"].Should().NotBeNull();
+        signature["returnType"]!.Value<string>().Should().Contain("Task<object>");
+        signature["isAsync"].Should().NotBeNull();
+        signature["isAsync"]!.Value<bool>().Should().BeTrue();
 
         var parameters = signature["parameters"] as JArray;
-        parameters!.Count.Should().Be(1);
-        parameters[0]["name"]?.Value<string>().Should().Be("solutionPath");
+        parameters!.Count.Should().Be(2, "solutionPath plus the cancellationToken every tool method carries");
+        parameters[0]["name"].Should().NotBeNull();
+        parameters[0]["name"]!.Value<string>().Should().Be("solutionPath");
+        parameters[1]["name"].Should().NotBeNull();
+        parameters[1]["name"]!.Value<string>().Should().Be("cancellationToken");
+    }
+
+    [Fact]
+    public async Task AnalyzeMethod_OverloadedName_WithoutIndex_ReturnsAmbiguousMatch()
+    {
+        // NameAddressingTarget declares Describe() and Describe(int) — analyzing by
+        // name alone must not silently pick one; it surfaces the ambiguity.
+        var result = await Service.AnalyzeMethodAsync("NameAddressingTarget", "Describe");
+
+        AssertError(result, ErrorCodes.AmbiguousMatch);
+        var json = JObject.FromObject(result);
+        json["error"]!["Message"]!.Value<string>().Should().Contain("2 overloads",
+            "the ambiguity error must report how many overloads exist");
+    }
+
+    [Fact]
+    public async Task AnalyzeMethod_OverloadIndex_SelectsThatSpecificOverload()
+    {
+        var zero = await Service.AnalyzeMethodAsync("NameAddressingTarget", "Describe", overloadIndex: 0);
+        AssertSuccess(zero);
+        var one = await Service.AnalyzeMethodAsync("NameAddressingTarget", "Describe", overloadIndex: 1);
+        AssertSuccess(one);
+
+        var zeroParams = (GetData(zero)["signature"]!["parameters"] as JArray)!.Count;
+        var oneParams = (GetData(one)["signature"]!["parameters"] as JArray)!.Count;
+        new[] { zeroParams, oneParams }.Should().BeEquivalentTo(new[] { 0, 1 },
+            "the two indices select the no-arg and the single-parameter Describe overload");
+    }
+
+    [Fact]
+    public async Task AnalyzeMethod_OverloadIndexOutOfRange_ReturnsInvalidParameter()
+    {
+        var result = await Service.AnalyzeMethodAsync("NameAddressingTarget", "Describe", overloadIndex: 5);
+
+        AssertError(result, ErrorCodes.InvalidParameter);
     }
 
     [Fact]
@@ -129,13 +182,24 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // The response field is `fullSource` (RoslynService.Inspection.cs:1399), not `source`.
+        // The response field is `fullSource`, not `source`.
         // The prior assertion read `data["source"]` which silently passed via null-conditional.
         var source = data["fullSource"]!.Value<string>()!;
-        source.Should().Contain("public async Task<object> GetHealthCheckAsync()");
+        source.Should().Contain("public async Task<object> GetHealthCheckAsync(",
+            "fullSource must include the declaration");
+        source.Should().Contain("bool includeDiagnostics = false",
+            "the includeDiagnostics parameter gates the diagnostics sweep");
         source.Should().Contain("CreateSuccessResponse",
-            "the body uses CreateSuccessResponse after the 1.5.3 health_check shape fix");
-        data["lineCount"]?.Value<int>().Should().BeGreaterThan(20);
+            "the body uses CreateSuccessResponse for the health_check envelope");
+        // lineCount is the method declaration's own line span — consistent with the
+        // reported start/end and free of the leading-trivia lines fullSource carries.
+        var startLine = data["location"]!["startLine"]!.Value<int>();
+        var endLine = data["location"]!["endLine"]!.Value<int>();
+        endLine.Should().BeGreaterThan(startLine, "GetHealthCheckAsync spans multiple lines");
+        data["lineCount"].Should().NotBeNull();
+        data["lineCount"]!.Value<int>().Should().Be(
+            endLine - startLine + 1,
+            "lineCount must equal the declaration's line span (endLine - startLine + 1)");
     }
 
     [Fact]
@@ -160,11 +224,16 @@ public class AnalysisTests : RoslynServiceTestBase
         // Every returned entry must conform to the documented UnusedSymbolEntry shape.
         foreach (var entry in unusedSymbols)
         {
-            entry["name"]?.Value<string>().Should().NotBeNullOrEmpty();
-            entry["fullyQualifiedName"]?.Value<string>().Should().NotBeNullOrEmpty();
-            entry["kind"]?.Value<string>().Should().NotBeNullOrEmpty();
-            entry["accessibility"]?.Value<string>().Should().NotBeNullOrEmpty();
-            entry["filePath"]?.Value<string>().Should().EndWith(".cs");
+            entry["name"].Should().NotBeNull();
+            entry["name"]!.Value<string>().Should().NotBeNullOrEmpty();
+            entry["fullyQualifiedName"].Should().NotBeNull();
+            entry["fullyQualifiedName"]!.Value<string>().Should().NotBeNullOrEmpty();
+            entry["kind"].Should().NotBeNull();
+            entry["kind"]!.Value<string>().Should().NotBeNullOrEmpty();
+            entry["accessibility"].Should().NotBeNull();
+            entry["accessibility"]!.Value<string>().Should().NotBeNullOrEmpty();
+            entry["filePath"].Should().NotBeNull();
+            entry["filePath"]!.Value<string>().Should().EndWith(".cs");
         }
     }
 
@@ -178,7 +247,8 @@ public class AnalysisTests : RoslynServiceTestBase
         // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["compiles"]?.Value<bool>().Should().BeTrue();
+        data["compiles"].Should().NotBeNull();
+        data["compiles"]!.Value<bool>().Should().BeTrue();
     }
 
     [Fact]
@@ -189,7 +259,8 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["compiles"]?.Value<bool>().Should().BeFalse();
+        data["compiles"].Should().NotBeNull();
+        data["compiles"]!.Value<bool>().Should().BeFalse();
         var errors = data["errors"] as JArray;
         errors.Should().NotBeNullOrEmpty(
             "an obviously malformed expression must surface compiler errors, not an empty list");
@@ -197,8 +268,82 @@ public class AnalysisTests : RoslynServiceTestBase
         // mean the response shape is broken even though compiles=false.
         foreach (var err in errors!)
         {
-            err["id"]?.Value<string>().Should().StartWith("CS",
+            err["id"].Should().NotBeNull();
+            err["id"]!.Value<string>().Should().StartWith("CS",
                 "compiler errors are reported with CS-prefixed IDs");
+        }
+    }
+
+    [Fact]
+    public async Task ValidateCode_NoContextWrap_ErrorLinesMapToTheSnippet()
+    {
+        // The error sits on the SECOND line of the snippet (0-based line 1).
+        // The reported line must be relative to the snippet, not to the
+        // ValidationClass wrapper the tool builds around it.
+        var code = "var ok = 1;\nint bad = \"text\";";
+        var result = await Service.ValidateCodeAsync(code);
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["compiles"]!.Value<bool>().Should().BeFalse();
+        var errors = (data["errors"] as JArray)!;
+        var cs0029 = errors.Single(e => e["id"]!.Value<string>() == "CS0029");
+        cs0029["line"]!.Value<int>().Should().Be(1,
+            "the string-to-int assignment is the snippet's second line");
+    }
+
+    [Fact]
+    public async Task ValidateCode_WithContextFile_ErrorLinesMapToTheSnippet()
+    {
+        // Context mode wraps the snippet under the context file's usings and
+        // namespace — several scaffold lines whose count depends on the file.
+        // A one-line snippet's error must still report line 0.
+        var result = await Service.ValidateCodeAsync(
+            "var x = undefinedSymbol123;",
+            contextFilePath: RoslynServicePath);
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["compiles"]!.Value<bool>().Should().BeFalse();
+        var errors = (data["errors"] as JArray)!;
+        var cs0103 = errors.Single(e => e["id"]!.Value<string>() == "CS0103");
+        cs0103["line"]!.Value<int>().Should().Be(0,
+            "the snippet is a single line, so its error is on snippet line 0");
+    }
+
+    [Fact]
+    public async Task ValidateCode_Standalone_LinesAreReportedUnshifted()
+    {
+        // Standalone code IS the validated file — no wrapper, no offset.
+        var code = "public class T\n{\n    public void M()\n    {\n        int bad = \"text\";\n    }\n}";
+        var result = await Service.ValidateCodeAsync(code, standalone: true);
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["compiles"]!.Value<bool>().Should().BeFalse();
+        var errors = (data["errors"] as JArray)!;
+        var cs0029 = errors.Single(e => e["id"]!.Value<string>() == "CS0029");
+        cs0029["line"]!.Value<int>().Should().Be(4,
+            "the bad assignment sits on line 4 of the standalone file");
+    }
+
+    [Fact]
+    public async Task ValidateCode_SnippetErrorSurfacingInWrapperSuffix_ClampsToSnippetRange()
+    {
+        // An unclosed brace errors at the wrapper's closing scaffold, BELOW the
+        // snippet. The reported line must clamp into the snippet's own range
+        // instead of pointing past its end.
+        var result = await Service.ValidateCodeAsync("if (true) {");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["compiles"]!.Value<bool>().Should().BeFalse();
+        var errors = (data["errors"] as JArray)!;
+        errors.Should().NotBeEmpty("an unclosed brace cannot compile");
+        foreach (var error in errors)
+        {
+            error["line"]!.Value<int>().Should().Be(0,
+                "every reported line must stay within the one-line snippet");
         }
     }
 
@@ -211,7 +356,8 @@ public class AnalysisTests : RoslynServiceTestBase
         // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["compatible"]?.Value<bool>().Should().BeTrue();
+        data["compatible"].Should().NotBeNull();
+        data["compatible"]!.Value<bool>().Should().BeTrue();
     }
 
     [Fact]
@@ -223,7 +369,8 @@ public class AnalysisTests : RoslynServiceTestBase
         // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["compatible"]?.Value<bool>().Should().BeFalse();
+        data["compatible"].Should().NotBeNull();
+        data["compatible"]!.Value<bool>().Should().BeFalse();
     }
 
     [Fact]
@@ -233,9 +380,12 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["typeName"]?.Value<string>().Should().Contain("RoslynService");
-        data["typeKind"]?.Value<string>().Should().Be("Class");
-        data["implementsIDisposable"]?.Value<bool>().Should().BeFalse();
+        data["typeName"].Should().NotBeNull();
+        data["typeName"]!.Value<string>().Should().Contain("RoslynService");
+        data["typeKind"].Should().NotBeNull();
+        data["typeKind"]!.Value<string>().Should().Be("Class");
+        data["implementsIDisposable"].Should().NotBeNull();
+        data["implementsIDisposable"]!.Value<bool>().Should().BeFalse();
         var ctors = data["constructors"] as JArray;
         ctors.Should().NotBeNullOrEmpty();
         ctors!.Any(c => (c["parameters"] as JArray)?.Count == 0)
@@ -260,15 +410,39 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Rename is always non-breaking per Inspection.cs:1180-1183.
-        data["safe"]?.Value<bool>().Should().BeTrue();
-        data["breakingChanges"]?.Value<int>().Should().Be(0);
+        // Rename is always non-breaking.
+        data["safe"].Should().NotBeNull();
+        data["safe"]!.Value<bool>().Should().BeTrue();
+        data["breakingChanges"].Should().NotBeNull();
+        data["breakingChanges"]!.Value<int>().Should().Be(0);
 
         var locations = data["impactedLocations"] as JArray;
         locations.Should().NotBeNullOrEmpty();
         foreach (var l in locations!)
         {
-            l["severity"]?.Value<string>().Should().Be("info");
+            l["severity"].Should().NotBeNull();
+            l["severity"]!.Value<string>().Should().Be("info");
+        }
+    }
+
+    [Fact]
+    public async Task AnalyzeChangeImpact_AddParameterWithDefault_IsNonBreaking()
+    {
+        var (file, line, col) = await LocateCreateSuccessResponseAsync();
+        // A new parameter WITH a default value keeps existing call sites valid.
+        var result = await Service.AnalyzeChangeImpactAsync(
+            file, line, col, changeType: "addParameter", newValue: "int flags = 0");
+
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["breakingChanges"]!.Value<int>().Should().Be(0,
+            "adding a parameter with a default value is source-compatible");
+        data["safe"]!.Value<bool>().Should().BeTrue();
+        // The response is honest about being a categorized inventory, not a proof.
+        data["note"]!.Value<string>().Should().Contain("feasibility");
+        foreach (var l in (data["impactedLocations"] as JArray)!)
+        {
+            l["severity"]!.Value<string>().Should().Be("info");
         }
     }
 
@@ -292,19 +466,25 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Inspection.cs:1192-1197 marks every call site as error / breakingChanges++.
-        data["breakingChanges"]?.Value<int>().Should().BeGreaterThan(0,
-            "addParameter must report every call site as a breaking change");
-        data["safe"]?.Value<bool>().Should().BeFalse(
+        data["safe"].Should().NotBeNull();
+        data["safe"]!.Value<bool>().Should().BeFalse(
             "addParameter cannot be safe — call sites lose a required argument");
-        data["changeType"]?.Value<string>().Should().Be("addParameter");
+        data["changeType"].Should().NotBeNull();
+        data["changeType"]!.Value<string>().Should().Be("addParameter");
 
         var locations = data["impactedLocations"] as JArray;
         locations.Should().NotBeNullOrEmpty();
-        foreach (var l in locations!)
+        // Every call site is a breaking change, so breakingChanges equals the number of
+        // impacted locations — an exact, drift-proof consistency lock rather than `> 0`.
+        data["breakingChanges"].Should().NotBeNull();
+        data["breakingChanges"]!.Value<int>().Should().Be(locations!.Count,
+            "addParameter marks every impacted call site as a breaking change");
+        foreach (var l in locations)
         {
-            l["severity"]?.Value<string>().Should().Be("error");
-            l["impact"]?.Value<string>().Should().Contain("missing new parameter");
+            l["severity"].Should().NotBeNull();
+            l["severity"]!.Value<string>().Should().Be("error");
+            l["impact"].Should().NotBeNull();
+            l["impact"]!.Value<string>().Should().Contain("missing new parameter");
         }
     }
 
@@ -317,14 +497,19 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["breakingChanges"]?.Value<int>().Should().BeGreaterThan(0);
-        data["safe"]?.Value<bool>().Should().BeFalse();
+        data["safe"].Should().NotBeNull();
+        data["safe"]!.Value<bool>().Should().BeFalse();
         var locations = data["impactedLocations"] as JArray;
         locations.Should().NotBeNullOrEmpty();
-        foreach (var l in locations!)
+        data["breakingChanges"].Should().NotBeNull();
+        data["breakingChanges"]!.Value<int>().Should().Be(locations!.Count,
+            "removeParameter marks every impacted call site as a breaking change");
+        foreach (var l in locations)
         {
-            l["severity"]?.Value<string>().Should().Be("error");
-            l["impact"]?.Value<string>().Should().Contain("extra parameter");
+            l["severity"].Should().NotBeNull();
+            l["severity"]!.Value<string>().Should().Be("error");
+            l["impact"].Should().NotBeNull();
+            l["impact"]!.Value<string>().Should().Contain("extra parameter");
         }
     }
 
@@ -337,17 +522,23 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Inspection.cs:1185-1190: changeType produces warnings, not breaking changes.
-        data["breakingChanges"]?.Value<int>().Should().Be(0);
-        data["warnings"]?.Value<int>().Should().BeGreaterThan(0,
-            "changeType must increment the warnings counter once per call site");
-        data["safe"]?.Value<bool>().Should().BeTrue("warnings don't count toward safe=false");
+        // changeType produces warnings, not breaking changes.
+        data["breakingChanges"].Should().NotBeNull();
+        data["breakingChanges"]!.Value<int>().Should().Be(0);
+        data["safe"].Should().NotBeNull();
+        data["safe"]!.Value<bool>().Should().BeTrue("warnings don't count toward safe=false");
 
         var locations = data["impactedLocations"] as JArray;
         locations.Should().NotBeNullOrEmpty();
-        foreach (var l in locations!)
+        // changeType warns once per call site, so warnings equals the number of impacted
+        // locations — an exact, drift-proof consistency lock rather than `> 0`.
+        data["warnings"].Should().NotBeNull();
+        data["warnings"]!.Value<int>().Should().Be(locations!.Count,
+            "changeType increments the warnings counter once per impacted call site");
+        foreach (var l in locations)
         {
-            l["severity"]?.Value<string>().Should().Be("warning");
+            l["severity"].Should().NotBeNull();
+            l["severity"]!.Value<string>().Should().Be("warning");
         }
     }
 
@@ -360,21 +551,26 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["breakingChanges"]?.Value<int>().Should().BeGreaterThan(0);
-        data["safe"]?.Value<bool>().Should().BeFalse();
+        data["safe"].Should().NotBeNull();
+        data["safe"]!.Value<bool>().Should().BeFalse();
         var locations = data["impactedLocations"] as JArray;
         locations.Should().NotBeNullOrEmpty();
-        foreach (var l in locations!)
+        data["breakingChanges"].Should().NotBeNull();
+        data["breakingChanges"]!.Value<int>().Should().Be(locations!.Count,
+            "delete marks every impacted reference as a breaking change");
+        foreach (var l in locations)
         {
-            l["severity"]?.Value<string>().Should().Be("error");
-            l["impact"]?.Value<string>().Should().Contain("Reference will be broken");
+            l["severity"].Should().NotBeNull();
+            l["severity"]!.Value<string>().Should().Be("error");
+            l["impact"].Should().NotBeNull();
+            l["impact"]!.Value<string>().Should().Contain("Reference will be broken");
         }
     }
 
     [Fact]
     public async Task AnalyzeChangeImpact_ChangeAccessibility_OnPrivateSymbol_ReportsWarning()
     {
-        // CreateSuccessResponse is private — Inspection.cs:1206-1219 takes the non-public
+        // CreateSuccessResponse is private — the impl takes the non-public
         // branch, emitting warning severity and incrementing warnings (not breakingChanges).
         var (file, line, col) = await LocateCreateSuccessResponseAsync();
         var result = await Service.AnalyzeChangeImpactAsync(
@@ -382,14 +578,19 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["safe"]?.Value<bool>().Should().BeTrue();
-        data["breakingChanges"]?.Value<int>().Should().Be(0);
-        data["warnings"]?.Value<int>().Should().BeGreaterThan(0);
+        data["safe"].Should().NotBeNull();
+        data["safe"]!.Value<bool>().Should().BeTrue();
+        data["breakingChanges"].Should().NotBeNull();
+        data["breakingChanges"]!.Value<int>().Should().Be(0);
         var locations = data["impactedLocations"] as JArray;
         locations.Should().NotBeNullOrEmpty();
-        foreach (var l in locations!)
+        data["warnings"].Should().NotBeNull();
+        data["warnings"]!.Value<int>().Should().Be(locations!.Count,
+            "changeAccessibility on a private symbol warns once per impacted reference");
+        foreach (var l in locations)
         {
-            l["severity"]?.Value<string>().Should().Be("warning");
+            l["severity"].Should().NotBeNull();
+            l["severity"]!.Value<string>().Should().Be("warning");
         }
     }
 
@@ -402,16 +603,21 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Default branch (Inspection.cs:1228-1231): unknown change → info severity, no counters.
-        data["breakingChanges"]?.Value<int>().Should().Be(0);
-        data["warnings"]?.Value<int>().Should().Be(0);
-        data["safe"]?.Value<bool>().Should().BeTrue();
+        // Default branch: unknown change → info severity, no counters.
+        data["breakingChanges"].Should().NotBeNull();
+        data["breakingChanges"]!.Value<int>().Should().Be(0);
+        data["warnings"].Should().NotBeNull();
+        data["warnings"]!.Value<int>().Should().Be(0);
+        data["safe"].Should().NotBeNull();
+        data["safe"]!.Value<bool>().Should().BeTrue();
         var locations = data["impactedLocations"] as JArray;
         locations.Should().NotBeNullOrEmpty();
         foreach (var l in locations!)
         {
-            l["severity"]?.Value<string>().Should().Be("info");
-            l["impact"]?.Value<string>().Should().Be("Unknown impact");
+            l["severity"].Should().NotBeNull();
+            l["severity"]!.Value<string>().Should().Be("info");
+            l["impact"].Should().NotBeNull();
+            l["impact"]!.Value<string>().Should().Be("Unknown impact");
         }
     }
 
@@ -420,14 +626,15 @@ public class AnalysisTests : RoslynServiceTestBase
     {
         // When startLine == endLine and ResolveAnalysisStatements returns the same
         // node for both, the impl takes the AnalyzeDataFlow(singleStatement) branch
-        // at Compound.cs:75-77. Lock that path against the Sum body's `var partial` line.
+        // Lock that path against the Sum body's `var partial` line.
         var (file, firstStmt, _) = LocateSumBody(Service);
 
         var result = await Service.AnalyzeDataFlowAsync(file, startLine: firstStmt, endLine: firstStmt);
         AssertSuccess(result);
 
         var data = GetData(result);
-        data["succeeded"]?.Value<bool>().Should().BeTrue(
+        data["succeeded"].Should().NotBeNull();
+        data["succeeded"]!.Value<bool>().Should().BeTrue(
             "the single-statement branch must still produce a successful analysis");
 
         // `var partial = a + b;` declares partial and reads a, b.
@@ -468,7 +675,8 @@ public class AnalysisTests : RoslynServiceTestBase
         var result = await Service.AnalyzeControlFlowAsync(file, startLine: firstIfLine, endLine: totalLine);
         AssertSuccess(result);
         var data = GetData(result);
-        data["succeeded"]?.Value<bool>().Should().BeTrue();
+        data["succeeded"].Should().NotBeNull();
+        data["succeeded"]!.Value<bool>().Should().BeTrue();
 
         var exitPoints = data["exitPoints"] as JArray;
         exitPoints.Should().NotBeNullOrEmpty(
@@ -480,6 +688,137 @@ public class AnalysisTests : RoslynServiceTestBase
             "the loop's continue statement must surface as an exit point");
     }
 
+    private static (string file, string[] lines) LocateControlFlowFixture(RoslynService service)
+    {
+        var solution = service.GetSolutionForTesting()!;
+        var fixtureDoc = solution.Projects
+            .SelectMany(p => p.Documents)
+            .First(d => d.FilePath != null && d.FilePath.EndsWith("ControlFlowFixture.cs"));
+        return (fixtureDoc.FilePath!, File.ReadAllLines(fixtureDoc.FilePath!));
+    }
+
+    [Fact]
+    public async Task AnalyzeDataFlow_OnSubRangeOfBlock_AnalyzesOnlySelectedStatements()
+    {
+        // Select only the first two statements of Sum, leaving `return total;`
+        // OUTSIDE the region. Resolving the selection through the enclosing block's
+        // first/last statements would silently widen the analysis to the whole body
+        // and report nothing flowing out.
+        var (file, _, _) = LocateSumBody(Service);
+        var lines = File.ReadAllLines(file);
+        var first = Array.FindIndex(lines, l => l.Contains("var partial"));
+        var second = Array.FindIndex(lines, l => l.Contains("var total"));
+        first.Should().BeGreaterThan(-1);
+        second.Should().BeGreaterThan(first);
+
+        var result = await Service.AnalyzeDataFlowAsync(file, startLine: first, endLine: second);
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["succeeded"]!.Value<bool>().Should().BeTrue();
+
+        var declared = (data["variablesDeclared"] as JArray)!.Select(v => v.Value<string>()).ToList();
+        declared.Should().BeEquivalentTo(new[] { "partial", "total" });
+
+        var flowsOut = (data["dataFlowsOut"] as JArray)!.Select(v => v.Value<string>()).ToList();
+        flowsOut.Should().Contain("total",
+            "`total` is read by the return statement below the selection — it only flows " +
+            "out when the analysis stops at the selected lines instead of the whole block");
+        flowsOut.Should().NotContain("partial",
+            "`partial` is last read inside the selection, so it must not flow out");
+    }
+
+    [Fact]
+    public async Task AnalyzeControlFlow_OnSubRangeOfBlock_EndPointIsReachable()
+    {
+        // Same sub-range as the data-flow clamp test: the region excludes the
+        // method's return, so execution falls through the end of the region and no
+        // return statement belongs to it. Whole-block analysis reported the opposite.
+        var (file, _, _) = LocateSumBody(Service);
+        var lines = File.ReadAllLines(file);
+        var first = Array.FindIndex(lines, l => l.Contains("var partial"));
+        var second = Array.FindIndex(lines, l => l.Contains("var total"));
+
+        var result = await Service.AnalyzeControlFlowAsync(file, startLine: first, endLine: second);
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["succeeded"]!.Value<bool>().Should().BeTrue();
+        data["endPointIsReachable"]!.Value<bool>().Should().BeTrue(
+            "the selected region ends before the return, so its end point is reachable");
+        (data["returnStatements"] as JArray)!.Should().BeEmpty(
+            "the return statement lies outside the selected region");
+    }
+
+    [Fact]
+    public async Task AnalyzeDataFlow_OnMiddleLineOfMultiLineStatement_AnalyzesThatStatementOnly()
+    {
+        // CombineAcrossLines declares `combined` with an initializer spanning three
+        // lines. Selecting only the middle line resolves to a node INSIDE the
+        // declaration statement; the analysis must clamp to that one statement
+        // instead of climbing to the whole method body.
+        var (file, lines) = LocateControlFlowFixture(Service);
+        var middle = Array.FindIndex(lines, l => l.Contains("x * 2 +"));
+        middle.Should().BeGreaterThan(-1);
+
+        var result = await Service.AnalyzeDataFlowAsync(file, startLine: middle, endLine: middle);
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["succeeded"]!.Value<bool>().Should().BeTrue();
+
+        var declared = (data["variablesDeclared"] as JArray)!.Select(v => v.Value<string>()).ToList();
+        declared.Should().BeEquivalentTo(new[] { "combined" },
+            "the selected line belongs to the `combined` declaration and nothing else");
+
+        var flowsOut = (data["dataFlowsOut"] as JArray)!.Select(v => v.Value<string>()).ToList();
+        flowsOut.Should().Contain("combined",
+            "`combined` is read by the return below the analyzed statement; whole-block " +
+            "analysis would have included the return and reported nothing flowing out");
+    }
+
+    [Fact]
+    public async Task AnalyzeControlFlow_OnMiddleLineOfMultiLineStatement_ExcludesTheReturnBelow()
+    {
+        var (file, lines) = LocateControlFlowFixture(Service);
+        var middle = Array.FindIndex(lines, l => l.Contains("x * 2 +"));
+        middle.Should().BeGreaterThan(-1);
+
+        var result = await Service.AnalyzeControlFlowAsync(file, startLine: middle, endLine: middle);
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["succeeded"]!.Value<bool>().Should().BeTrue();
+        data["endPointIsReachable"]!.Value<bool>().Should().BeTrue(
+            "the analyzed declaration statement falls through to the return below it");
+        (data["returnStatements"] as JArray)!.Should().BeEmpty(
+            "`return combined;` lies outside the analyzed statement");
+    }
+
+    [Fact]
+    public async Task AnalyzeDataFlow_OnSubRangeOfSwitchSection_ClampsToSelectedStatements()
+    {
+        // DescribeCode's case 1 section holds three statements; its statement list
+        // lives on the SwitchSectionSyntax, not on a block. Selecting the two
+        // declarations must analyze exactly those, so both locals flow out to the
+        // section's return below the selection.
+        var (file, lines) = LocateControlFlowFixture(Service);
+        var first = Array.FindIndex(lines, l => l.Contains("var label"));
+        var second = Array.FindIndex(lines, l => l.Contains("var suffix"));
+        first.Should().BeGreaterThan(-1);
+        second.Should().BeGreaterThan(first);
+
+        var result = await Service.AnalyzeDataFlowAsync(file, startLine: first, endLine: second);
+        AssertSuccess(result);
+        var data = GetData(result);
+        data["succeeded"]!.Value<bool>().Should().BeTrue();
+
+        var declared = (data["variablesDeclared"] as JArray)!.Select(v => v.Value<string>()).ToList();
+        declared.Should().BeEquivalentTo(new[] { "label", "suffix" });
+
+        var flowsOut = (data["dataFlowsOut"] as JArray)!.Select(v => v.Value<string>()).ToList();
+        flowsOut.Should().Contain("label",
+            "`label` is read by the section's return below the selection");
+        flowsOut.Should().Contain("suffix",
+            "`suffix` is read by the section's return below the selection");
+    }
+
     [Fact]
     public async Task CheckTypeCompatibility_ListOfIntToIEnumerableOfInt_IsCompatible()
     {
@@ -489,7 +828,8 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["compatible"]?.Value<bool>().Should().BeTrue(
+        data["compatible"].Should().NotBeNull();
+        data["compatible"]!.Value<bool>().Should().BeTrue(
             "List<T> implements IEnumerable<T>; the generic compatibility must resolve");
     }
 
@@ -506,7 +846,8 @@ public class AnalysisTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["compatible"]?.Value<bool>().Should().BeFalse(
+        data["compatible"].Should().NotBeNull();
+        data["compatible"]!.Value<bool>().Should().BeFalse(
             "Dictionary<,> has no conversion to System.String");
     }
 }

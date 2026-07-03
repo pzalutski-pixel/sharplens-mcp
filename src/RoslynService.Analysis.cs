@@ -6,8 +6,10 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.FindSymbols;
+using Microsoft.CodeAnalysis.Formatting;
 using Microsoft.CodeAnalysis.Text;
 using System.Collections.Immutable;
+using System.Text;
 
 namespace SharpLensMcp;
 
@@ -18,14 +20,24 @@ public partial class RoslynService
         string? projectPath,
         string? severity,
         bool includeHidden,
-        bool runAnalyzers = true)
+        bool runAnalyzers = true,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
+
+        if (!string.IsNullOrEmpty(severity) && !Enum.TryParse<DiagnosticSeverity>(severity, ignoreCase: true, out _))
+        {
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                $"severity must be one of: {string.Join(", ", Enum.GetNames<DiagnosticSeverity>())} (got '{severity}')",
+                context: new { severity }
+            );
+        }
 
         DiagnosticsData data;
         try
         {
-            data = await GetDiagnosticsDataAsync(filePath, projectPath, severity, includeHidden, runAnalyzers);
+            data = await GetDiagnosticsDataAsync(filePath, projectPath, severity, includeHidden, runAnalyzers, cancellationToken);
         }
         catch (FileNotFoundException)
         {
@@ -80,7 +92,8 @@ public partial class RoslynService
         string? projectPath,
         string? severity,
         bool includeHidden,
-        bool runAnalyzers)
+        bool runAnalyzers,
+        CancellationToken cancellationToken = default)
     {
         var allDiagnostics = new List<Diagnostic>();
         var analyzersRanOnAtLeastOneProject = false;
@@ -90,10 +103,10 @@ public partial class RoslynService
         if (!string.IsNullOrEmpty(filePath))
         {
             var document = await GetDocumentAsync(filePath);
-            var semanticModel = await document.GetSemanticModelAsync();
+            var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
             if (semanticModel != null)
             {
-                allDiagnostics.AddRange(semanticModel.GetDiagnostics());
+                allDiagnostics.AddRange(semanticModel.GetDiagnostics(cancellationToken: cancellationToken));
             }
             projectsToAnalyze.Add(document.Project);
         }
@@ -102,10 +115,10 @@ public partial class RoslynService
             var project = _solution!.Projects.FirstOrDefault(p => p.FilePath == projectPath);
             if (project != null)
             {
-                var compilation = await GetProjectCompilationAsync(project);
+                var compilation = await GetProjectCompilationAsync(project, cancellationToken);
                 if (compilation != null)
                 {
-                    allDiagnostics.AddRange(compilation.GetDiagnostics());
+                    allDiagnostics.AddRange(compilation.GetDiagnostics(cancellationToken));
                 }
                 projectsToAnalyze.Add(project);
             }
@@ -114,10 +127,10 @@ public partial class RoslynService
         {
             foreach (var project in _solution!.Projects)
             {
-                var compilation = await GetProjectCompilationAsync(project);
+                var compilation = await GetProjectCompilationAsync(project, cancellationToken);
                 if (compilation != null)
                 {
-                    allDiagnostics.AddRange(compilation.GetDiagnostics());
+                    allDiagnostics.AddRange(compilation.GetDiagnostics(cancellationToken));
                 }
                 projectsToAnalyze.Add(project);
             }
@@ -132,7 +145,7 @@ public partial class RoslynService
                     .ToImmutableArray();
                 if (analyzers.IsEmpty) continue;
 
-                var compilation = await GetProjectCompilationAsync(project);
+                var compilation = await GetProjectCompilationAsync(project, cancellationToken);
                 if (compilation == null) continue;
 
                 var withAnalyzers = compilation.WithAnalyzers(
@@ -143,23 +156,34 @@ public partial class RoslynService
 
                 try
                 {
-                    var analyzerDiagnostics = await withAnalyzers.GetAllDiagnosticsAsync();
+                    var analyzerDiagnostics = await withAnalyzers.GetAllDiagnosticsAsync(cancellationToken);
                     if (!string.IsNullOrEmpty(filePath))
                     {
                         var doc = TryFindDocument(filePath);
                         if (doc?.FilePath != null)
                         {
+                            // Filter by the physical source tree, not GetLineSpan().Path:
+                            // the latter honors #line directives, so a #line-remapped
+                            // diagnostic that physically lives in this file would be
+                            // dropped (and one remapped INTO it wrongly kept).
                             analyzerDiagnostics = analyzerDiagnostics
-                                .Where(d => string.Equals(
-                                    Path.GetFullPath(d.Location.GetLineSpan().Path ?? ""),
-                                    Path.GetFullPath(doc.FilePath),
-                                    PathComparison))
+                                .Where(d => d.Location.SourceTree?.FilePath is { Length: > 0 } treePath
+                                    && string.Equals(
+                                        Path.GetFullPath(treePath),
+                                        Path.GetFullPath(doc.FilePath),
+                                        PathComparison))
                                 .ToImmutableArray();
                         }
                     }
                     allDiagnostics.AddRange(analyzerDiagnostics);
                     analyzersRanOnAtLeastOneProject = true;
                     analyzersInvoked += analyzers.Length;
+                }
+                catch (OperationCanceledException)
+                {
+                    // A per-call timeout during analyzer execution must surface as
+                    // cancellation, not be downgraded to a skipped-project warning.
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -169,9 +193,19 @@ public partial class RoslynService
         }
 
         allDiagnostics = allDiagnostics
-            .GroupBy(d => (d.Id, d.Location.SourceSpan, d.GetMessage()))
+            .GroupBy(d => (d.Id, d.Location.SourceTree?.FilePath, d.Location.SourceSpan, d.GetMessage()))
             .Select(g => g.First())
             .ToList();
+
+        if (!includeHidden)
+        {
+            allDiagnostics = allDiagnostics.Where(d => d.Severity != DiagnosticSeverity.Hidden).ToList();
+        }
+
+        // Error/warning counts reflect the whole set, so they are taken before the
+        // severity filter, which scopes only the returned page and totalCount.
+        var errorCount = allDiagnostics.Count(d => d.Severity == DiagnosticSeverity.Error);
+        var warningCount = allDiagnostics.Count(d => d.Severity == DiagnosticSeverity.Warning);
 
         if (!string.IsNullOrEmpty(severity))
         {
@@ -179,13 +213,16 @@ public partial class RoslynService
             allDiagnostics = allDiagnostics.Where(d => d.Severity == severityEnum).ToList();
         }
 
-        if (!includeHidden)
-        {
-            allDiagnostics = allDiagnostics.Where(d => d.Severity != DiagnosticSeverity.Hidden).ToList();
-        }
-
         var totalBeforeCap = allDiagnostics.Count;
-        var capped = allDiagnostics.Take(_maxDiagnostics).ToList();
+
+        // Deterministic, useful truncation order: errors first (they matter most when
+        // the page is capped), then by file and source position.
+        var capped = allDiagnostics
+            .OrderByDescending(d => d.Severity)
+            .ThenBy(d => d.Location.SourceTree?.FilePath, StringComparer.Ordinal)
+            .ThenBy(d => d.Location.SourceSpan.Start)
+            .Take(_maxDiagnostics)
+            .ToList();
 
         var entries = capped.Select(d =>
         {
@@ -198,9 +235,6 @@ public partial class RoslynService
                 lineSpan.StartLinePosition.Line);
         }).ToList();
 
-        var errorCount = entries.Count(e => e.Severity == "Error");
-        var warningCount = entries.Count(e => e.Severity == "Warning");
-
         return new DiagnosticsData(
             ErrorCount: errorCount,
             WarningCount: warningCount,
@@ -210,52 +244,20 @@ public partial class RoslynService
             Diagnostics: entries);
     }
 
-    public async Task<object> GetCodeFixesAsync(string filePath, string diagnosticId, int line, int column)
+    public async Task<object> GetCodeFixesAsync(
+        string filePath, string diagnosticId, int line, int column,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
-
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                hint: "Check for syntax errors with get_diagnostics",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
+        var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
+        if (pos == null) return posError!;
 
         // Get all diagnostics for the document (semantic + syntax)
-        var allDiagnostics = semanticModel.GetDiagnostics().ToList();
-        var syntaxDiagnostics = syntaxTree.GetDiagnostics().ToList();
-        allDiagnostics.AddRange(syntaxDiagnostics);
+        var allDiagnostics = pos.Model.GetDiagnostics(cancellationToken: cancellationToken).ToList();
+        allDiagnostics.AddRange(pos.Tree.GetDiagnostics(cancellationToken));
 
-        var position = GetPosition(syntaxTree, line, column);
+        var position = pos.Position;
 
         // Strategy 1: Try exact ID match with position contained in span
         var diagnostic = allDiagnostics.FirstOrDefault(d =>
@@ -308,9 +310,22 @@ public partial class RoslynService
 
         var lineSpan = diagnostic.Location.GetLineSpan();
 
-        // Note: Actual code fix provider infrastructure would require CodeFixProvider registration
-        // For now, we return diagnostic info and common fix suggestions based on diagnostic ID
-        var suggestedFixes = GetCommonFixSuggestions(diagnostic.Id, diagnostic.GetMessage());
+        // The real fixes, from the same MEF code-fix providers apply_code_fix uses —
+        // index/title/equivalenceKey match apply_code_fix's own listing, so the
+        // documented workflow (get_code_fixes → apply_code_fix with fixIndex) shows
+        // one consistent reality. Canned guidance strings remain only as a fallback
+        // for diagnostics no provider can fix.
+        var codeActions = await GetCodeActionsForDiagnosticAsync(pos.Document, diagnostic, cancellationToken);
+        var fixes = codeActions.Select((action, index) => new
+        {
+            index,
+            title = action.Title,
+            equivalenceKey = action.EquivalenceKey
+        }).ToList();
+
+        var fallbackSuggestions = fixes.Count == 0
+            ? GetCommonFixSuggestions(diagnostic.Id, diagnostic.GetMessage())
+            : null;
 
         return CreateSuccessResponse(
             data: new
@@ -326,13 +341,22 @@ public partial class RoslynService
                     endLine = lineSpan.EndLinePosition.Line,
                     endColumn = lineSpan.EndLinePosition.Character
                 },
-                suggestedFixes
+                fixes,
+                fallbackSuggestions
             },
-            suggestedNextTools: new[]
-            {
-                "apply_code_fix to apply a fix automatically",
-                "get_diagnostics to see other issues"
-            }
+            suggestedNextTools: fixes.Count > 0
+                ? new[]
+                {
+                    "apply_code_fix with the same fixIndex to apply one of these fixes",
+                    "get_diagnostics to see other issues"
+                }
+                : new[]
+                {
+                    "No automated fix available - apply the fallback suggestions manually",
+                    "get_diagnostics to see other issues"
+                },
+            totalCount: fixes.Count,
+            returnedCount: fixes.Count
         );
     }
 
@@ -361,52 +385,20 @@ public partial class RoslynService
         int line,
         int column,
         int? fixIndex = null,
-        bool preview = true)
+        bool preview = true,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.FileNotInSolution,
-                $"File not found in solution: {filePath}",
-                hint: "Check the file path or reload the solution",
-                context: new { filePath }
-            );
-        }
-
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get semantic model",
-                hint: "Check for syntax errors with get_diagnostics",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath, line, column }
-            );
-        }
+        var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
+        if (pos == null) return posError!;
+        var document = pos.Document;
 
         // Get all diagnostics (semantic + syntax)
-        var allDiagnostics = semanticModel.GetDiagnostics().ToList();
-        var syntaxDiagnostics = syntaxTree.GetDiagnostics().ToList();
-        allDiagnostics.AddRange(syntaxDiagnostics);
+        var allDiagnostics = pos.Model.GetDiagnostics(cancellationToken: cancellationToken).ToList();
+        allDiagnostics.AddRange(pos.Tree.GetDiagnostics(cancellationToken));
 
-        var position = GetPosition(syntaxTree, line, column);
+        var position = pos.Position;
 
         // Find the diagnostic using the same strategy as GetCodeFixesAsync
         var diagnostic = allDiagnostics.FirstOrDefault(d =>
@@ -436,7 +428,7 @@ public partial class RoslynService
         }
 
         // Get code actions from built-in code fix providers
-        var codeActions = await GetCodeActionsForDiagnosticAsync(document, diagnostic);
+        var codeActions = await GetCodeActionsForDiagnosticAsync(document, diagnostic, cancellationToken);
 
         if (codeActions.Count == 0)
         {
@@ -489,7 +481,7 @@ public partial class RoslynService
         var selectedAction = codeActions[fixIndex.Value];
 
         // Apply the code action
-        var operations = await selectedAction.GetOperationsAsync(CancellationToken.None);
+        var operations = await selectedAction.GetOperationsAsync(cancellationToken);
         var changedSolution = _solution;
 
         foreach (var operation in operations)
@@ -511,115 +503,47 @@ public partial class RoslynService
             );
         }
 
-        // Collect all changed documents
-        var changedDocuments = new List<object>();
-        var solutionChanges = changedSolution.GetChanges(_solution!);
-
-        foreach (var projectChanges in solutionChanges.GetProjectChanges())
+        if (preview)
         {
-            // Check for added documents
-            foreach (var addedDocId in projectChanges.GetAddedDocuments())
-            {
-                var addedDoc = changedSolution.GetDocument(addedDocId);
-                if (addedDoc == null) continue;
-
-                var text = await addedDoc.GetTextAsync();
-                changedDocuments.Add(new
+            var changedDocuments = await BuildPreviewChangeDetailsAsync(changedSolution, cancellationToken);
+            return CreateSuccessResponse(
+                data: new
                 {
-                    filePath = FormatPath(addedDoc.FilePath) ?? $"NewFile_{addedDoc.Name}",
-                    fileName = addedDoc.Name,
-                    isNewFile = true,
-                    newText = preview ? text.ToString() : null,
-                    changeType = "Added"
-                });
-
-                // Write to disk if not preview
-                if (!preview && addedDoc.FilePath != null)
-                {
-                    await File.WriteAllTextAsync(addedDoc.FilePath, text.ToString());
-                }
-            }
-
-            // Check for changed documents
-            foreach (var changedDocId in projectChanges.GetChangedDocuments())
-            {
-                var oldDoc = _solution!.GetDocument(changedDocId);
-                var newDoc = changedSolution.GetDocument(changedDocId);
-                if (oldDoc == null || newDoc == null) continue;
-
-                var oldText = await oldDoc.GetTextAsync();
-                var newText = await newDoc.GetTextAsync();
-
-                var changes = newText.GetTextChanges(oldText).ToList();
-
-                changedDocuments.Add(new
-                {
-                    filePath = FormatPath(newDoc.FilePath),
-                    fileName = newDoc.Name,
-                    isNewFile = false,
-                    changeCount = changes.Count,
-                    newText = preview ? newText.ToString() : null,
-                    changes = preview ? changes.Select(c => new
-                    {
-                        span = new { start = c.Span.Start, end = c.Span.End, length = c.Span.Length },
-                        oldText = oldText.ToString(c.Span),
-                        newText = c.NewText
-                    }).ToList() : null,
-                    changeType = "Modified"
-                });
-
-                if (!preview && newDoc.FilePath != null)
-                {
-                    await File.WriteAllTextAsync(newDoc.FilePath, newText.ToString());
-                }
-            }
-
-            foreach (var removedDocId in projectChanges.GetRemovedDocuments())
-            {
-                var removedDoc = _solution!.GetDocument(removedDocId);
-                if (removedDoc == null) continue;
-
-                changedDocuments.Add(new
-                {
-                    filePath = FormatPath(removedDoc.FilePath),
-                    fileName = removedDoc.Name,
-                    isNewFile = false,
-                    changeType = "Removed"
-                });
-
-                if (!preview && removedDoc.FilePath != null && File.Exists(removedDoc.FilePath))
-                {
-                    File.Delete(removedDoc.FilePath);
-                }
-            }
+                    applied = false,
+                    diagnosticId = diagnostic.Id,
+                    fixTitle = selectedAction.Title,
+                    fixIndex = fixIndex.Value,
+                    changedFiles = changedDocuments,
+                    preview = true
+                },
+                suggestedNextTools: new[] { "apply_code_fix with preview=false to apply changes to disk" },
+                totalCount: changedDocuments.Count,
+                returnedCount: changedDocuments.Count
+            );
         }
 
-        if (!preview)
-        {
-            _solution = changedSolution;
-            _documentCache.Clear();
-            _compilationCache.Clear();
-        }
+        var (ok, applyError, applyReport, introducedErrors) = await ApplyAndReportAsync(changedSolution, cancellationToken);
+        if (!ok) return applyError!;
 
         return CreateSuccessResponse(
             data: new
             {
-                applied = !preview,
+                applied = true,
                 diagnosticId = diagnostic.Id,
                 fixTitle = selectedAction.Title,
                 fixIndex = fixIndex.Value,
-                changedFiles = changedDocuments,
-                preview
+                changedFiles = FormatAppliedChanges(applyReport),
+                preview = false,
+                postApplyErrors = introducedErrors.Count > 0 ? introducedErrors : null
             },
-            suggestedNextTools: preview
-                ? new[] { $"apply_code_fix with preview=false to apply changes to disk" }
-                : new[] { "get_diagnostics to verify fix resolved the issue" },
-            totalCount: changedDocuments.Count,
-            returnedCount: changedDocuments.Count
+            suggestedNextTools: new[] { "get_diagnostics to verify fix resolved the issue" },
+            totalCount: applyReport.Count,
+            returnedCount: applyReport.Count
         );
     }
 
-    private async Task<List<CodeAction>> GetCodeActionsForDiagnosticAsync(Document document, Diagnostic diagnostic)
+    private async Task<List<CodeAction>> GetCodeActionsForDiagnosticAsync(
+        Document document, Diagnostic diagnostic, CancellationToken cancellationToken = default)
     {
         var codeActions = new List<CodeAction>();
         var codeFixProviders = GetBuiltInCodeFixProviders();
@@ -633,11 +557,17 @@ public partial class RoslynService
                 document,
                 diagnostic,
                 (action, _) => codeActions.Add(action),
-                CancellationToken.None);
+                cancellationToken);
 
             try
             {
                 await provider.RegisterCodeFixesAsync(context);
+            }
+            catch (OperationCanceledException)
+            {
+                // A per-call timeout must surface as cancellation (→ TIMEOUT), not be
+                // swallowed and returned as a partial set of fixes.
+                throw;
             }
             catch
             {
@@ -737,7 +667,8 @@ public partial class RoslynService
         int position,
         int? endPosition = null,
         bool includeCodeFixes = true,
-        bool includeRefactorings = true)
+        bool includeRefactorings = true,
+        CancellationToken cancellationToken = default)
     {
         var allActions = new List<(CodeAction action, string kind)>();
         var span = endPosition.HasValue
@@ -747,14 +678,14 @@ public partial class RoslynService
         // Get code fixes for diagnostics at this position
         if (includeCodeFixes)
         {
-            var semanticModel = await document.GetSemanticModelAsync();
-            var syntaxTree = await document.GetSyntaxTreeAsync();
+            var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
+            var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
 
             if (semanticModel != null && syntaxTree != null)
             {
                 // Get all diagnostics and filter to those overlapping our span
-                var allDiagnostics = semanticModel.GetDiagnostics().ToList();
-                allDiagnostics.AddRange(syntaxTree.GetDiagnostics());
+                var allDiagnostics = semanticModel.GetDiagnostics(cancellationToken: cancellationToken).ToList();
+                allDiagnostics.AddRange(syntaxTree.GetDiagnostics(cancellationToken));
 
                 var diagnostics = allDiagnostics
                     .Where(d => d.Location.SourceSpan.IntersectsWith(span) ||
@@ -774,11 +705,15 @@ public partial class RoslynService
                             document,
                             diagnostic,
                             (action, _) => allActions.Add((action, "fix")),
-                            CancellationToken.None);
+                            cancellationToken);
 
                         try
                         {
                             await provider.RegisterCodeFixesAsync(context);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
                         }
                         catch
                         {
@@ -800,11 +735,15 @@ public partial class RoslynService
                     document,
                     span,
                     action => allActions.Add((action, "refactoring")),
-                    CancellationToken.None);
+                    cancellationToken);
 
                 try
                 {
                     await provider.ComputeRefactoringsAsync(context);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch
                 {
@@ -821,7 +760,8 @@ public partial class RoslynService
         bool includeDocuments,
         string? projectNamePattern = null,
         int? maxProjects = null,
-        bool summaryOnly = false)
+        bool summaryOnly = false,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -910,7 +850,7 @@ public partial class RoslynService
                 filePath = FormatPath(project.FilePath),
                 language = project.Language,
                 outputPath = project.OutputFilePath,
-                targetFramework = project.CompilationOptions?.Platform.ToString(),
+                targetFramework = GetTargetFramework(project),
                 documentCount,
                 referenceCount,
                 references = includeReferences ? (referenceCount > 100 ? references!.Concat(new[] { $"... and {referenceCount - 100} more" }).ToList() : references) : null,
@@ -935,16 +875,157 @@ public partial class RoslynService
         ));
     }
 
-    public async Task<object> OrganizeUsingsAsync(string filePath)
+    // Reads the real target framework moniker from the project file. Roslyn's
+    // Project model doesn't expose the TFM, and CompilationOptions.Platform is
+    // the CPU platform (AnyCpu/x64), not a framework.
+    private static string? GetTargetFramework(Project project)
+    {
+        if (project.FilePath == null || !File.Exists(project.FilePath)) return null;
+        try
+        {
+            return ResolveTargetFrameworkFromXml(File.ReadAllText(project.FilePath), project.Name);
+        }
+        catch
+        {
+            // Unreadable or malformed project file — report no TFM rather than a wrong one.
+            return null;
+        }
+    }
+
+    // Pure resolution from csproj XML content. Element lookup is by local name so
+    // legacy project files with the MSBuild xmlns resolve too. A multi-targeted
+    // project loads once per TFM with the moniker in the project name
+    // ("MyProj(net8.0)") — when that instance is identifiable, report its own
+    // moniker instead of the full semicolon list.
+    internal static string? ResolveTargetFrameworkFromXml(string csprojContent, string projectName)
+    {
+        var doc = System.Xml.Linq.XDocument.Parse(csprojContent);
+
+        string? ElementValue(string localName) => doc.Descendants()
+            .FirstOrDefault(e => e.Name.LocalName == localName)?.Value;
+
+        var single = ElementValue("TargetFramework");
+        if (!string.IsNullOrWhiteSpace(single)) return single;
+
+        var multi = ElementValue("TargetFrameworks");
+        if (!string.IsNullOrWhiteSpace(multi))
+        {
+            var open = projectName.LastIndexOf('(');
+            if (open >= 0 && projectName.EndsWith(')'))
+            {
+                var candidate = projectName[(open + 1)..^1];
+                if (multi.Split(';').Select(t => t.Trim()).Contains(candidate)) return candidate;
+            }
+            return multi;
+        }
+
+        // Legacy (non-SDK) project files carry a version ("v4.7.2") instead of a moniker.
+        var legacy = ElementValue("TargetFrameworkVersion");
+        return string.IsNullOrWhiteSpace(legacy) ? null : legacy;
+    }
+
+    // Computes a document's organized usings: directives the compiler marks
+    // unnecessary (CS8019) removed, the rest grouped global → plain (System root
+    // namespaces first) → static → alias, alphabetical within each group.
+    // Returns null when the document has no compilation-unit root.
+    private static async Task<(CompilationUnitSyntax newRoot, int totalUsings, int removedUsings, bool changed)?>
+        ComputeOrganizedUsingsAsync(Document document, CancellationToken cancellationToken = default)
+    {
+        var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
+        var root = await document.GetSyntaxRootAsync(cancellationToken);
+        if (semanticModel == null || root is not CompilationUnitSyntax compilationUnit) return null;
+
+        var usings = compilationUnit.Usings;
+        if (usings.Count == 0) return (compilationUnit, 0, 0, false);
+
+        // CS8019 "Unnecessary using directive" — the compiler's own verdict, so
+        // conditional-compilation and alias subtleties are already accounted for.
+        var unusedSpans = semanticModel.GetDiagnostics(cancellationToken: cancellationToken)
+            .Where(d => d.Id == "CS8019")
+            .Select(d => d.Location.SourceSpan)
+            .ToList();
+
+        var kept = usings
+            .Where(u => !unusedSpans.Any(span => span.Contains(u.Span) || u.Span.Contains(span)))
+            .ToList();
+
+        var organized = kept.OrderBy(UsingSortKey).ToList();
+        var changed = !usings.SequenceEqual(organized);
+
+        var newRoot = WithUsingsPreservingHeader(compilationUnit, usings[0], organized);
+        return (newRoot, usings.Count, usings.Count - kept.Count, changed);
+    }
+
+    // Group order: global, plain (System root first), static, alias —
+    // alphabetical within each group. Exact "System"-root check, so a
+    // namespace like SystemFoo sorts with the other plain usings.
+    private static (int group, int systemFirst, string name) UsingSortKey(UsingDirectiveSyntax u)
+    {
+        var name = u.Name?.ToString() ?? u.ToString();
+        var group =
+            u.GlobalKeyword.IsKind(SyntaxKind.GlobalKeyword) ? 0 :
+            u.Alias != null ? 3 :
+            u.StaticKeyword.IsKind(SyntaxKind.StaticKeyword) ? 2 : 1;
+        var systemFirst = name == "System" || name.StartsWith("System.", StringComparison.Ordinal) ? 0 : 1;
+        return (group, systemFirst, name);
+    }
+
+    // Keeps a using block's file-header leading trivia pinned to the top after the
+    // directives are reordered (organize_usings) or a new one is inserted before them
+    // (add_missing_imports). The header is the leading trivia of the directive that was
+    // syntactically first; rather than let it travel to the middle of the file with that
+    // directive, it is moved onto whichever directive ends up first — the same contract
+    // as Roslyn's "Remove and Sort Usings" / dotnet format. No-op when the original first
+    // directive is still first (or the block is empty).
+    private static SyntaxList<UsingDirectiveSyntax> PinHeaderTrivia(
+        UsingDirectiveSyntax originalFirst, IReadOnlyList<UsingDirectiveSyntax> ordered)
+    {
+        if (ordered.Count == 0 || ordered[0] == originalFirst)
+            return SyntaxFactory.List(ordered);
+
+        var header = originalFirst.GetLeadingTrivia();
+        var result = ordered.ToList();
+        result[0] = result[0].WithLeadingTrivia(header.AddRange(result[0].GetLeadingTrivia()));
+        for (var i = 1; i < result.Count; i++)
+        {
+            if (result[i] == originalFirst)
+            {
+                result[i] = originalFirst.WithLeadingTrivia();
+                break;
+            }
+        }
+        return SyntaxFactory.List(result);
+    }
+
+    // Rebuilds the compilation unit with the reordered/reduced usings while keeping the file
+    // header (the original first using's leading trivia) pinned to the top: onto the new
+    // first using when one remains, or onto the first member / EOF token when removing the
+    // unused usings empties the block — so a header on the sole using is not deleted with it.
+    private static CompilationUnitSyntax WithUsingsPreservingHeader(
+        CompilationUnitSyntax unit, UsingDirectiveSyntax originalFirst, IReadOnlyList<UsingDirectiveSyntax> newUsings)
+    {
+        if (newUsings.Count > 0)
+            return unit.WithUsings(PinHeaderTrivia(originalFirst, newUsings));
+
+        var header = originalFirst.GetLeadingTrivia();
+        var withoutUsings = unit.WithUsings(default);
+        if (withoutUsings.Members.Count > 0)
+        {
+            var firstMember = withoutUsings.Members[0];
+            return withoutUsings.ReplaceNode(firstMember,
+                firstMember.WithLeadingTrivia(header.AddRange(firstMember.GetLeadingTrivia())));
+        }
+        var eof = withoutUsings.EndOfFileToken;
+        return withoutUsings.WithEndOfFileToken(eof.WithLeadingTrivia(header.AddRange(eof.LeadingTrivia)));
+    }
+
+    public async Task<object> OrganizeUsingsAsync(
+        string filePath, bool preview = true, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        Document document;
-        try
-        {
-            document = await GetDocumentAsync(filePath);
-        }
-        catch (FileNotFoundException)
+        var document = TryFindDocument(filePath);
+        if (document == null)
         {
             return CreateErrorResponse(
                 ErrorCodes.FileNotInSolution,
@@ -954,18 +1035,8 @@ public partial class RoslynService
             );
         }
 
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree",
-                context: new { filePath }
-            );
-        }
-
-        var root = await syntaxTree.GetRootAsync();
-        if (root is not CompilationUnitSyntax compilationUnit)
+        var organizedResult = await ComputeOrganizedUsingsAsync(document, cancellationToken);
+        if (organizedResult == null)
         {
             return CreateErrorResponse(
                 ErrorCodes.AnalysisFailed,
@@ -975,32 +1046,49 @@ public partial class RoslynService
             );
         }
 
-        // Get all usings
-        var usings = compilationUnit.Usings;
+        var (newRoot, totalUsings, removedUsings, changed) = organizedResult.Value;
 
-        // Sort them (System namespaces first, then alphabetically)
-        var sortedUsings = usings
-            .OrderBy(u => u.Name?.ToString().StartsWith("System") == true ? 0 : 1)
-            .ThenBy(u => u.Name?.ToString())
-            .ToList();
+        if (preview || !changed)
+        {
+            return CreateSuccessResponse(
+                data: new
+                {
+                    organizedText = newRoot.ToFullString(),
+                    totalUsings,
+                    removedUsings,
+                    changed,
+                    preview = true,
+                    applied = false
+                },
+                suggestedNextTools: changed
+                    ? new[] { "organize_usings with preview=false to apply", "organize_usings_batch to process multiple files" }
+                    : new[] { "Usings are already organized - nothing to apply" }
+            );
+        }
 
-        // Create new compilation unit with sorted usings
-        var newRoot = compilationUnit.WithUsings(SyntaxFactory.List(sortedUsings));
+        var newSolution = _solution!.WithDocumentText(
+            document.Id, SourceText.From(newRoot.ToFullString(), Encoding.UTF8));
+        var (ok, applyError, _, introducedErrors) = await ApplyAndReportAsync(newSolution, cancellationToken);
+        if (!ok) return applyError!;
 
         return CreateSuccessResponse(
             data: new
             {
-                organizedText = newRoot.ToFullString()
+                organizedText = newRoot.ToFullString(),
+                totalUsings,
+                removedUsings,
+                changed,
+                preview = false,
+                applied = true,
+                postApplyErrors = introducedErrors.Count > 0 ? introducedErrors : null
             },
-            suggestedNextTools: new[]
-            {
-                "organize_usings_batch to process multiple files",
-                "format_document_batch for consistent formatting"
-            }
+            suggestedNextTools: new[] { "get_diagnostics to verify the file still compiles" }
         );
     }
 
-    public async Task<object> OrganizeUsingsBatchAsync(string? projectName, string? filePattern, bool preview = true)
+    public async Task<object> OrganizeUsingsBatchAsync(
+        string? projectName, string? filePattern, bool preview = true,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -1011,6 +1099,7 @@ public partial class RoslynService
         var processedFiles = new List<object>();
         var totalFiles = 0;
         var filesWithChanges = 0;
+        var changedSolution = _solution!;
 
         foreach (var project in projectsToProcess)
         {
@@ -1030,45 +1119,35 @@ public partial class RoslynService
 
                 try
                 {
-                    var syntaxTree = await document.GetSyntaxTreeAsync();
-                    if (syntaxTree == null) continue;
+                    var organizedResult = await ComputeOrganizedUsingsAsync(document, cancellationToken);
+                    if (organizedResult == null) continue;
 
-                    var root = await syntaxTree.GetRootAsync();
-                    if (root is not CompilationUnitSyntax compilationUnit) continue;
-
-                    var usings = compilationUnit.Usings;
-                    if (usings.Count == 0) continue;
-
-                    // Sort usings
-                    var sortedUsings = usings
-                        .OrderBy(u => u.Name?.ToString().StartsWith("System") == true ? 0 : 1)
-                        .ThenBy(u => u.Name?.ToString())
-                        .ToList();
-
-                    // Check if anything changed
-                    var hasChanges = !usings.SequenceEqual(sortedUsings);
-                    if (!hasChanges) continue;
+                    var (newRoot, totalUsings, removedUsings, changed) = organizedResult.Value;
+                    if (totalUsings == 0 || !changed) continue;
 
                     filesWithChanges++;
-
-                    // Create new compilation unit with sorted usings
-                    var newRoot = compilationUnit.WithUsings(SyntaxFactory.List(sortedUsings));
-                    var newText = newRoot.ToFullString();
 
                     processedFiles.Add(new
                     {
                         filePath = FormatPath(document.FilePath),
                         fileName = Path.GetFileName(document.FilePath),
                         projectName = project.Name,
-                        usingCount = usings.Count,
+                        totalUsings,
+                        removedUsings,
                         preview
                     });
 
-                    // Write to disk if not preview
                     if (!preview)
                     {
-                        await File.WriteAllTextAsync(document.FilePath, newText);
+                        changedSolution = changedSolution.WithDocumentText(
+                            document.Id, SourceText.From(newRoot.ToFullString(), Encoding.UTF8));
                     }
+                }
+                catch (OperationCanceledException)
+                {
+                    // A per-call timeout must surface as cancellation (→ TIMEOUT), not be
+                    // folded into a per-file error entry and returned as partial success.
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -1083,13 +1162,14 @@ public partial class RoslynService
             }
         }
 
-        // On apply, clear caches so subsequent compilation reads pick up the new on-disk
-        // content. Caller should call sync_documents to refresh the workspace's solution
-        // since we wrote directly through File.WriteAllTextAsync rather than via SolutionEditor.
+        // Apply through the unified path — workspace, in-memory solution, caches,
+        // and disk stay consistent; no sync_documents needed afterward.
+        IReadOnlyList<string> introducedErrors = Array.Empty<string>();
         if (!preview && filesWithChanges > 0)
         {
-            _documentCache.Clear();
-            _compilationCache.Clear();
+            var (ok, applyError, _, applyErrors) = await ApplyAndReportAsync(changedSolution, cancellationToken);
+            if (!ok) return applyError!;
+            introducedErrors = applyErrors;
         }
 
         return CreateSuccessResponse(
@@ -1098,19 +1178,34 @@ public partial class RoslynService
                 totalFilesScanned = totalFiles,
                 filesWithChanges,
                 preview,
-                files = processedFiles
+                files = processedFiles,
+                postApplyErrors = introducedErrors.Count > 0 ? introducedErrors : null
             },
             suggestedNextTools: preview
                 ? new[] { "organize_usings_batch with preview=false to apply changes" }
-                : new[] { "sync_documents to refresh the workspace, then get_diagnostics to verify" },
+                : new[] { "get_diagnostics to verify the changes compile" },
             totalCount: totalFiles,
             returnedCount: processedFiles.Count
         );
     }
 
-    public async Task<object> FormatDocumentBatchAsync(string? projectName, bool includeTests = true, bool preview = true, string? filePattern = null)
+    public async Task<object> FormatDocumentBatchAsync(
+        string? projectName, bool includeTests = true, bool preview = true, string? filePattern = null,
+        string? mode = null, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
+
+        var normalizedMode = string.IsNullOrWhiteSpace(mode) ? "whitespace" : mode!.ToLowerInvariant();
+        if (normalizedMode != "whitespace" && normalizedMode != "canonical")
+        {
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                $"mode must be 'whitespace' or 'canonical' (got '{mode}')",
+                hint: "'whitespace' (default) fixes indentation/spacing and preserves your style; 'canonical' fully re-prints the syntax tree — it expands minified code but rewrites stylistic whitespace.",
+                context: new { mode }
+            );
+        }
+        var canonical = normalizedMode == "canonical";
 
         var projectsToProcess = string.IsNullOrEmpty(projectName)
             ? _solution!.Projects
@@ -1119,6 +1214,7 @@ public partial class RoslynService
         var processedFiles = new List<object>();
         var totalFiles = 0;
         var filesFormatted = 0;
+        var changedSolution = _solution!;
 
         foreach (var project in projectsToProcess)
         {
@@ -1139,17 +1235,30 @@ public partial class RoslynService
 
                 try
                 {
-                    var syntaxTree = await document.GetSyntaxTreeAsync();
-                    if (syntaxTree == null) continue;
+                    var originalText = (await document.GetTextAsync(cancellationToken)).ToString();
 
-                    var root = await syntaxTree.GetRootAsync();
+                    string formattedText;
+                    if (canonical)
+                    {
+                        // Canonical re-print of the syntax tree: the only engine that
+                        // expands minified one-liner code, at the cost of rewriting
+                        // stylistic whitespace (suppression-operator spacing becomes
+                        // "null !", blank lines between members are dropped). Opt-in.
+                        var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
+                        if (syntaxTree == null) continue;
+                        var root = await syntaxTree.GetRootAsync(cancellationToken);
+                        formattedText = root.NormalizeWhitespace().ToFullString();
+                    }
+                    else
+                    {
+                        // Whitespace-only formatting per the workspace's formatting
+                        // rules — fixes indentation and token spacing, preserves the
+                        // author's structural choices (single-line auto-properties,
+                        // blank lines, "null!"). Same contract as `dotnet format`.
+                        var formattedDocument = await Formatter.FormatAsync(document, cancellationToken: cancellationToken);
+                        formattedText = (await formattedDocument.GetTextAsync(cancellationToken)).ToString();
+                    }
 
-                    // Format the document using Roslyn's formatter
-                    var formattedRoot = root.NormalizeWhitespace();
-                    var formattedText = formattedRoot.ToFullString();
-
-                    // Check if anything changed
-                    var originalText = root.ToFullString();
                     var hasChanges = originalText != formattedText;
 
                     if (!hasChanges) continue;
@@ -1164,11 +1273,17 @@ public partial class RoslynService
                         preview
                     });
 
-                    // Write to disk if not preview
                     if (!preview)
                     {
-                        await File.WriteAllTextAsync(document.FilePath, formattedText);
+                        changedSolution = changedSolution.WithDocumentText(
+                            document.Id, SourceText.From(formattedText, Encoding.UTF8));
                     }
+                }
+                catch (OperationCanceledException)
+                {
+                    // A per-call timeout must surface as cancellation (→ TIMEOUT), not be
+                    // folded into a per-file error entry and returned as partial success.
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -1183,13 +1298,14 @@ public partial class RoslynService
             }
         }
 
-        // On apply, clear caches so subsequent compilation reads pick up the new on-disk
-        // content. Caller should call sync_documents to refresh the workspace's solution
-        // since we wrote directly through File.WriteAllTextAsync rather than via SolutionEditor.
+        // Apply through the unified path — workspace, in-memory solution, caches,
+        // and disk stay consistent; no sync_documents needed afterward.
+        IReadOnlyList<string> introducedErrors = Array.Empty<string>();
         if (!preview && filesFormatted > 0)
         {
-            _documentCache.Clear();
-            _compilationCache.Clear();
+            var (ok, applyError, _, applyErrors) = await ApplyAndReportAsync(changedSolution, cancellationToken);
+            if (!ok) return applyError!;
+            introducedErrors = applyErrors;
         }
 
         return CreateSuccessResponse(
@@ -1197,12 +1313,14 @@ public partial class RoslynService
             {
                 totalFilesScanned = totalFiles,
                 filesFormatted,
+                mode = normalizedMode,
                 preview,
-                files = processedFiles
+                files = processedFiles,
+                postApplyErrors = introducedErrors.Count > 0 ? introducedErrors : null
             },
             suggestedNextTools: preview
                 ? new[] { "format_document_batch with preview=false to apply changes" }
-                : new[] { "sync_documents to refresh the workspace, then get_diagnostics to verify" },
+                : new[] { "get_diagnostics to verify the formatting compiles" },
             totalCount: totalFiles,
             returnedCount: processedFiles.Count
         );

@@ -30,16 +30,21 @@ public class ChangeSignatureTests : IAsyncLifetime
 
         _service = new RoslynService();
         var result = await _service.LoadSolutionAsync(_solutionPath);
-        JObject.FromObject(result)["success"]?.Value<bool>().Should().BeTrue();
+        var loadJson = JObject.FromObject(result);
+        loadJson["success"].Should().NotBeNull();
+        loadJson["success"]!.Value<bool>().Should().BeTrue();
     }
 
     public Task DisposeAsync()
     {
-        // Always restore the fixture file so tests don't pollute each other or
-        // leave the working tree dirty.
-        if (_originalFixtureContent != null && _fixturePath != null && File.Exists(_fixturePath))
+        // Always restore the fixture to its committed content — recreating it even
+        // if a test deleted it — and assert the restore physically landed, so a
+        // swallowed write can't leave the tree dirty for the next serialized test.
+        if (_originalFixtureContent != null && _fixturePath != null)
         {
             File.WriteAllText(_fixturePath, _originalFixtureContent);
+            File.ReadAllText(_fixturePath).Should().Be(_originalFixtureContent,
+                "the fixture must be restored to its committed content after the test");
         }
         return Task.CompletedTask;
     }
@@ -74,15 +79,20 @@ public class ChangeSignatureTests : IAsyncLifetime
             preview: true);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue();
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue();
         var data = json["data"]!;
-        data["preview"]?.Value<bool>().Should().BeTrue();
-        data["methodName"]?.Value<string>().Should().Be("Concat");
+        data["preview"].Should().NotBeNull();
+        data["preview"]!.Value<bool>().Should().BeTrue();
+        data["methodName"].Should().NotBeNull();
+        data["methodName"]!.Value<string>().Should().Be("Concat");
 
         // Old/new signature must lock the rewrite Roslyn would emit.
-        data["oldSignature"]?.Value<string>().Should()
+        data["oldSignature"].Should().NotBeNull();
+        data["oldSignature"]!.Value<string>().Should()
             .Contain("Concat(int first, int second, int third)");
-        data["newSignature"]?.Value<string>().Should()
+        data["newSignature"].Should().NotBeNull();
+        data["newSignature"]!.Value<string>().Should()
             .Contain("Concat(int first, int second, int third, int extra = 0)",
                 "the added int parameter with default 0 must appear at the end of the signature");
 
@@ -92,9 +102,11 @@ public class ChangeSignatureTests : IAsyncLifetime
         var callSites = (data["callSites"] as JArray)!;
         callSites.Count.Should().Be(5,
             "Concat has exactly 5 call sites across ChangeSignatureMethodHolder");
-        data["callSitesCount"]?.Value<int>().Should().Be(5,
+        data["callSitesCount"].Should().NotBeNull();
+        data["callSitesCount"]!.Value<int>().Should().Be(5,
             "callSitesCount must equal the total — fewer than 20 so no truncation");
-        data["hasMoreCallSites"]?.Value<bool>().Should().BeFalse(
+        data["hasMoreCallSites"].Should().NotBeNull();
+        data["hasMoreCallSites"]!.Value<bool>().Should().BeFalse(
             "5 < 20 cap; no truncation");
 
         File.ReadAllText(_fixturePath).Should().Be(before, "preview must not modify disk");
@@ -114,11 +126,15 @@ public class ChangeSignatureTests : IAsyncLifetime
             preview: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
-        json["data"]!["applied"]?.Value<bool>().Should().BeTrue();
-        json["data"]!["callSitesUpdated"]?.Value<int>().Should().Be(5,
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+        json["data"]!["applied"].Should().NotBeNull();
+        json["data"]!["applied"]!.Value<bool>().Should().BeTrue();
+        json["data"]!["callSitesUpdated"].Should().NotBeNull();
+        json["data"]!["callSitesUpdated"]!.Value<int>().Should().Be(5,
             "all 5 Concat call sites must receive the new argument");
-        json["data"]!["newSignature"]?.Value<string>().Should().Contain("factor");
+        json["data"]!["newSignature"].Should().NotBeNull();
+        json["data"]!["newSignature"]!.Value<string>().Should().Contain("factor");
 
         // Verify on disk: the declaration and at least one call site got the new arg.
         // Whitespace is stripped before matching — see Normalize().
@@ -144,9 +160,12 @@ public class ChangeSignatureTests : IAsyncLifetime
             preview: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
-        json["data"]!["callSitesUpdated"]?.Value<int>().Should().Be(5);
-        json["data"]!["newSignature"]?.Value<string>().Should().NotContain("int third");
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+        json["data"]!["callSitesUpdated"].Should().NotBeNull();
+        json["data"]!["callSitesUpdated"]!.Value<int>().Should().Be(5);
+        json["data"]!["newSignature"].Should().NotBeNull();
+        json["data"]!["newSignature"]!.Value<string>().Should().NotContain("int third");
 
         // Verify on disk (whitespace stripped by Normalize): the declaration is now
         // (int first, int second) only.
@@ -177,12 +196,15 @@ public class ChangeSignatureTests : IAsyncLifetime
             preview: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
-        json["data"]!["callSitesUpdated"]?.Value<int>().Should().Be(5,
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+        json["data"]!["callSitesUpdated"].Should().NotBeNull();
+        json["data"]!["callSitesUpdated"]!.Value<int>().Should().Be(5,
             "every call site must be visited so named-arg labels can be re-written");
-        json["data"]!["newSignature"]?.Value<string>().Should().Contain("int primary",
+        json["data"]!["newSignature"].Should().NotBeNull();
+        json["data"]!["newSignature"]!.Value<string>().Should().Contain("int primary",
             "renamed parameter must appear in the new signature");
-        json["data"]!["newSignature"]?.Value<string>().Should().NotContain("int first",
+        json["data"]!["newSignature"]!.Value<string>().Should().NotContain("int first",
             "old parameter name must be gone from the signature");
 
         // The signature rewrite is half the contract — named-argument call sites must
@@ -212,8 +234,10 @@ public class ChangeSignatureTests : IAsyncLifetime
             preview: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
-        json["data"]!["callSitesUpdated"]?.Value<int>().Should().Be(5);
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+        json["data"]!["callSitesUpdated"].Should().NotBeNull();
+        json["data"]!["callSitesUpdated"]!.Value<int>().Should().Be(5);
         var newSig = json["data"]!["newSignature"]?.Value<string>();
         // Parameter order in the signature must reflect the requested permutation.
         var thirdIdx = newSig!.IndexOf("int third");
@@ -250,11 +274,15 @@ public class ChangeSignatureTests : IAsyncLifetime
             preview: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
-        json["data"]!["applied"]?.Value<bool>().Should().BeTrue();
-        json["data"]!["newSignature"]?.Value<string>().Should().Contain("scale");
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+        json["data"]!["applied"].Should().NotBeNull();
+        json["data"]!["applied"]!.Value<bool>().Should().BeTrue();
+        json["data"]!["newSignature"].Should().NotBeNull();
+        json["data"]!["newSignature"]!.Value<string>().Should().Contain("scale");
         // Fixture's Total() calls Combine exactly twice — `Combine(1, 2)` and `Combine(3, 4)`.
-        json["data"]!["callSitesUpdated"]?.Value<int>().Should().Be(2);
+        json["data"]!["callSitesUpdated"].Should().NotBeNull();
+        json["data"]!["callSitesUpdated"]!.Value<int>().Should().Be(2);
 
         // On disk: both call sites must have the default appended (whitespace stripped).
         var diskContent = Normalize(File.ReadAllText(_fixturePath));
@@ -276,7 +304,9 @@ public class ChangeSignatureTests : IAsyncLifetime
                 new() { Action = "add", Name = "scale", Type = "int", DefaultValue = "10" }
             },
             preview: false);
-        JObject.FromObject(apply)["success"]?.Value<bool>().Should().BeTrue();
+        var applyJson = JObject.FromObject(apply);
+        applyJson["success"].Should().NotBeNull();
+        applyJson["success"]!.Value<bool>().Should().BeTrue();
 
         // After applying an additive change with a default value, the fixture file must
         // still compile — every call site got the default argument inserted.
@@ -307,12 +337,16 @@ public class ChangeSignatureTests : IAsyncLifetime
             preview: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
-        json["data"]!["applied"]?.Value<bool>().Should().BeTrue();
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+        json["data"]!["applied"].Should().NotBeNull();
+        json["data"]!["applied"]!.Value<bool>().Should().BeTrue();
         // Two call sites: `: this(seed, "default")` and `new ChangeSignatureCtorHolder(seed, "made")`.
-        json["data"]!["callSitesUpdated"]?.Value<int>().Should().Be(2,
+        json["data"]!["callSitesUpdated"].Should().NotBeNull();
+        json["data"]!["callSitesUpdated"]!.Value<int>().Should().Be(2,
             "the ctor has exactly two call sites: this-initializer and new-expression");
-        json["data"]!["newSignature"]?.Value<string>().Should().Contain("tag");
+        json["data"]!["newSignature"].Should().NotBeNull();
+        json["data"]!["newSignature"]!.Value<string>().Should().Contain("tag");
 
         // Disk verification (whitespace stripped): both forms must include the new
         // default-argument 0.
@@ -327,7 +361,7 @@ public class ChangeSignatureTests : IAsyncLifetime
     public async Task Apply_OnNonMethodPosition_ReturnsNotAMethod()
     {
         // Cursor on the class-declaration line of ChangeSignatureMethodHolder — not a
-        // method/ctor/local-function. Refactoring.cs:600 returns NotAMethod.
+        // method/ctor/local-function. The impl returns NotAMethod.
         var lines = File.ReadAllLines(_fixturePath);
         var classLine = Array.FindIndex(lines, l => l.Contains("public class ChangeSignatureMethodHolder"));
         classLine.Should().BeGreaterThan(-1);
@@ -341,8 +375,13 @@ public class ChangeSignatureTests : IAsyncLifetime
             preview: true);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeFalse();
-        json["error"]?["code"]?.Value<string>().Should().Be(ErrorCodes.NotAMethod);
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeFalse();
+        // In-process JObject.FromObject keeps RoslynError's PascalCase `Code`; the old
+        // lowercase `["code"]` read was always null and silently passed.
+        json["error"].Should().NotBeNull("a failed change_signature must carry an error");
+        json["error"]!["Code"].Should().NotBeNull();
+        json["error"]!["Code"]!.Value<string>().Should().Be(ErrorCodes.NotAMethod);
     }
 
     [Fact]
@@ -363,8 +402,10 @@ public class ChangeSignatureTests : IAsyncLifetime
             preview: false);
 
         var json = JObject.FromObject(result);
-        json["success"]?.Value<bool>().Should().BeTrue(json.ToString());
-        json["data"]!["callSitesUpdated"]?.Value<int>().Should().Be(5,
+        json["success"].Should().NotBeNull();
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+        json["data"]!["callSitesUpdated"].Should().NotBeNull();
+        json["data"]!["callSitesUpdated"]!.Value<int>().Should().Be(5,
             "every call site must be visited for the combined add+rename to land");
 
         var newSig = json["data"]!["newSignature"]?.Value<string>()!;
@@ -377,5 +418,66 @@ public class ChangeSignatureTests : IAsyncLifetime
             "the named-arg call site must have first→alpha applied (whitespace stripped)");
         diskContent.Should().Contain("Concat(1,2,3,0)",
             "the positional call site must have the extra=0 default appended");
+    }
+
+    [Fact]
+    public async Task Reorder_OmittingAKeptParameter_ReturnsInvalidParameter()
+    {
+        var (line, col) = await LocateConcatAsync();
+
+        var result = await _service.ChangeSignatureAsync(
+            _fixturePath, line, col,
+            new List<SignatureChange>
+            {
+                new() { Action = "reorder", Order = new List<string> { "third", "first" } }
+            },
+            preview: true);
+
+        var json = JObject.FromObject(result);
+        json["success"]!.Value<bool>().Should().BeFalse(
+            "a reorder that omits a kept parameter must be rejected, not silently drop it");
+        json["error"]!["Code"]!.Value<string>().Should().Be(ErrorCodes.InvalidParameter);
+        json["error"]!["Message"]!.Value<string>().Should().Contain("second",
+            "the omitted kept parameter must be named in the error");
+    }
+
+    [Fact]
+    public async Task Add_DefaultedParameterBeforeRequired_ReturnsInvalidParameter()
+    {
+        var (line, col) = await LocateConcatAsync();
+
+        var result = await _service.ChangeSignatureAsync(
+            _fixturePath, line, col,
+            new List<SignatureChange>
+            {
+                new() { Action = "add", Name = "extra", Type = "int", DefaultValue = "0", Position = 0 }
+            },
+            preview: true);
+
+        var json = JObject.FromObject(result);
+        json["success"]!.Value<bool>().Should().BeFalse(
+            "a defaulted parameter placed before the required parameters would not compile (CS1737)");
+        json["error"]!["Code"]!.Value<string>().Should().Be(ErrorCodes.InvalidParameter);
+        json["error"]!["Message"]!.Value<string>().Should().Contain("CS1737");
+    }
+
+    [Fact]
+    public async Task Add_WithOutOfRangePosition_ReturnsInvalidParameter()
+    {
+        var (line, col) = await LocateConcatAsync();
+
+        var result = await _service.ChangeSignatureAsync(
+            _fixturePath, line, col,
+            new List<SignatureChange>
+            {
+                new() { Action = "add", Name = "extra", Type = "int", DefaultValue = "0", Position = 99 }
+            },
+            preview: true);
+
+        var json = JObject.FromObject(result);
+        json["success"]!.Value<bool>().Should().BeFalse(
+            "an out-of-range add Position must be rejected, not silently appended");
+        json["error"]!["Code"]!.Value<string>().Should().Be(ErrorCodes.InvalidParameter);
+        json["error"]!["Message"]!.Value<string>().Should().Contain("out of range");
     }
 }

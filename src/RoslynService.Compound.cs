@@ -14,7 +14,8 @@ public partial class RoslynService
     public async Task<object> AnalyzeDataFlowAsync(
         string filePath,
         int startLine,
-        int endLine)
+        int endLine,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -33,7 +34,7 @@ public partial class RoslynService
             );
         }
 
-        var semanticModel = await document.GetSemanticModelAsync();
+        var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
         if (semanticModel == null)
         {
             return CreateErrorResponse(
@@ -43,7 +44,7 @@ public partial class RoslynService
             );
         }
 
-        var syntaxTree = await document.GetSyntaxTreeAsync();
+        var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
         if (syntaxTree == null)
         {
             return CreateErrorResponse(
@@ -52,8 +53,8 @@ public partial class RoslynService
             );
         }
 
-        var root = await syntaxTree.GetRootAsync();
-        var text = await syntaxTree.GetTextAsync();
+        var root = await syntaxTree.GetRootAsync(cancellationToken);
+        var text = await syntaxTree.GetTextAsync(cancellationToken);
 
         // Find the node spanning the specified lines
         var startPosition = text.Lines[Math.Max(0, startLine)].Start;
@@ -62,7 +63,7 @@ public partial class RoslynService
 
         var node = root.FindNode(span);
 
-        var (firstStatement, lastStatement) = ResolveAnalysisStatements(node);
+        var (firstStatement, lastStatement) = ResolveAnalysisStatements(node, span);
 
         if (firstStatement == null || lastStatement == null)
         {
@@ -80,6 +81,10 @@ public partial class RoslynService
             dataFlow = firstStatement == lastStatement
                 ? semanticModel.AnalyzeDataFlow(firstStatement)
                 : semanticModel.AnalyzeDataFlow(firstStatement, lastStatement);
+        }
+        catch (OperationCanceledException)
+        {
+            throw; // a per-call timeout surfaces as the dispatcher's TIMEOUT, not AnalysisFailed
         }
         catch (Exception ex)
         {
@@ -131,7 +136,8 @@ public partial class RoslynService
     public async Task<object> AnalyzeControlFlowAsync(
         string filePath,
         int startLine,
-        int endLine)
+        int endLine,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -150,7 +156,7 @@ public partial class RoslynService
             );
         }
 
-        var semanticModel = await document.GetSemanticModelAsync();
+        var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
         if (semanticModel == null)
         {
             return CreateErrorResponse(
@@ -159,7 +165,7 @@ public partial class RoslynService
             );
         }
 
-        var syntaxTree = await document.GetSyntaxTreeAsync();
+        var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
         if (syntaxTree == null)
         {
             return CreateErrorResponse(
@@ -168,8 +174,8 @@ public partial class RoslynService
             );
         }
 
-        var root = await syntaxTree.GetRootAsync();
-        var text = await syntaxTree.GetTextAsync();
+        var root = await syntaxTree.GetRootAsync(cancellationToken);
+        var text = await syntaxTree.GetTextAsync(cancellationToken);
 
         var startPosition = text.Lines[Math.Max(0, startLine)].Start;
         var endPosition = text.Lines[Math.Min(text.Lines.Count - 1, endLine)].End;
@@ -177,7 +183,7 @@ public partial class RoslynService
 
         var node = root.FindNode(span);
 
-        var (firstStatement, lastStatement) = ResolveAnalysisStatements(node);
+        var (firstStatement, lastStatement) = ResolveAnalysisStatements(node, span);
 
         if (firstStatement == null || lastStatement == null)
         {
@@ -192,6 +198,10 @@ public partial class RoslynService
         try
         {
             controlFlow = semanticModel.AnalyzeControlFlow(firstStatement, lastStatement);
+        }
+        catch (OperationCanceledException)
+        {
+            throw; // a per-call timeout surfaces as the dispatcher's TIMEOUT, not AnalysisFailed
         }
         catch (Exception ex)
         {
@@ -260,9 +270,9 @@ public partial class RoslynService
 
     /// <summary>
     /// Gets a comprehensive overview of a type in a single call.
-    /// Combines type info, base types summary, member counts, and Godot attributes.
+    /// Combines type info, base types summary, and member counts.
     /// </summary>
-    public async Task<object> GetTypeOverviewAsync(string typeName)
+    public async Task<object> GetTypeOverviewAsync(string typeName, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -274,7 +284,8 @@ public partial class RoslynService
             );
         }
 
-        var type = await FindTypeByNameAsync(typeName);
+        var (type, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
+        if (ambiguousType != null) return ambiguousType;
         if (type == null)
         {
             return CreateErrorResponse(
@@ -306,15 +317,6 @@ public partial class RoslynService
             constructors = members.OfType<IMethodSymbol>().Count(m => m.MethodKind == MethodKind.Constructor)
         };
 
-        // Godot attributes check
-        var godotAttributes = new
-        {
-            hasExport = members.Any(m => HasAttribute(m, "Export")),
-            hasSignal = members.Any(m => HasAttribute(m, "Signal")),
-            hasTool = HasAttribute(type, "Tool"),
-            hasGlobalClass = HasAttribute(type, "GlobalClass")
-        };
-
         return CreateSuccessResponse(
             data: new
             {
@@ -329,16 +331,14 @@ public partial class RoslynService
                 baseTypeCount = type.BaseType != null ? baseTypes.Count + (currentBase != null ? 1 : 0) : 0,
                 interfaceCount = type.AllInterfaces.Length,
                 memberSummary,
-                godotAttributes,
                 location = GetSymbolLocation(type)
             },
             suggestedNextTools: new[]
             {
-                $"get_type_members for detailed member list",
-                $"get_base_types for full inheritance chain",
-                $"get_derived_types to find classes inheriting from {type.Name}",
-                godotAttributes.hasExport ? "get_attributes('Export') to see exported properties" : null
-            }.Where(s => s != null).ToArray()!
+                "get_type_members for detailed member list",
+                "get_base_types for full inheritance chain",
+                $"get_derived_types to find classes inheriting from {type.Name}"
+            }
         );
     }
 
@@ -352,7 +352,9 @@ public partial class RoslynService
         bool includeCallers = true,
         bool includeOutgoingCalls = false,
         int maxCallers = 20,
-        int maxOutgoingCalls = 50)
+        int maxOutgoingCalls = 50,
+        int? overloadIndex = null,
+        CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
@@ -364,7 +366,8 @@ public partial class RoslynService
             );
         }
 
-        var type = await FindTypeByNameAsync(typeName);
+        var (type, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
+        if (ambiguousType != null) return ambiguousType;
         if (type == null)
         {
             return CreateErrorResponse(
@@ -373,13 +376,45 @@ public partial class RoslynService
             );
         }
 
-        var method = type.GetMembers(methodName).OfType<IMethodSymbol>().FirstOrDefault();
-        if (method == null)
+        var overloads = type.GetMembers(methodName).OfType<IMethodSymbol>().ToList();
+        if (overloads.Count == 0)
         {
             return CreateErrorResponse(
                 ErrorCodes.SymbolNotFound,
                 $"Method '{methodName}' not found on type '{type.Name}'"
             );
+        }
+
+        IMethodSymbol method;
+        if (overloadIndex.HasValue)
+        {
+            if (overloadIndex.Value < 0 || overloadIndex.Value >= overloads.Count)
+            {
+                return CreateErrorResponse(
+                    ErrorCodes.InvalidParameter,
+                    $"overloadIndex {overloadIndex.Value} is out of range for '{methodName}' (0..{overloads.Count - 1})",
+                    context: new { overloadIndex = overloadIndex.Value, overloadCount = overloads.Count });
+            }
+            method = overloads[overloadIndex.Value];
+        }
+        else if (overloads.Count > 1)
+        {
+            // Picking the first overload silently analyzes an arbitrary one. Surface
+            // the ambiguity with every signature so the caller can choose by index.
+            return CreateErrorResponse(
+                ErrorCodes.AmbiguousMatch,
+                $"'{methodName}' has {overloads.Count} overloads on '{type.Name}'; pass overloadIndex to choose one",
+                hint: "overloadIndex is 0-based, matching the listed order",
+                context: new
+                {
+                    overloads = overloads
+                        .Select((o, i) => new { index = i, signature = o.ToDisplayString() })
+                        .ToList()
+                });
+        }
+        else
+        {
+            method = overloads[0];
         }
 
         // Get signature details
@@ -400,14 +435,32 @@ public partial class RoslynService
             accessibility = method.DeclaredAccessibility.ToString()
         };
 
-        // Get callers if requested
+        // Get callers if requested. This is a grouped view: one entry per distinct
+        // calling symbol (with up to three sample locations), capped by maxCallers.
+        // The count is therefore caller GROUPS, not call sites — named
+        // totalCallerGroups so it never collides with find_callers.totalCallers,
+        // which counts individual call sites (its list is one entry per site).
         List<object>? callers = null;
-        var totalCallers = 0;
+        var totalCallerGroups = 0;
         if (includeCallers)
         {
-            var callerSymbols = await SymbolFinder.FindCallersAsync(method, _solution!);
-            var callerList = callerSymbols.ToList();
-            totalCallers = callerList.Count;
+            var callerSymbols = await SymbolFinder.FindCallersAsync(method, _solution!, cancellationToken);
+
+            // The generated scan is authoritative for callers inside generator output, which
+            // SymbolFinder now also returns. Dedup the SymbolFinder groups against it by
+            // display string (the two come from different compilations, so symbol identity
+            // can't be compared) so a generated caller group is listed and counted once.
+            var generatedGroups = (await ScanGeneratedReferencesAsync(method, cancellationToken))
+                .Where(h => h.Kind is "invocation" or "read" or "write" && h.EnclosingSymbol is IMethodSymbol)
+                .GroupBy(h => h.EnclosingSymbol!, SymbolEqualityComparer.Default)
+                .ToList();
+            var generatedCallerNames = new HashSet<string>(
+                generatedGroups.Select(g => g.Key.ToDisplayString()), StringComparer.Ordinal);
+
+            var callerList = callerSymbols
+                .Where(c => !generatedCallerNames.Contains(c.CallingSymbol.ToDisplayString()))
+                .ToList();
+            totalCallerGroups = callerList.Count;
 
             callers = callerList
                 .Take(maxCallers)
@@ -427,80 +480,39 @@ public partial class RoslynService
                 })
                 .Cast<object>()
                 .ToList();
+
+            totalCallerGroups += generatedGroups.Count;
+            foreach (var group in generatedGroups)
+            {
+                if (callers.Count >= maxCallers) break;
+                callers.Add(new
+                {
+                    callingMethod = group.Key.ToDisplayString(),
+                    containingType = group.Key.ContainingType?.Name,
+                    locations = group.Take(3).Select(h => new
+                    {
+                        filePath = FormatPath(h.HintPath),
+                        line = h.Line
+                    }).ToList(),
+                    inGeneratedCode = true
+                });
+            }
         }
 
-        // Get outgoing calls if requested
+        // Get outgoing calls if requested — via the shared collector so this list
+        // matches get_outgoing_calls/get_call_graph (symbol-equality dedup,
+        // qualified + unqualified property references).
         List<object>? outgoingCalls = null;
         var totalOutgoingCalls = 0;
         if (includeOutgoingCalls)
         {
-            var location = method.Locations.FirstOrDefault(l => l.IsInSource);
-            if (location?.SourceTree != null)
-            {
-                var root = await location.SourceTree.GetRootAsync();
-                var node = root.FindNode(location.SourceSpan);
-                var methodDecl = node.AncestorsAndSelf().OfType<MethodDeclarationSyntax>().FirstOrDefault();
+            var references = await CollectOutgoingReferencesAsync(method, includeProperties: true, cancellationToken);
+            // Shared projection so analyze_method's outgoing calls match get_outgoing_calls
+            // exactly (depth is null here — this is a single-hop list, not a depth walk).
+            var calls = references.Select(reference => BuildOutgoingCall(reference, null)).ToList();
 
-                if (methodDecl != null)
-                {
-                    var document = _solution!.GetDocument(location.SourceTree);
-                    var semanticModel = document != null ? await document.GetSemanticModelAsync() : null;
-
-                    if (semanticModel != null)
-                    {
-                        var calls = new List<object>();
-                        var visited = new HashSet<string>();
-
-                        // Find method invocations
-                        foreach (var invocation in methodDecl.DescendantNodes().OfType<InvocationExpressionSyntax>())
-                        {
-                            var symbolInfo = semanticModel.GetSymbolInfo(invocation);
-                            if (symbolInfo.Symbol is IMethodSymbol calledMethod)
-                            {
-                                var key = calledMethod.ToDisplayString();
-                                if (visited.Contains(key)) continue;
-                                visited.Add(key);
-
-                                var callLoc = calledMethod.Locations.FirstOrDefault(l => l.IsInSource);
-                                calls.Add(new
-                                {
-                                    method = calledMethod.ToDisplayString(),
-                                    shortName = $"{calledMethod.ContainingType?.Name}.{calledMethod.Name}",
-                                    returnType = calledMethod.ReturnType.ToDisplayString(),
-                                    isAsync = calledMethod.IsAsync,
-                                    isExternal = callLoc == null
-                                });
-                            }
-                        }
-
-                        // Find property accesses
-                        foreach (var access in methodDecl.DescendantNodes().OfType<MemberAccessExpressionSyntax>())
-                        {
-                            var symbolInfo = semanticModel.GetSymbolInfo(access);
-                            if (symbolInfo.Symbol is IPropertySymbol prop)
-                            {
-                                var key = prop.ToDisplayString();
-                                if (visited.Contains(key)) continue;
-                                visited.Add(key);
-
-                                var propLoc = prop.Locations.FirstOrDefault(l => l.IsInSource);
-                                calls.Add(new
-                                {
-                                    method = prop.ToDisplayString(),
-                                    shortName = $"{prop.ContainingType?.Name}.{prop.Name}",
-                                    returnType = prop.Type.ToDisplayString(),
-                                    isAsync = false,
-                                    isProperty = true,
-                                    isExternal = propLoc == null
-                                });
-                            }
-                        }
-
-                        totalOutgoingCalls = calls.Count;
-                        outgoingCalls = calls.Take(maxOutgoingCalls).ToList();
-                    }
-                }
-            }
+            totalOutgoingCalls = calls.Count;
+            outgoingCalls = calls.Take(maxOutgoingCalls).ToList();
         }
 
         return CreateSuccessResponse(
@@ -508,7 +520,7 @@ public partial class RoslynService
             {
                 signature,
                 callers,
-                totalCallers,
+                totalCallerGroups,
                 callersShown = callers?.Count ?? 0,
                 outgoingCalls,
                 totalOutgoingCalls,
@@ -530,9 +542,18 @@ public partial class RoslynService
     /// Gets a comprehensive overview of a file.
     /// Combines diagnostics, type declarations, and structure.
     /// </summary>
-    public async Task<object> GetFileOverviewAsync(string filePath)
+    public async Task<object> GetFileOverviewAsync(
+        string filePath, int maxMembersPerType = 100, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
+
+        if (maxMembersPerType is < 1 or > 1000)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                $"maxMembersPerType must be between 1 and 1000 (got {maxMembersPerType})",
+                context: new { maxMembersPerType });
+        }
 
         Document document;
         try
@@ -549,8 +570,8 @@ public partial class RoslynService
             );
         }
 
-        var semanticModel = await document.GetSemanticModelAsync();
-        var syntaxTree = await document.GetSyntaxTreeAsync();
+        var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
+        var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
 
         if (semanticModel == null || syntaxTree == null)
         {
@@ -560,7 +581,7 @@ public partial class RoslynService
             );
         }
 
-        var root = await syntaxTree.GetRootAsync();
+        var root = await syntaxTree.GetRootAsync(cancellationToken);
 
         // Get diagnostics
         var diagnostics = semanticModel.GetDiagnostics()
@@ -570,18 +591,47 @@ public partial class RoslynService
                 g => g.Count()
             );
 
+        // Per-member outline from THIS file's declaration only. A field/event
+        // declaring several variables yields one entry per variable; everything
+        // else maps one syntax member to one entry. Nested types appear here as
+        // members AND, being TypeDeclarationSyntax, as their own top-level entry.
+        IEnumerable<object> DescribeMembers(TypeDeclarationSyntax typeDecl)
+        {
+            foreach (var member in typeDecl.Members)
+            {
+                if (member is BaseFieldDeclarationSyntax field)
+                {
+                    foreach (var variable in field.Declaration.Variables)
+                    {
+                        yield return DescribeMember(
+                            semanticModel.GetDeclaredSymbol(variable, cancellationToken),
+                            variable.Identifier.Text, member);
+                    }
+                }
+                else
+                {
+                    yield return DescribeMember(
+                        semanticModel.GetDeclaredSymbol(member, cancellationToken),
+                        MemberFallbackName(member), member);
+                }
+            }
+        }
+
         // Get type declarations
         var typeDeclarations = root.DescendantNodes()
             .OfType<TypeDeclarationSyntax>()
             .Select(td =>
             {
-                var symbol = semanticModel.GetDeclaredSymbol(td);
+                var symbol = semanticModel.GetDeclaredSymbol(td, cancellationToken);
+                var allMembers = DescribeMembers(td).ToList();
                 return new
                 {
                     name = symbol?.Name ?? td.Identifier.Text,
                     kind = td.Kind().ToString().Replace("Declaration", ""),
                     line = td.GetLocation().GetLineSpan().StartLinePosition.Line,
-                    memberCount = td.Members.Count
+                    memberCount = td.Members.Count,
+                    members = allMembers.Take(maxMembersPerType).ToList(),
+                    membersTruncated = allMembers.Count > maxMembersPerType
                 };
             })
             .ToList();
@@ -607,7 +657,7 @@ public partial class RoslynService
                 diagnosticSummary = diagnostics,
                 usingCount = usings.Count,
                 typeDeclarations,
-                lineCount = (await syntaxTree.GetTextAsync()).Lines.Count
+                lineCount = (await syntaxTree.GetTextAsync(cancellationToken)).Lines.Count
             },
             suggestedNextTools: new[]
             {
@@ -617,34 +667,76 @@ public partial class RoslynService
         );
     }
 
-    // Roslyn's AnalyzeDataFlow/AnalyzeControlFlow(first, last) requires both statements to
-    // be direct siblings in the same statement list. The previous implementation walked
-    // node.DescendantNodesAndSelf().OfType<StatementSyntax>(), which on a BlockSyntax
-    // node returned [Block, child1, child2, ...] — Block and its child aren't siblings,
-    // so Roslyn threw "statements not within the same statement list". Resolve the
-    // first/last sibling pair correctly here.
-    private static (StatementSyntax? first, StatementSyntax? last) ResolveAnalysisStatements(SyntaxNode node)
+    // One member-outline entry. Signature/accessibility come from the symbol
+    // when bound; span lines come from the syntax so the entry is useful even
+    // when the symbol fails to resolve.
+    private static object DescribeMember(ISymbol? symbol, string fallbackName, MemberDeclarationSyntax memberSyntax)
     {
-        // If the picked node is itself a block, analyze its direct children (or the block as a whole).
+        var lineSpan = memberSyntax.GetLocation().GetLineSpan();
+        return new
+        {
+            name = symbol?.Name ?? fallbackName,
+            kind = symbol?.Kind.ToString() ?? memberSyntax.Kind().ToString().Replace("Declaration", ""),
+            signature = symbol?.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat) ?? fallbackName,
+            accessibility = symbol?.DeclaredAccessibility.ToString() ?? "NotApplicable",
+            startLine = lineSpan.StartLinePosition.Line,
+            endLine = lineSpan.EndLinePosition.Line
+        };
+    }
+
+    private static string MemberFallbackName(MemberDeclarationSyntax member) => member switch
+    {
+        MethodDeclarationSyntax m => m.Identifier.Text,
+        PropertyDeclarationSyntax p => p.Identifier.Text,
+        ConstructorDeclarationSyntax c => c.Identifier.Text,
+        BaseTypeDeclarationSyntax t => t.Identifier.Text,
+        DelegateDeclarationSyntax d => d.Identifier.Text,
+        EnumMemberDeclarationSyntax e => e.Identifier.Text,
+        _ => member.Kind().ToString().Replace("Declaration", "")
+    };
+
+    // Roslyn's AnalyzeDataFlow/AnalyzeControlFlow(first, last) requires both statements to
+    // be direct siblings in the same statement list, and the analyzed range must match the
+    // selection: handing Roslyn the enclosing list's first/last statement silently widens
+    // a sub-range selection to the whole block. FindNode returns the smallest node covering
+    // the selection — a statement-list owner (block or switch section) when the selection
+    // spans sibling statements, the statement itself for a one-statement selection, or a
+    // node inside a statement when the selection covers part of a multi-line statement.
+    // Clamp each case to exactly the statements the selection touches.
+    private static (StatementSyntax? first, StatementSyntax? last) ResolveAnalysisStatements(
+        SyntaxNode node, TextSpan selection)
+    {
         if (node is BlockSyntax block)
         {
-            if (block.Statements.Count == 0) return (null, null);
-            return (block.Statements.First(), block.Statements.Last());
+            return ClampToSelection(block.Statements, selection);
         }
 
-        // If the picked node is a statement, that's our single-statement target.
+        if (node is SwitchSectionSyntax section)
+        {
+            return ClampToSelection(section.Statements, selection);
+        }
+
         if (node is StatementSyntax stmt)
         {
             return (stmt, stmt);
         }
 
-        // Otherwise climb up looking for a block we can analyze.
-        var enclosingBlock = node.FirstAncestorOrSelf<BlockSyntax>();
-        if (enclosingBlock != null && enclosingBlock.Statements.Count > 0)
+        // The selection sits inside a single statement (e.g. one line of a multi-line
+        // initializer) — analyze that statement, not its whole enclosing block.
+        var enclosingStatement = node.FirstAncestorOrSelf<StatementSyntax>();
+        if (enclosingStatement != null)
         {
-            return (enclosingBlock.Statements.First(), enclosingBlock.Statements.Last());
+            return (enclosingStatement, enclosingStatement);
         }
 
         return (null, null);
+    }
+
+    private static (StatementSyntax? first, StatementSyntax? last) ClampToSelection(
+        SyntaxList<StatementSyntax> statements, TextSpan selection)
+    {
+        var touched = statements.Where(s => selection.IntersectsWith(s.Span)).ToList();
+        if (touched.Count == 0) return (null, null);
+        return (touched[0], touched[^1]);
     }
 }

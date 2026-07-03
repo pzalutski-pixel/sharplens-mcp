@@ -20,9 +20,12 @@ public class NavigationTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["kind"]?.Value<string>().Should().Be("NamedType");
-        data["name"]?.Value<string>().Should().Be("RoslynService");
-        data["typeKind"]?.Value<string>().Should().Be("Class");
+        data["kind"].Should().NotBeNull();
+        data["kind"]!.Value<string>().Should().Be("NamedType");
+        data["name"].Should().NotBeNull();
+        data["name"]!.Value<string>().Should().Be("RoslynService");
+        data["typeKind"].Should().NotBeNull();
+        data["typeKind"]!.Value<string>().Should().Be("Class");
     }
 
     [Fact]
@@ -42,19 +45,30 @@ public class NavigationTests : RoslynServiceTestBase
         var symbols = GetData(searchResult)["results"] as JArray;
         symbols.Should().NotBeNullOrEmpty("CreateSuccessResponse exists in the loaded solution");
 
-        var symbol = symbols![0];
-        var loc = symbol["location"];
-        loc.Should().NotBeNull();
-        var file = loc!["filePath"]!.Value<string>()!;
+        // Two distinct CreateSuccessResponse methods exist (RoslynService.cs and
+        // McpServer.cs), so symbols[0] is non-deterministic. Pin the RoslynService
+        // one so go_to_definition resolves to a known file.
+        var symbol = symbols!.First(s =>
+            s["location"]!["filePath"]!.Value<string>()!.EndsWith("RoslynService.cs"));
+        var loc = symbol["location"]!;
+        var file = loc["filePath"]!.Value<string>()!;
         var line = loc["line"]!.Value<int>();
         var col = loc["column"]!.Value<int>();
 
         var result = await Service.GoToDefinitionAsync(file, line, col);
         AssertSuccess(result);
         var data = GetData(result);
-        data["filePath"]?.Value<string>().Should().EndWith("RoslynService.cs",
+        // go_to_definition nests the location under `definition` (Navigation.cs
+        // builds data.definition.{filePath,line,...}); the old top-level
+        // data["filePath"] read was always null and silently passed.
+        data["definition"].Should().NotBeNull("a resolved definition must carry its location");
+        var definition = data["definition"]!;
+        definition["filePath"].Should().NotBeNull("CreateSuccessResponse is defined in RoslynService.cs");
+        definition["filePath"]!.Value<string>().Should().EndWith("RoslynService.cs",
             "CreateSuccessResponse is defined in RoslynService.cs");
-        data["line"]?.Value<int>().Should().BeGreaterThan(0);
+        definition["line"].Should().NotBeNull();
+        definition["line"]!.Value<int>().Should().Be(line,
+            "go_to_definition must resolve to the same declaration line search_symbols reported");
     }
 
     [Fact]
@@ -90,7 +104,8 @@ public class NavigationTests : RoslynServiceTestBase
 
         foreach (var symbol in results!)
         {
-            symbol["kind"]?.Value<string>().Should().Be("Method");
+            symbol["kind"].Should().NotBeNull();
+            symbol["kind"]!.Value<string>().Should().Be("Method");
         }
     }
 
@@ -109,13 +124,16 @@ public class NavigationTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task FindReferences_OnPublicMethod_FindsUsages()
+    public async Task FindReferences_OnFixtureAnchor_ReturnsExactlyFiveInvocations()
     {
-        var searchResult = await Service.SearchSymbolsAsync("CreateSuccessResponse", kind: "Method", maxResults: 10);
+        // ReferenceCountFixture.Anchor is invoked exactly five times (CallerOne..Five),
+        // so the reference total is a fixed, drift-proof 5 rather than an inequality
+        // against the live, evolving RoslynService source.
+        var searchResult = await Service.SearchSymbolsAsync("Anchor", kind: "Method", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
-        symbols.Should().NotBeNullOrEmpty("CreateSuccessResponse exists in the loaded solution");
+        symbols.Should().NotBeNullOrEmpty("ReferenceCountTarget.Anchor exists in the loaded solution");
 
-        var symbol = symbols![0];
+        var symbol = symbols!.First(s => s["containingType"]!.Value<string>()!.EndsWith("ReferenceCountTarget"));
         var loc = symbol["location"]!;
         var result = await Service.FindReferencesAsync(
             loc["filePath"]!.Value<string>()!,
@@ -125,10 +143,15 @@ public class NavigationTests : RoslynServiceTestBase
 
         var data = GetData(result);
         var references = data["references"] as JArray;
-        references.Should().NotBeNullOrEmpty();
-        references!.Count.Should().BeGreaterThan(1,
-            "CreateSuccessResponse is called from multiple tool methods");
-        data["totalReferences"]?.Value<int>().Should().BeGreaterThan(1);
+        references.Should().NotBeNull();
+        references!.Count.Should().Be(5, "Anchor is invoked five times in ReferenceCountFixture");
+        data["totalReferences"].Should().NotBeNull();
+        data["totalReferences"]!.Value<int>().Should().Be(5);
+        foreach (var r in references)
+        {
+            r["kind"]!.Value<string>().Should().Be("invocation",
+                "every reference to Anchor is a call");
+        }
     }
 
     [Fact]
@@ -140,8 +163,10 @@ public class NavigationTests : RoslynServiceTestBase
         // Assert
         AssertSuccess(result);
         var data = GetData(result);
-        data["typeName"]?.Value<string>().Should().Contain("RoslynService");
-        data["totalMembers"]?.Value<int>().Should().BeGreaterThan(50, "RoslynService has many methods");
+        data["typeName"].Should().NotBeNull();
+        data["typeName"]!.Value<string>().Should().Contain("RoslynService");
+        data["totalMembers"].Should().NotBeNull();
+        data["totalMembers"]!.Value<int>().Should().BeGreaterThan(50, "RoslynService has many methods");
     }
 
     [Fact]
@@ -157,8 +182,50 @@ public class NavigationTests : RoslynServiceTestBase
 
         foreach (var member in members!)
         {
-            member["kind"]?.Value<string>().Should().Be("Method");
+            member["kind"].Should().NotBeNull();
+            member["kind"]!.Value<string>().Should().Be("Method");
         }
+    }
+
+    [Fact]
+    public async Task GetTypeMembers_WithConstructorKind_ReturnsConstructorsOnly()
+    {
+        // memberKind=Constructor must filter to constructors (named ".ctor"). Before
+        // the fix this hit the default arm and returned every member.
+        var result = await Service.GetTypeMembersAsync("RoslynService", memberKind: "Constructor");
+
+        AssertSuccess(result);
+        var members = (GetData(result)["members"] as JArray)!;
+        members.Should().NotBeNullOrEmpty("RoslynService declares a constructor");
+        members.Should().OnlyContain(m => m["name"]!.Value<string>() == ".ctor",
+            "the Constructor filter must return only constructors");
+    }
+
+    [Fact]
+    public async Task GetTypeMembers_WithUnknownKind_ReturnsInvalidParameter()
+    {
+        // An unknown memberKind must error, not silently return every member.
+        var result = await Service.GetTypeMembersAsync("RoslynService", memberKind: "Bogus");
+        AssertError(result, ErrorCodes.InvalidParameter);
+    }
+
+    [Fact]
+    public async Task GetTypeHierarchy_ReportsTotalInterfaces()
+    {
+        // interfaces is now capped (like derivedTypes) with the true total reported,
+        // instead of an uncapped list with no count.
+        var search = await Service.SearchSymbolsAsync("FixtureRectangle", kind: "Class", maxResults: 5);
+        var loc = (GetData(search)["results"] as JArray)!
+            .First(s => s["name"]!.Value<string>() == "FixtureRectangle")["location"]!;
+
+        var result = await Service.GetTypeHierarchyAsync(
+            loc["filePath"]!.Value<string>()!, loc["line"]!.Value<int>(), loc["column"]!.Value<int>());
+        AssertSuccess(result);
+
+        var data = GetData(result);
+        data["totalInterfaces"].Should().NotBeNull("the interface total must be reported alongside the capped list");
+        data["totalInterfaces"]!.Value<int>().Should().Be((data["interfaces"] as JArray)!.Count,
+            "with no cap hit, totalInterfaces equals the returned interface count");
     }
 
     [Fact]
@@ -168,17 +235,21 @@ public class NavigationTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // The impl emits `name` (TypeDiscovery.cs:346), not `methodName`. The previous
+        // The impl emits `name`, not `methodName`. The previous
         // `data["methodName"]?.Value<string>().Should().Be("X")` silently passed because
         // C# null-conditional short-circuits the ENTIRE chain — including .Should().Be(...)
         // — when the prefix is null. Lock the actual field name to defeat that pattern.
         data["name"].Should().NotBeNull("response must include the method name");
         data["name"]!.Value<string>().Should().Be("LoadSolutionAsync");
-        data["returnType"]?.Value<string>().Should().Contain("Task<object>");
+        data["returnType"].Should().NotBeNull();
+        data["returnType"]!.Value<string>().Should().Contain("Task<object>");
         var parameters = data["parameters"] as JArray;
         parameters.Should().NotBeNullOrEmpty();
-        parameters!.Count.Should().Be(1);
-        parameters[0]["name"]?.Value<string>().Should().Be("solutionPath");
+        parameters!.Count.Should().Be(2, "solutionPath plus the cancellationToken every tool method carries");
+        parameters[0]["name"].Should().NotBeNull();
+        parameters[0]["name"]!.Value<string>().Should().Be("solutionPath");
+        parameters[1]["name"].Should().NotBeNull();
+        parameters[1]["name"]!.Value<string>().Should().Be("cancellationToken");
     }
 
     [Fact]
@@ -188,7 +259,8 @@ public class NavigationTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        data["baseType"]?.Value<string>().Should().EndWith("FixtureRectangle");
+        data["baseType"].Should().NotBeNull();
+        data["baseType"]!.Value<string>().Should().EndWith("FixtureRectangle");
 
         var derived = data["derivedTypes"] as JArray;
         derived.Should().NotBeNullOrEmpty("FixtureSquare derives from FixtureRectangle");
@@ -211,13 +283,15 @@ public class NavigationTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task FindCallers_OnEnsureSolutionLoaded_FindsManySpecificCallers()
+    public async Task FindCallers_OnFixtureAnchor_FindsExactlyFiveNamedCallers()
     {
-        var searchResult = await Service.SearchSymbolsAsync("EnsureSolutionLoaded", kind: "Method", maxResults: 10);
+        // Anchor is called from exactly five distinct methods, so the caller set is a
+        // fixed list rather than a `>= 20` inequality against the live source.
+        var searchResult = await Service.SearchSymbolsAsync("Anchor", kind: "Method", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
         symbols.Should().NotBeNullOrEmpty();
 
-        var symbol = symbols![0];
+        var symbol = symbols!.First(s => s["containingType"]!.Value<string>()!.EndsWith("ReferenceCountTarget"));
         var loc = symbol["location"]!;
         var result = await Service.FindCallersAsync(
             loc["filePath"]!.Value<string>()!,
@@ -227,21 +301,25 @@ public class NavigationTests : RoslynServiceTestBase
 
         var data = GetData(result);
         var callers = data["callers"] as JArray;
-        callers.Should().NotBeNullOrEmpty();
-        callers!.Count.Should().BeGreaterOrEqualTo(20,
-            "EnsureSolutionLoaded is called from dozens of tool methods");
+        callers.Should().NotBeNull();
+        callers!.Count.Should().Be(5, "Anchor is called from CallerOne through CallerFive");
         var names = callers
-            .Select(c => c["callingSymbol"]?["name"]?.Value<string>())
+            .Select(c => c["callingSymbol"]!["name"]!.Value<string>())
             .ToList();
-        names.Should().Contain("SearchSymbolsAsync");
-        names.Should().Contain("GetDiagnosticsAsync");
+        names.Should().BeEquivalentTo(
+            new[] { "CallerOne", "CallerTwo", "CallerThree", "CallerFour", "CallerFive" });
     }
 
     [Fact]
     public async Task SemanticQuery_FindsAsyncMethods()
     {
+        // Constrain to methods: only methods can be async, and the impl emits the
+        // isAsync field exclusively for method results — so kinds:["Method"] makes
+        // the async-filter invariant verifiable on every returned symbol. (Querying
+        // every kind leaks non-method symbols that carry no isAsync field, which the
+        // old `symbol["isAsync"]?...` silent-pass hid.)
         var result = await Service.SemanticQueryAsync(
-            kinds: null,
+            kinds: new List<string> { "Method" },
             isAsync: true,
             namespaceFilter: null,
             accessibility: null,
@@ -257,12 +335,13 @@ public class NavigationTests : RoslynServiceTestBase
         var data = GetData(result);
         var results = data["results"] as JArray;
         results.Should().NotBeNullOrEmpty();
-        results!.Count.Should().BeGreaterThan(5, "Should find async symbols");
-        // Filter invariant: every returned symbol must satisfy the isAsync filter.
+        results!.Count.Should().BeGreaterThan(5, "Should find async methods");
+        // Filter invariant: every returned method must satisfy the isAsync filter.
         foreach (var symbol in results)
         {
-            symbol["isAsync"]?.Value<bool>().Should().BeTrue(
-                "isAsync:true must drop non-async symbols");
+            symbol["isAsync"].Should().NotBeNull("every method result carries isAsync");
+            symbol["isAsync"]!.Value<bool>().Should().BeTrue(
+                "isAsync:true must drop non-async methods");
         }
     }
 
@@ -290,7 +369,8 @@ public class NavigationTests : RoslynServiceTestBase
 
         foreach (var symbol in results!)
         {
-            symbol["accessibility"]?.Value<string>().Should().Be("Public");
+            symbol["accessibility"].Should().NotBeNull();
+            symbol["accessibility"]!.Value<string>().Should().Be("Public");
         }
     }
 
@@ -311,9 +391,12 @@ public class NavigationTests : RoslynServiceTestBase
         AssertSuccess(result);
         var data = GetData(result);
         // Kind for methods is "Method", not "NamedType".
-        data["kind"]?.Value<string>().Should().Be("Method");
-        data["name"]?.Value<string>().Should().Be("LoadSolutionAsync");
-        data["containingType"]?.Value<string>().Should().Contain("RoslynService");
+        data["kind"].Should().NotBeNull();
+        data["kind"]!.Value<string>().Should().Be("Method");
+        data["name"].Should().NotBeNull();
+        data["name"]!.Value<string>().Should().Be("LoadSolutionAsync");
+        data["containingType"].Should().NotBeNull();
+        data["containingType"]!.Value<string>().Should().Contain("RoslynService");
     }
 
     [Fact]
@@ -335,17 +418,38 @@ public class NavigationTests : RoslynServiceTestBase
     {
         // System.String.Substring has two overloads: (int startIndex) and
         // (int startIndex, int length). The response's overloadCount field
-        // (TypeDiscovery.cs:359) must reflect that.
+        // must reflect that.
         var result = await Service.GetMethodSignatureAsync("System.String", "Substring");
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Note: the impl emits `name`, not `methodName` (TypeDiscovery.cs:346).
-        data["name"]?.Value<string>().Should().Be("Substring");
-        data["overloadCount"]?.Value<int>().Should().Be(2,
+        // Note: the impl emits `name`, not `methodName`.
+        data["name"].Should().NotBeNull();
+        data["name"]!.Value<string>().Should().Be("Substring");
+        data["overloadCount"].Should().NotBeNull();
+        data["overloadCount"]!.Value<int>().Should().Be(2,
             "String.Substring has exactly 2 overloads in the BCL surface");
         // selectedOverload defaults to 0 — the first overload is returned.
-        data["selectedOverload"]?.Value<int>().Should().Be(0);
+        data["selectedOverload"].Should().NotBeNull();
+        data["selectedOverload"]!.Value<int>().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task GetMethodSignature_OverloadIndexOutOfRange_ReturnsInvalidParameter()
+    {
+        // String.Substring has exactly 2 overloads, so index 2 is out of range.
+        // It must surface as a structured error, never as a silent fallback to
+        // overload 0 — an agent asking for a specific overload would otherwise
+        // act on the wrong signature.
+        var result = await Service.GetMethodSignatureAsync("System.String", "Substring", overloadIndex: 2);
+        AssertError(result, ErrorCodes.InvalidParameter);
+    }
+
+    [Fact]
+    public async Task GetMethodSignature_NegativeOverloadIndex_ReturnsInvalidParameter()
+    {
+        var result = await Service.GetMethodSignatureAsync("System.String", "Substring", overloadIndex: -1);
+        AssertError(result, ErrorCodes.InvalidParameter);
     }
 
     [Fact]
@@ -367,8 +471,10 @@ public class NavigationTests : RoslynServiceTestBase
     {
         var page1 = await Service.SearchSymbolsAsync("*Async", kind: "Method", maxResults: 5, offset: 0);
         var p1 = GetData(page1);
-        p1["offset"]?.Value<int>().Should().Be(0);
-        p1["hasMore"]?.Value<bool>().Should().BeTrue(
+        p1["offset"].Should().NotBeNull();
+        p1["offset"]!.Value<int>().Should().Be(0);
+        p1["hasMore"].Should().NotBeNull();
+        p1["hasMore"]!.Value<bool>().Should().BeTrue(
             "the solution has dozens of *Async methods; 5 doesn't exhaust them");
 
         var nextOffset = p1["pagination"]!["nextOffset"]!.Value<int>();
@@ -376,7 +482,8 @@ public class NavigationTests : RoslynServiceTestBase
 
         var page2 = await Service.SearchSymbolsAsync("*Async", kind: "Method", maxResults: 5, offset: nextOffset);
         var p2 = GetData(page2);
-        p2["offset"]?.Value<int>().Should().Be(5);
+        p2["offset"].Should().NotBeNull();
+        p2["offset"]!.Value<int>().Should().Be(5);
 
         // Page 2 results must not overlap with page 1.
         var p1Names = (p1["results"] as JArray)!.Select(r => r["fullyQualifiedName"]?.Value<string>()).ToList();
@@ -388,12 +495,11 @@ public class NavigationTests : RoslynServiceTestBase
     [Fact]
     public async Task FindReferences_WithMaxResults_CapsListButTotalReportsTrueCount()
     {
-        // EnsureSolutionLoaded has 20+ callers (asserted in
-        // FindCallers_OnEnsureSolutionLoaded_FindsManySpecificCallers above).
-        // With maxResults=3, references list caps at 3, totalReferences stays accurate.
-        var searchResult = await Service.SearchSymbolsAsync("EnsureSolutionLoaded", kind: "Method", maxResults: 10);
+        // ReferenceCountFixture.Anchor has exactly five references; with maxResults=3
+        // the list caps at 3 while totalReferences reports the true 5.
+        var searchResult = await Service.SearchSymbolsAsync("Anchor", kind: "Method", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
-        var loc = symbols![0]["location"]!;
+        var loc = symbols!.First(s => s["containingType"]!.Value<string>()!.EndsWith("ReferenceCountTarget"))["location"]!;
 
         var result = await Service.FindReferencesAsync(
             loc["filePath"]!.Value<string>()!,
@@ -406,8 +512,9 @@ public class NavigationTests : RoslynServiceTestBase
         var references = data["references"] as JArray;
         references!.Count.Should().Be(3,
             "maxResults=3 must fill the cap exactly when more references exist");
-        data["totalReferences"]?.Value<int>().Should().BeGreaterThan(3,
-            "totalReferences must reflect the true count, not the capped count");
+        data["totalReferences"].Should().NotBeNull();
+        data["totalReferences"]!.Value<int>().Should().Be(5,
+            "totalReferences must reflect the true count (5), not the capped count (3)");
     }
 
     [Fact]
@@ -436,9 +543,11 @@ public class NavigationTests : RoslynServiceTestBase
 
         foreach (var symbol in results)
         {
-            symbol["accessibility"]?.Value<string>().Should().Be("Public",
+            symbol["accessibility"].Should().NotBeNull();
+            symbol["accessibility"]!.Value<string>().Should().Be("Public",
                 "accessibility=Public must be satisfied for every returned symbol");
-            symbol["isStatic"]?.Value<bool>().Should().BeTrue(
+            symbol["isStatic"].Should().NotBeNull();
+            symbol["isStatic"]!.Value<bool>().Should().BeTrue(
                 "isStatic=true must be satisfied for every returned symbol");
         }
     }
@@ -476,5 +585,41 @@ public class NavigationTests : RoslynServiceTestBase
                 .Should().BeTrue(
                     "every returned method must have at least one string-typed parameter");
         }
+    }
+
+    [Fact]
+    public async Task SemanticQuery_PastTheCap_ReportsHonestTotalCountAndTruncated()
+    {
+        // The solution declares far more than one method. With maxResults=1 the
+        // materialized list caps at 1, but the meta must report the true match
+        // count and flag truncation — totalCount previously equalled returnedCount
+        // by construction, so truncated never fired.
+        var result = await Service.SemanticQueryAsync(
+            kinds: new List<string> { "Method" },
+            isAsync: null,
+            namespaceFilter: null,
+            accessibility: null,
+            isStatic: null,
+            type: null,
+            returnType: null,
+            attributes: null,
+            parameterIncludes: null,
+            parameterExcludes: null,
+            maxResults: 1);
+
+        AssertSuccess(result);
+        (GetData(result)["results"] as JArray)!.Count.Should().Be(1,
+            "maxResults=1 caps the materialized list at exactly one");
+
+        // meta is a ResponseMetadata class → PascalCase in-process.
+        var meta = JObject.FromObject(result)["meta"]!;
+        meta["ReturnedCount"].Should().NotBeNull();
+        meta["ReturnedCount"]!.Value<int>().Should().Be(1);
+        meta["TotalCount"].Should().NotBeNull();
+        meta["TotalCount"]!.Value<int>().Should().BeGreaterThan(1,
+            "the true match count exceeds the cap of 1, so it must not collapse to returnedCount");
+        meta["Truncated"].Should().NotBeNull();
+        meta["Truncated"]!.Value<bool>().Should().BeTrue(
+            "totalCount exceeding returnedCount must set truncated");
     }
 }
