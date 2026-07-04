@@ -10,6 +10,8 @@ An MCP server providing **91 semantic analysis tools** for .NET/C#, built on Mic
 
 - **.NET 8.0 SDK or later** — works with .NET 8, 9, 10, and future versions. Analyzes any .NET 8+ project/solution.
 
+**Why does the tool target `net8.0` — can it analyze my .NET 9 / .NET 10 project?** Yes. `net8.0` is the tool's own runtime floor — the Roslyn 5.x packages it builds on require it — not a ceiling on what it can analyze. `RollForward` lets the installed tool run on newer .NET runtimes, and `MSBuildWorkspace` loads each project's real target framework from its csproj, so one install analyzes solutions targeting .NET 8, 9, 10, and beyond.
+
 ## Quick Start
 
 ```json
