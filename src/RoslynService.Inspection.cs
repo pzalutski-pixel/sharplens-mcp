@@ -562,33 +562,33 @@ public partial class RoslynService
             }
         }
 
-        // Check abstract base class members
-        var baseType = typeSymbol.BaseType;
-        while (baseType != null)
+        // Check abstract base class members. INamedTypeSymbol.GetMembers on the queried
+        // type sees only its OWN declarations, so whether an inherited abstract member is
+        // satisfied is resolved by walking the base chain (IsAbstractSlotSatisfied) — an
+        // override living in an intermediate abstract base counts. Each abstract slot is
+        // reported once, attributed to the base that originally declared it.
+        var reportedSlots = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+        for (var baseType = typeSymbol.BaseType; baseType != null; baseType = baseType.BaseType)
         {
-            if (baseType.IsAbstract)
+            if (!baseType.IsAbstract) continue;
+
+            foreach (var member in baseType.GetMembers())
             {
-                foreach (var member in baseType.GetMembers())
+                if (!member.IsAbstract) continue;
+
+                var slotRoot = GetOverrideSlotRoot(member);
+                if (!reportedSlots.Add(slotRoot.OriginalDefinition)) continue;
+                if (IsAbstractSlotSatisfied(typeSymbol, slotRoot)) continue;
+
+                missingMembers.Add(new
                 {
-                    if (!member.IsAbstract) continue;
-
-                    var isImplemented = typeSymbol.GetMembers(member.Name)
-                        .Any(m => m.IsOverride && !m.IsAbstract);
-
-                    if (!isImplemented)
-                    {
-                        missingMembers.Add(new
-                        {
-                            fromAbstractClass = baseType.ToDisplayString(),
-                            memberName = member.Name,
-                            kind = member.Kind.ToString(),
-                            signature = GetMemberSignature(member),
-                            returnType = GetMemberReturnType(member)
-                        });
-                    }
-                }
+                    fromAbstractClass = slotRoot.ContainingType.ToDisplayString(),
+                    memberName = slotRoot.Name,
+                    kind = slotRoot.Kind.ToString(),
+                    signature = GetMemberSignature(slotRoot),
+                    returnType = GetMemberReturnType(slotRoot)
+                });
             }
-            baseType = baseType.BaseType;
         }
 
         return CreateSuccessResponse(
@@ -923,6 +923,48 @@ public partial class RoslynService
             IEventSymbol evt => evt.Type.ToDisplayString(),
             _ => null
         };
+    }
+
+    // Walks a member's override chain to its original declaration — the "slot" an
+    // abstract requirement occupies. An `abstract override` re-abstracts an inherited
+    // slot; both levels resolve to the same root, so a slot is reported once.
+    private static ISymbol GetOverrideSlotRoot(ISymbol member)
+    {
+        var current = member;
+        while (OverriddenMemberOf(current) is { } overridden)
+            current = overridden;
+        return current;
+    }
+
+    private static ISymbol? OverriddenMemberOf(ISymbol member) => member switch
+    {
+        IMethodSymbol m => m.OverriddenMethod,
+        IPropertySymbol p => p.OverriddenProperty,
+        IEventSymbol e => e.OverriddenEvent,
+        _ => null
+    };
+
+    // Whether the abstract requirement at slotRoot is satisfied by a concrete override
+    // between `type` and the declaring base. GetMembers on `type` alone misses overrides
+    // in intermediate bases, so walk the chain; the most-derived member occupying the
+    // slot decides — satisfied iff it is not itself abstract (an `abstract override`
+    // re-abstracts and leaves it unsatisfied).
+    private static bool IsAbstractSlotSatisfied(INamedTypeSymbol type, ISymbol slotRoot)
+    {
+        var declaringType = slotRoot.ContainingType.OriginalDefinition;
+        for (var current = type;
+             current != null && !SymbolEqualityComparer.Default.Equals(current.OriginalDefinition, declaringType);
+             current = current.BaseType)
+        {
+            foreach (var candidate in current.GetMembers(slotRoot.Name))
+            {
+                if (!candidate.IsOverride) continue;
+                if (SymbolEqualityComparer.Default.Equals(
+                        GetOverrideSlotRoot(candidate).OriginalDefinition, slotRoot.OriginalDefinition))
+                    return !candidate.IsAbstract;
+            }
+        }
+        return false;
     }
 
     /// <summary>
