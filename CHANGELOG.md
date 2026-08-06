@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.1] - 2026-08-05
+
+### Fixed
+- `get_missing_members` no longer reports an inherited abstract member as missing when an intermediate abstract base already overrides it. Satisfaction is resolved by walking the base chain — the most-derived member occupying each abstract slot decides — so a concrete type that compiles (e.g. `Square : Polygon : Shape` where `Polygon` overrides `Shape`'s abstract member) reports nothing missing. Abstract properties and events are resolved the same way, and a re-abstracted (`abstract override`) slot is reported once, attributed to the base that declared it.
+- `analyze_data_flow` and `analyze_control_flow` return a structured `INVALID_PARAMETER` error for a line range that is out of range or inverted (`startLine` past end-of-file, or `startLine > endLine`), instead of an internal `-32603`. The shared range guard also covers `extract_method`, and the code-action tools reject a selection whose end position precedes its start.
+
 ## [1.6.0] - 2026-06-14
 
 ### Added
