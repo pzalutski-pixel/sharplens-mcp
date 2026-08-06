@@ -1111,15 +1111,7 @@ public partial class RoslynService
 
         // Validate the line range up front: indexing text.Lines out of range (or a
         // reversed range) would otherwise throw and surface as an InternalError.
-        var lineCount = text.Lines.Count;
-        if (startLine < 0 || endLine < 0 || startLine >= lineCount || endLine >= lineCount || startLine > endLine)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"Invalid line range: startLine={startLine}, endLine={endLine} (file has {lineCount} lines)",
-                hint: "startLine and endLine are 0-based and must satisfy 0 <= startLine <= endLine < lineCount.",
-                context: new { startLine, endLine, lineCount });
-        }
+        if (ValidateLineRange(text, startLine, endLine) is { } rangeError) return rangeError;
 
         // Get the text span for the selection
         var startPosition = text.Lines[startLine].Start;

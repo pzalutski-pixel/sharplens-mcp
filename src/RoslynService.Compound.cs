@@ -56,9 +56,11 @@ public partial class RoslynService
         var root = await syntaxTree.GetRootAsync(cancellationToken);
         var text = await syntaxTree.GetTextAsync(cancellationToken);
 
+        if (ValidateLineRange(text, startLine, endLine) is { } rangeError) return rangeError;
+
         // Find the node spanning the specified lines
-        var startPosition = text.Lines[Math.Max(0, startLine)].Start;
-        var endPosition = text.Lines[Math.Min(text.Lines.Count - 1, endLine)].End;
+        var startPosition = text.Lines[startLine].Start;
+        var endPosition = text.Lines[endLine].End;
         var span = Microsoft.CodeAnalysis.Text.TextSpan.FromBounds(startPosition, endPosition);
 
         var node = root.FindNode(span);
@@ -177,8 +179,10 @@ public partial class RoslynService
         var root = await syntaxTree.GetRootAsync(cancellationToken);
         var text = await syntaxTree.GetTextAsync(cancellationToken);
 
-        var startPosition = text.Lines[Math.Max(0, startLine)].Start;
-        var endPosition = text.Lines[Math.Min(text.Lines.Count - 1, endLine)].End;
+        if (ValidateLineRange(text, startLine, endLine) is { } rangeError) return rangeError;
+
+        var startPosition = text.Lines[startLine].Start;
+        var endPosition = text.Lines[endLine].End;
         var span = Microsoft.CodeAnalysis.Text.TextSpan.FromBounds(startPosition, endPosition);
 
         var node = root.FindNode(span);

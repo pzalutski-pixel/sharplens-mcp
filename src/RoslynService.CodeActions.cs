@@ -9,6 +9,23 @@ namespace SharpLensMcp;
 
 public partial class RoslynService
 {
+    // Guards a two-position code-action selection so a reversed range (end before start)
+    // returns a structured error instead of throwing downstream in TextSpan.FromBounds.
+    // Both positions are individually validated by ResolvePositionAsync; only their order
+    // is unchecked, and FromBounds requires start <= end.
+    private object? ValidateSelectionOrder(
+        int startPosition, int? endPosition, int line, int column, int? endLine, int? endColumn)
+    {
+        if (endPosition.HasValue && endPosition.Value < startPosition)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                "Invalid selection: the end position precedes the start position",
+                hint: "Ensure (endLine, endColumn) is at or after (line, column).",
+                context: new { line, column, endLine, endColumn });
+        }
+        return null;
+    }
 
     /// <summary>
     /// Get all available code actions (fixes + refactorings) at a position.
@@ -35,6 +52,9 @@ public partial class RoslynService
             if (endPos == null) return endError!;
             endPosition = endPos.Position;
         }
+
+        if (ValidateSelectionOrder(pos.Position, endPosition, line, column, endLine, endColumn) is { } orderError)
+            return orderError;
 
         var allActions = await GetAllCodeActionsAtPositionAsync(
             pos.Document,
@@ -121,6 +141,9 @@ public partial class RoslynService
             if (endPos == null) return endError!;
             endPosition = endPos.Position;
         }
+
+        if (ValidateSelectionOrder(pos.Position, endPosition, line, column, endLine, endColumn) is { } orderError)
+            return orderError;
 
         var allActions = await GetAllCodeActionsAtPositionAsync(
             document,

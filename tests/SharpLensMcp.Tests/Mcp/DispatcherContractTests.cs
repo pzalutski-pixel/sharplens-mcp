@@ -235,11 +235,15 @@ public class DispatcherContractTests : McpTestBase
     [Fact]
     public async Task ToolsCall_UnexpectedHandlerException_SurfacesAsInBandIsErrorResult()
     {
-        // analyze_data_flow with a start line far past the end of the file throws
-        // ArgumentOutOfRangeException inside the handler. An exception escaping a
-        // tool handler is a TOOL failure: it must surface as an in-band
-        // CallToolResult with isError, where the model can read and recover from
-        // it — not as a JSON-RPC -32603 protocol error.
+        // An exception escaping a tool handler is a TOOL failure: it must surface as an
+        // in-band CallToolResult with isError, where the model can read and recover from
+        // it — not as a JSON-RPC -32603 protocol error. Trigger the generic catch through
+        // the deterministic fault seam rather than a specific tool's out-of-range input, so
+        // hardening any one tool (as the region tools now are) can't silently delete this
+        // contract's only coverage.
+        var server = new McpServer(TimeSpan.FromSeconds(30),
+            testToolCallFault: new InvalidOperationException("simulated handler fault"));
+
         var wireOptions = new System.Text.Json.JsonSerializerOptions
         {
             PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase,
@@ -252,17 +256,12 @@ public class DispatcherContractTests : McpTestBase
             method = "tools/call",
             @params = new
             {
-                name = "analyze_data_flow",
-                arguments = new
-                {
-                    filePath = Fixture.RoslynServicePath,
-                    startLine = 99_999_999,
-                    endLine = 99_999_999
-                }
+                name = "health_check",
+                arguments = new { }
             }
         });
 
-        var response = await Fixture.Server.HandleRequestAsync(request);
+        var response = await server.HandleRequestAsync(request);
         var envelope = JObject.Parse(System.Text.Json.JsonSerializer.Serialize(response, wireOptions));
 
         envelope["error"].Should().BeNull(
@@ -272,6 +271,8 @@ public class DispatcherContractTests : McpTestBase
         var inner = JObject.Parse(envelope["result"]!["content"]![0]!["text"]!.Value<string>()!);
         inner["success"]!.Value<bool>().Should().BeFalse();
         inner["error"]!["code"]!.Value<string>().Should().Be("INTERNAL_ERROR");
+        inner["error"]!["message"]!.Value<string>().Should().Contain("Unhandled error executing tool",
+            "the generic catch prefixes the escaping handler exception message");
         inner["error"]!["hint"]!.Value<string>().Should().NotBeNullOrEmpty(
             "the envelope must carry a recovery hint like every structured tool error");
     }

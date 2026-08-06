@@ -83,6 +83,26 @@ public partial class RoslynService
         return (new ResolvedPosition(document, semanticModel, syntaxTree, text, position, token), null);
     }
 
+    // Validates a zero-based inclusive [startLine, endLine] range against the file, so a
+    // region-addressed tool returns a structured error instead of throwing when the line
+    // numbers are out of range or inverted. The range counterpart to ResolvePositionAsync's
+    // single-position guard: indexing text.Lines out of range throws ArgumentOutOfRangeException,
+    // and TextSpan.FromBounds throws when start > end — both would otherwise escape as -32603.
+    // Returns a structured error response, or null when the range is valid.
+    internal object? ValidateLineRange(SourceText text, int startLine, int endLine)
+    {
+        var lineCount = text.Lines.Count;
+        if (startLine < 0 || endLine < 0 || startLine >= lineCount || endLine >= lineCount || startLine > endLine)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                $"Invalid line range: startLine={startLine}, endLine={endLine} (file has {lineCount} lines)",
+                hint: "startLine and endLine are 0-based and must satisfy 0 <= startLine <= endLine < lineCount.",
+                context: new { startLine, endLine, lineCount });
+        }
+        return null;
+    }
+
     // ---- Unified apply path -------------------------------------------------
     //
     // Every preview:false tool funnels its changed Solution through here. One

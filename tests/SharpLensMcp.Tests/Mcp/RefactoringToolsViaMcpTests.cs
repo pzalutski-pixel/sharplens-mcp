@@ -377,6 +377,22 @@ public class RefactoringToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task GetCodeActionsAtPosition_ReversedSelection_ReturnsInvalidParameter()
+    {
+        // A selection whose end position precedes the start (endLine/endColumn before
+        // line/column) would otherwise reach TextSpan.FromBounds and throw as -32603.
+        // Both positions are individually valid, so only the ordering guard rejects it.
+        var error = await CallAndGetErrorAsync("get_code_actions_at_position", new
+        {
+            filePath = Fixture.RoslynServicePath,
+            line = 10, column = 10,
+            endLine = 0, endColumn = 0
+        }, codeContains: ErrorCodes.InvalidParameter);
+        error["message"]!.Value<string>()!.Should().Contain("end position precedes",
+            "the reversed-selection guard names the ordering problem");
+    }
+
+    [Fact]
     public async Task ImplementMissingMembers_OnCompleteRoslynService_ReturnsSymbolNotFound()
     {
         // The RoslynService partial class implements every interface/abstract member.

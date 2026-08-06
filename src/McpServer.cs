@@ -23,6 +23,11 @@ public class McpServer
     // into the per-call CTS), so the pre-dispatch check in HandleToolCallAsync forces
     // a TIMEOUT with no timing race. CancellationToken.None in production (never fires).
     private readonly CancellationToken _testToolCallCancellation;
+    // Deterministic fault seam for the dispatcher's exception-wrapping contract: when
+    // non-null, HandleToolCallAsync throws it in place of dispatch, exercising the generic
+    // catch's in-band INTERNAL_ERROR path without coupling the test to any one tool's
+    // failure mode. Null in production (never fires).
+    private readonly Exception? _testToolCallFault;
 
     public McpServer() : this(ReadConfiguredToolCallTimeout())
     {
@@ -31,7 +36,8 @@ public class McpServer
     // Test seam: injects the per-call timeout directly (and optionally a forced
     // cancellation token). Tests must not mutate SHARPLENS_TIMEOUT_SECONDS —
     // environment variables are process-wide and parallel test classes would race.
-    internal McpServer(TimeSpan toolCallTimeout, CancellationToken testToolCallCancellation = default)
+    internal McpServer(TimeSpan toolCallTimeout, CancellationToken testToolCallCancellation = default,
+        Exception? testToolCallFault = null)
     {
         _roslynService = new RoslynService();
         _logLevel = EnvironmentConfig.Get("SHARPLENS_LOG_LEVEL", "ROSLYN_LOG_LEVEL") ?? "Information";
@@ -43,6 +49,7 @@ public class McpServer
         };
         _toolCallTimeout = toolCallTimeout;
         _testToolCallCancellation = testToolCallCancellation;
+        _testToolCallFault = testToolCallFault;
     }
 
     // Test seam: load an in-memory workspace into the underlying service so the
@@ -302,6 +309,11 @@ public class McpServer
             // already-cancelled budget surfaces as TIMEOUT deterministically rather than
             // depending on the first Roslyn call to observe the token.
             timeoutCts.Token.ThrowIfCancellationRequested();
+
+            // Deterministic fault seam (null in production): simulate an unexpected
+            // exception escaping the handler so the generic catch's in-band INTERNAL_ERROR
+            // wrapping is testable without depending on a specific tool's failure mode.
+            if (_testToolCallFault != null) throw _testToolCallFault;
 
             var result = await ToolRegistry.DispatchAsync(name, p, _roslynService, timeoutCts.Token);
 

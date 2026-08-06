@@ -203,6 +203,36 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
+    public async Task AnalyzeDataFlow_StartLineBeyondEndOfFile_ReturnsInvalidParameter()
+    {
+        // A startLine past end-of-file used to index text.Lines out of range and throw
+        // -32603; it must surface as a structured in-band error instead.
+        var lineCount = File.ReadAllLines(Fixture.RoslynServicePath).Length;
+        var error = await CallAndGetErrorAsync("analyze_data_flow", new
+        {
+            filePath = Fixture.RoslynServicePath,
+            startLine = lineCount + 1000,
+            endLine = lineCount + 1000
+        }, codeContains: ErrorCodes.InvalidParameter);
+        error["message"]!.Value<string>()!.Should().Contain("Invalid line range");
+    }
+
+    [Fact]
+    public async Task AnalyzeControlFlow_InvertedRange_ReturnsInvalidParameter()
+    {
+        // startLine > endLine used to throw in TextSpan.FromBounds (start > end); it must
+        // surface as a structured in-band error instead.
+        var lineCount = File.ReadAllLines(Fixture.RoslynServicePath).Length;
+        var error = await CallAndGetErrorAsync("analyze_control_flow", new
+        {
+            filePath = Fixture.RoslynServicePath,
+            startLine = lineCount - 1,
+            endLine = 0
+        }, codeContains: ErrorCodes.InvalidParameter);
+        error["message"]!.Value<string>()!.Should().Contain("Invalid line range");
+    }
+
+    [Fact]
     public async Task AnalyzeChangeImpact_RenameCreateSuccessResponse_AllInfoNoBreaking()
     {
         var (file, line, col) = await LocateSymbolAsync(
