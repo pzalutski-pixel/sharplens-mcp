@@ -158,4 +158,142 @@ public sealed class Square : Polygon
         entry["fromAbstractClass"]!.Value<string>().Should().EndWith("Shape",
             "the slot is attributed to the base that originally declared the abstract member");
     }
+
+    // The satisfaction walk resolves an abstract PROPERTY through an intermediate base's
+    // override, exercising the IPropertySymbol arm of the override-chain helpers (methods
+    // alone would leave that branch unproven).
+    private const string LayeredAbstractProperty = @"
+namespace Fixtures;
+
+public abstract class Shape
+{
+    public abstract double Area { get; }
+}
+
+public abstract class Polygon : Shape
+{
+    public override double Area => 0;
+}
+
+public sealed class Square : Polygon
+{
+}
+";
+
+    // A grandparent's abstract member with NO override anywhere and a concrete leaf: the
+    // member is genuinely missing and must be reported once, attributed to the base that
+    // declared it — the reporting counterpart of the intermediate-override case.
+    private const string GrandparentAbstractNotOverridden = @"
+namespace Fixtures;
+
+public abstract class Shape
+{
+    public abstract double Area();
+}
+
+public abstract class Polygon : Shape
+{
+}
+
+public sealed class Square : Polygon
+{
+}
+";
+
+    // Overloaded abstract methods where the intermediate base overrides only one: the walk
+    // must match slots by override chain, not by name, so the un-overridden overload is the
+    // one reported.
+    private const string OverloadedAbstractPartiallyOverridden = @"
+namespace Fixtures;
+
+public abstract class Shape
+{
+    public abstract void F();
+    public abstract void F(int n);
+}
+
+public abstract class Polygon : Shape
+{
+    public override void F() { }
+}
+
+public sealed class Square : Polygon
+{
+}
+";
+
+    [Fact]
+    public async Task GetMissingMembers_WhenIntermediateBaseOverridesAbstractProperty_ReportsEmpty()
+    {
+        var (workspace, document) = TestHelpers.CreateWorkspaceWithCode(
+            LayeredAbstractProperty, fileName: "LayeredAbstractProperty.cs");
+
+        var service = new RoslynService();
+        service.LoadFromWorkspaceForTesting(workspace);
+
+        var (line, column) = LocateSquare(LayeredAbstractProperty);
+
+        var result = await service.GetMissingMembersAsync(document.FilePath!, line, column);
+
+        var json = JObject.FromObject(result);
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+
+        var missing = json["data"]!["missingMembers"] as JArray;
+        missing.Should().NotBeNull();
+        missing!.Count.Should().Be(0,
+            "Polygon already overrides Shape.Area (a property), so nothing is missing on Square");
+    }
+
+    [Fact]
+    public async Task GetMissingMembers_WhenGrandparentAbstractNeverOverridden_ReportsOnceFromOriginalBase()
+    {
+        var (workspace, document) = TestHelpers.CreateWorkspaceWithCode(
+            GrandparentAbstractNotOverridden, fileName: "GrandparentAbstract.cs");
+
+        var service = new RoslynService();
+        service.LoadFromWorkspaceForTesting(workspace);
+
+        var (line, column) = LocateSquare(GrandparentAbstractNotOverridden);
+
+        var result = await service.GetMissingMembersAsync(document.FilePath!, line, column);
+
+        var json = JObject.FromObject(result);
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+
+        var missing = json["data"]!["missingMembers"] as JArray;
+        missing.Should().NotBeNull();
+        missing!.Count.Should().Be(1,
+            "Area is abstract in Shape, unoverridden through Polygon, and unimplemented in Square");
+        var entry = missing[0];
+        entry["memberName"]!.Value<string>().Should().Be("Area");
+        entry["fromAbstractClass"]!.Value<string>().Should().EndWith("Shape",
+            "the member is attributed to Shape, two levels up, where it was declared");
+    }
+
+    [Fact]
+    public async Task GetMissingMembers_WhenOnlyOneAbstractOverloadOverridden_ReportsTheOtherOverload()
+    {
+        var (workspace, document) = TestHelpers.CreateWorkspaceWithCode(
+            OverloadedAbstractPartiallyOverridden, fileName: "OverloadedAbstract.cs");
+
+        var service = new RoslynService();
+        service.LoadFromWorkspaceForTesting(workspace);
+
+        var (line, column) = LocateSquare(OverloadedAbstractPartiallyOverridden);
+
+        var result = await service.GetMissingMembersAsync(document.FilePath!, line, column);
+
+        var json = JObject.FromObject(result);
+        json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
+
+        var missing = json["data"]!["missingMembers"] as JArray;
+        missing.Should().NotBeNull();
+        // F() is satisfied by Polygon's override; F(int) is not — exactly one is missing.
+        missing!.Count.Should().Be(1,
+            "the parameterless F() is overridden; only the F(int) overload remains unimplemented");
+        var entry = missing[0];
+        entry["memberName"]!.Value<string>().Should().Be("F");
+        entry["signature"]!.Value<string>().Should().Contain("int",
+            "the reported overload must be F(int), distinguished by its signature");
+    }
 }
