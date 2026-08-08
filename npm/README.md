@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/sharplens-mcp.svg)](https://www.npmjs.com/package/sharplens-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/pzalutski-pixel/sharplens-mcp/blob/main/LICENSE)
 
-An MCP server providing **91 semantic analysis tools** for .NET/C#, built on Microsoft Roslyn for compiler-accurate code understanding.
+An MCP server providing **92 semantic analysis tools** for .NET/C#, built on Microsoft Roslyn for compiler-accurate code understanding.
 
 ## Requirements
 
@@ -50,8 +50,8 @@ AI systems need compiler-accurate insights that reading source files cannot prov
 
 ## Features
 
-### Navigation & Discovery (23 tools)
-Symbol info, go to definition, find references (reports `read`/`write`/`invocation`/`cast`/`typeof`/`nameof`/`attribute` kind with optional server-side filter), find implementations, find callers, multi-hop call graph with depth bound + cycle detection, type hierarchy, symbol search (glob or fuzzy camel-hump matching), semantic query, type members, batch type members, method signatures, derived types, base types, attributes, containing member, method overloads, attribute usage search, **external type inspection** (NuGet/BCL/closed-source assemblies with members + XML doc summaries), **stack-trace resolution** (map a .NET trace to source with compiler mangling undone), **applicable extension methods** (classic `this`-parameter and C# 14 `extension` blocks), **symbol documentation** with `<inheritdoc>` resolved recursively, and **super-method navigation** (jump to the overridden or implemented member).
+### Navigation & Discovery (24 tools)
+Symbol info, go to definition, find references (reports `read`/`write`/`invocation`/`cast`/`typeof`/`nameof`/`attribute` kind with optional server-side filter), find implementations, find callers, multi-hop call graph with depth bound + cycle detection, **point-to-point reachability** (the connecting call path between two methods, dispatch followed, with barriers and a checkpoint), type hierarchy, symbol search (glob or fuzzy camel-hump matching), semantic query, type members, batch type members, method signatures, derived types, base types, attributes, containing member, method overloads, attribute usage search, **external type inspection** (NuGet/BCL/closed-source assemblies with members + XML doc summaries), **stack-trace resolution** (map a .NET trace to source with compiler mangling undone), **applicable extension methods** (classic `this`-parameter and C# 14 `extension` blocks), **symbol documentation** with `<inheritdoc>` resolved recursively, and **super-method navigation** (jump to the overridden or implemented member).
 
 ### Analysis (17 tools)
 Diagnostics (runs configured `DiagnosticAnalyzer`s — StyleCop, Roslynator, NetAnalyzers, custom — by default; matches CI output), **API-surface diff** against a git ref, **exception-flow analysis** (which exceptions can escape a method and where each is caught), **structural similar-code search**, **remove-unused-code** computation (generation-only), **dead-branch detection** (unreachable code from the real control-flow graph), **add-missing-imports** computation (compiler-accurate), data flow analysis, control flow analysis, change impact analysis, type compatibility, outgoing calls, unused code detection, code validation, complexity metrics, circular dependency detection, and missing members.

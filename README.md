@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/sharplens-mcp.svg)](https://www.npmjs.com/package/sharplens-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Model Context Protocol (MCP) server providing **91 AI-optimized tools** for .NET/C# semantic code analysis, navigation, refactoring, and code generation using Microsoft Roslyn.
+A Model Context Protocol (MCP) server providing **92 AI-optimized tools** for .NET/C# semantic code analysis, navigation, refactoring, and code generation using Microsoft Roslyn.
 
 Built for AI coding agents - provides compiler-accurate code understanding that AI cannot infer from reading source files alone.
 
@@ -99,7 +99,7 @@ Tool names no longer carry the `roslyn:` prefix — the colon violates the MCP t
 | `roslyn:load_solution` | `load_solution` |
 | `roslyn:get_diagnostics` | `get_diagnostics` |
 | `roslyn:rename_symbol` | `rename_symbol` |
-| ...same rule for all 91 tools... | drop the `roslyn:` prefix |
+| ...same rule for all tools... | drop the `roslyn:` prefix |
 
 `tools/list` publishes only the new names. Calls using the old prefixed names are still accepted as aliases for one release and will be removed in the following one.
 
@@ -157,7 +157,7 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 
 ## Features
 
-- **91 Semantic Analysis Tools** - Navigation, refactoring, code generation, diagnostics, discovery, audit/quality
+- **92 Semantic Analysis Tools** - Navigation, refactoring, code generation, diagnostics, discovery, audit/quality
 - **AI-Optimized Descriptions** - Clear USAGE/OUTPUT/WORKFLOW patterns
 - **Structured Responses** - Consistent `success/error/data` format with `suggestedNextTools`
 - **Zero-Based Coordinates** - Clear warnings to prevent off-by-one errors
@@ -166,7 +166,7 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 
 ## Tool Categories
 
-### Navigation & Discovery (23 tools)
+### Navigation & Discovery (24 tools)
 | Tool | Description |
 |------|-------------|
 | `get_symbol_info` | Semantic info at position |
@@ -175,6 +175,7 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 | `find_implementations` | Interface/abstract implementations |
 | `find_callers` | Impact analysis - who calls this? |
 | `get_call_graph` | Multi-hop callers/callees graph with depth bound + cycle detection |
+| `find_path_between` | Reachability + the connecting call path(s) between two methods; follows dispatch, with barriers and a checkpoint |
 | `get_type_hierarchy` | Inheritance chain |
 | `search_symbols` | Glob pattern search (`*Handler`, `Get*`) |
 | `semantic_query` | Multi-filter search (async, public, etc.) |
@@ -310,7 +311,7 @@ For MCP clients other than Claude Code, add to your configuration:
 ## Usage
 
 1. **Load a solution**: Call `load_solution` with path to `.sln` or `.slnx` file (or set `DOTNET_SOLUTION_PATH`)
-2. **Analyze code**: Use any of the 91 tools for navigation, analysis, refactoring, audit
+2. **Analyze code**: Use any of the 92 tools for navigation, analysis, refactoring, audit
 3. **Refactor safely**: Preview changes before applying with `preview: true`
 
 ## Architecture
@@ -321,7 +322,7 @@ MCP Client (AI Agent)
         v
    SharpLensMcp
    - Protocol handling
-   - 91 AI-optimized tools
+   - 92 AI-optimized tools
         |
         v
 Microsoft.CodeAnalysis (Roslyn)

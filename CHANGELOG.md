@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.6.2] - 2026-08-08
+
+### Added
+- `find_path_between` — point-to-point reachability over the call graph: can any source method reach any target method, and through what call chain? Fills the gap between `get_call_graph` (single-source) and `find_callers`/`get_outgoing_calls` (one hop). A bounded bidirectional search that follows virtual/interface dispatch, with optional `avoidThrough` barriers and a single `mustPassThrough` checkpoint. An unreachable pair reports whether the search hit its bounds (raise `maxHops`) or the graph is genuinely disconnected. A neutral mechanism — the caller names the endpoints and any barriers; it has no built-in notion of what matters.
+
 ## [1.6.1] - 2026-08-05
 
 ### Fixed
