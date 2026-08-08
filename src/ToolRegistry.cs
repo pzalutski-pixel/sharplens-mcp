@@ -1869,6 +1869,94 @@ Use get_source_generators first to discover available generated files.",
                 p.Optional("maxDepth", 3),
                 p.Optional("maxNodes", 100),
                 cancellationToken)),
+            new ToolDefinition("find_path_between", ReadOnly: true,
+            (object)new
+            {
+                name = "find_path_between",
+                description = @"Point-to-point reachability over the call graph: can any source method reach any target method, and through what call chain? Fills the gap between get_call_graph (single-source) and find_callers/get_outgoing_calls (one hop). A neutral mechanism - you name the endpoints and any barriers; it has no built-in notion of what matters.
+
+USAGE: find_path_between(sources: [{typeName, memberName}], targets: [{typeName, memberName}]). Optional avoidThrough (barrier methods the path may not cross), mustPassThrough (a single required checkpoint), maxHops (1-12, default 8), maxNodes (default 500).
+OUTPUT: per source/target pair, reachable + the ordered hops (symbol + location) of a shortest connecting chain; or reachable:false with hitHopLimit (raise maxHops) vs. a genuinely disconnected pair.
+LIMITS: over-approximate CONTROL reachability - follows virtual/interface dispatch, so a path is 'could reach' not 'will'; blind to reflection, delegates dispatched through fields, and DI-by-string; stops at the metadata boundary (a path to a BCL/NuGet member means the app calls it).",
+                inputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        sources = new
+                        {
+                            type = "array",
+                            description = "Entry-point methods to search from. Each { typeName, memberName }; a member name matches all its overloads.",
+                            items = new
+                            {
+                                type = "object",
+                                properties = new
+                                {
+                                    typeName = new { type = "string", description = "Containing type (fully-qualified, simple, or unique partial name)" },
+                                    memberName = new { type = "string", description = "Method name" }
+                                },
+                                required = new[] { "typeName", "memberName" }
+                            }
+                        },
+                        targets = new
+                        {
+                            type = "array",
+                            description = "Target methods to reach. Each { typeName, memberName }.",
+                            items = new
+                            {
+                                type = "object",
+                                properties = new
+                                {
+                                    typeName = new { type = "string", description = "Containing type (fully-qualified, simple, or unique partial name)" },
+                                    memberName = new { type = "string", description = "Method name" }
+                                },
+                                required = new[] { "typeName", "memberName" }
+                            }
+                        },
+                        avoidThrough = new
+                        {
+                            type = "array",
+                            description = "Optional barrier methods: a reported path never traverses these (graph cut). Each { typeName, memberName }.",
+                            items = new
+                            {
+                                type = "object",
+                                properties = new
+                                {
+                                    typeName = new { type = "string", description = "Containing type" },
+                                    memberName = new { type = "string", description = "Method name" }
+                                },
+                                required = new[] { "typeName", "memberName" }
+                            }
+                        },
+                        mustPassThrough = new
+                        {
+                            type = "array",
+                            description = "Optional single checkpoint the path must cross (source reaches it, and it reaches the target). More than one is rejected.",
+                            items = new
+                            {
+                                type = "object",
+                                properties = new
+                                {
+                                    typeName = new { type = "string", description = "Containing type" },
+                                    memberName = new { type = "string", description = "Method name" }
+                                },
+                                required = new[] { "typeName", "memberName" }
+                            }
+                        },
+                        maxHops = new { type = "integer", description = "Max path length in edges, 1-12 (default: 8)." },
+                        maxNodes = new { type = "integer", description = "Node budget across both search frontiers (default: 500). Sets hitHopLimit/truncated when hit." }
+                    },
+                    required = new[] { "sources", "targets" }
+                }
+            },
+            (svc, p, cancellationToken) => svc.FindPathBetweenAsync(
+                ParseMemberRefs(p.Raw("sources"), p.ToolName),
+                ParseMemberRefs(p.Raw("targets"), p.ToolName),
+                ParseMemberRefs(p.Raw("avoidThrough"), p.ToolName),
+                ParseMemberRefs(p.Raw("mustPassThrough"), p.ToolName),
+                p.Optional("maxHops", 8),
+                p.Optional("maxNodes", 500),
+                cancellationToken)),
             new ToolDefinition("get_external_type_info", ReadOnly: true,
             (object)new
             {
@@ -2543,6 +2631,28 @@ OUTPUT: issues[] {category: asyncVoid|blockingCall|tokenNotForwarded, symbol, de
         }
 
         return definition.Handler(svc, p, cancellationToken);
+    }
+
+    // Parses find_path_between's endpoint arrays ([{typeName, memberName}, ...]) into
+    // MemberRefs. A missing/non-array node yields an empty list, so the optional
+    // avoidThrough/mustPassThrough are absent-safe and the required sources/targets fall
+    // into the tool's own empty-check.
+    private static List<MemberRef> ParseMemberRefs(JsonNode? node, string toolName)
+    {
+        var refs = new List<MemberRef>();
+        if (node is JsonArray array)
+        {
+            foreach (var item in array)
+            {
+                if (item is JsonObject obj)
+                {
+                    refs.Add(new MemberRef(
+                        OptionalString(obj, "typeName", toolName) ?? "",
+                        OptionalString(obj, "memberName", toolName) ?? ""));
+                }
+            }
+        }
+        return refs;
     }
 
     private static List<SignatureChange> ParseSignatureChanges(JsonNode? changesNode, string toolName)

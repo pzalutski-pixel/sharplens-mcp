@@ -55,7 +55,7 @@ public class ToolsListGoldenTests
     }
 
     [Fact]
-    public async Task ToolsList_HasExactlyNinetyOneTools()
+    public async Task ToolsList_HasExactlyNinetyTwoTools()
     {
         var server = new McpServer();
         var response = await server.HandleRequestAsync(
@@ -71,7 +71,7 @@ public class ToolsListGoldenTests
         var json = JObject.Parse(JsonSerializer.Serialize(response, jsonOptions));
         var tools = json["result"]!["tools"] as JArray;
         tools.Should().NotBeNull();
-        tools!.Count.Should().Be(91,
-            "the README advertises 91 tools; changing the count must be a deliberate, documented decision");
+        tools!.Count.Should().Be(92,
+            "adding find_path_between brings the count to 92; the README tool tables and count are synced at release. Changing the count must be a deliberate, documented decision");
     }
 }
