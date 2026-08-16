@@ -65,6 +65,10 @@ public partial class RoslynService
                 warningCount = data.WarningCount,
                 analyzersRan = data.AnalyzersRan,
                 analyzerCount = data.AnalyzerCount,
+                // These are Roslyn's live-compilation diagnostics, not a `dotnet build`. Counts
+                // can differ from a real build (MSBuild target/generator graph, a partial load
+                // inflating unresolved-type errors); use health_check's `partial` to rule that out.
+                analysisMode = "live-compilation",
                 diagnostics = diagnosticView
             },
             suggestedNextTools: data.ErrorCount > 0 || data.WarningCount > 0

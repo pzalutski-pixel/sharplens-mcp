@@ -29,6 +29,9 @@ public partial class RoslynService
     private readonly bool _useAbsolutePaths;
 
     private DateTime? _solutionLoadedAt;
+    // How faithfully the loaded solution reflects disk (declared vs loaded projects + MSBuild
+    // load diagnostics). Persisted so health_check can report it without a reload.
+    private LoadFidelity? _loadFidelity;
 
     // Single source for the semantic-cache flag, read by both the cache gate and the
     // health_check configuration report so the reported state can't drift from the
@@ -368,6 +371,9 @@ public partial class RoslynService
         // their language-service lookups return null and they emit no actions.
         var hostServices = Microsoft.CodeAnalysis.Host.Mef.MefHostServices.Create(GetRoslynMefAssemblies());
         var msbuild = MSBuildWorkspace.Create(hostServices);
+        // Log to stderr for the server operator; the same diagnostics are read from
+        // msbuild.Diagnostics below and surfaced to the caller, so a dropped project is
+        // never invisible in the response.
         msbuild.RegisterWorkspaceFailedHandler(args =>
         {
             Console.Error.WriteLine($"[Warning] Workspace: {args.Diagnostic.Message}");
@@ -380,20 +386,75 @@ public partial class RoslynService
         var projectCount = _solution.ProjectIds.Count;
         var documentCount = _solution.Projects.Sum(p => p.DocumentIds.Count);
 
+        // Load fidelity: a Failure-kind diagnostic means MSBuildWorkspace dropped a project
+        // (unresolvable ProjectReference, unsupported project type, missing SDK); Warning-kind
+        // flags reference/restore problems. Cross-check the loaded count against what the
+        // solution file declares so a silent drop is caught even if no diagnostic fired.
+        var failures = msbuild.Diagnostics
+            .Where(d => d.Kind == WorkspaceDiagnosticKind.Failure)
+            .Select(d => d.Message)
+            .ToList();
+        var warnings = msbuild.Diagnostics
+            .Where(d => d.Kind == WorkspaceDiagnosticKind.Warning)
+            .Select(d => d.Message)
+            .ToList();
+        _loadFidelity = new LoadFidelity(CountDeclaredProjects(solutionPath), projectCount, failures, warnings);
+
         return CreateSuccessResponse(
             data: new
             {
                 solutionPath,
                 projectCount,
-                documentCount
+                documentCount,
+                declaredProjectCount = _loadFidelity.DeclaredProjectCount,
+                partial = _loadFidelity.IsPartial,
+                loadFailures = failures,
+                loadWarningCount = warnings.Count
             },
-            suggestedNextTools: new[]
-            {
-                "get_project_structure to see solution structure",
-                "search_symbols to find code",
-                "get_diagnostics to check for issues"
-            }
+            suggestedNextTools: _loadFidelity.IsPartial
+                ? new[]
+                {
+                    "PARTIAL LOAD: projects failed to load - see loadFailures; fix the references or run dotnet restore, then reload",
+                    "get_project_structure to see what did load"
+                }
+                : new[]
+                {
+                    "get_project_structure to see solution structure",
+                    "search_symbols to find code",
+                    "get_diagnostics to check for issues"
+                }
         );
+    }
+
+    // The number of projects the solution FILE declares - an independent cross-check against
+    // how many actually loaded, so a silently-dropped project is caught even when no diagnostic
+    // fired. .sln: Project("{type}") entries that aren't solution folders. .slnx: <Project>
+    // elements. Null when the file can't be parsed (the caller degrades gracefully).
+    internal static int? CountDeclaredProjects(string solutionPath)
+    {
+        try
+        {
+            if (solutionPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
+            {
+                var doc = System.Xml.Linq.XDocument.Load(solutionPath);
+                return doc.Descendants().Count(e => e.Name.LocalName == "Project" && e.Attribute("Path") != null);
+            }
+            // The solution-folder type GUID is excluded so only real projects are counted.
+            const string solutionFolderTypeGuid = "2150E333-8FDC-42A3-9474-1A3956D46DE8";
+            var count = 0;
+            foreach (var line in File.ReadLines(solutionPath))
+            {
+                var trimmed = line.TrimStart();
+                if (!trimmed.StartsWith("Project(\"{", StringComparison.OrdinalIgnoreCase)) continue;
+                if (trimmed.IndexOf(solutionFolderTypeGuid, StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                count++;
+            }
+            return count;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -638,6 +699,10 @@ public partial class RoslynService
                 loaded = true,
                 path = _solution.FilePath,
                 projects = projectCount,
+                declaredProjects = _loadFidelity?.DeclaredProjectCount,
+                partial = _loadFidelity?.IsPartial ?? false,
+                loadFailures = _loadFidelity?.Failures ?? (IReadOnlyList<string>)Array.Empty<string>(),
+                loadWarningCount = _loadFidelity?.Warnings.Count ?? 0,
                 documents = documentCount,
                 loadedAt = _solutionLoadedAt?.ToString("yyyy-MM-ddTHH:mm:ssZ"),
                 diagnosticsIncluded = includeDiagnostics,
@@ -844,6 +909,8 @@ public partial class RoslynService
         _workspace = workspace;
         _solution = workspace.CurrentSolution;
         _solutionLoadedAt = DateTime.UtcNow;
+        // An in-memory workspace has no MSBuild load step, so every project is present.
+        _loadFidelity = LoadFidelity.Complete(_solution.ProjectIds.Count);
     }
 
     /// <summary>

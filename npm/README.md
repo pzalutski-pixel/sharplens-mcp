@@ -72,7 +72,7 @@ Type overview, method analysis, file overview, method source, batch method sourc
 DI registration scanning, reflection usage detection, and **interceptor discovery** (`[InterceptsLocation]` call rerouting, generated code included).
 
 ### Infrastructure (12 tools)
-Health check, **unused dependency detection** (PackageReference/ProjectReference the compiler never needs), **fix-all** for a diagnostic across a file, project, or solution, solution loading, document synchronization, project structure, dependency graph, code fixes, apply code fix, NuGet dependency listing, source generator inspection, and generated code viewer.
+Health check (with **load-fidelity reporting** — a `partial` flag and `loadFailures` so dropped projects / unresolvable references aren't silent), **unused dependency detection** (PackageReference/ProjectReference the compiler never needs), **fix-all** for a diagnostic across a file, project, or solution, solution loading, document synchronization, project structure, dependency graph, code fixes, apply code fix, NuGet dependency listing, source generator inspection, and generated code viewer.
 
 ## Configuration
 

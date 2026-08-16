@@ -53,7 +53,7 @@ internal static class ToolRegistry
             (object)new
             {
                 name = "health_check",
-                description = "Check the health and status of the SharpLens MCP server and workspace. Returns server status, solution loaded state, project/document counts, cache size, and configuration. O(1) by default; set includeDiagnostics=true to also compile a sample of projects and report error/warning counts (slower). Call this first to verify the server is ready.",
+                description = "Check the health and status of the SharpLens MCP server and workspace. Returns server status, solution loaded state, project/document counts, cache size, and configuration. Reports load fidelity too: declaredProjects (from the solution file) vs loaded, a partial flag, and loadFailures — so you can detect a solution that silently dropped projects, without reloading. O(1) by default; set includeDiagnostics=true to also compile a sample of projects and report error/warning counts (slower). Call this first to verify the server is ready.",
                 inputSchema = new
                 {
                     type = "object",
@@ -70,7 +70,7 @@ internal static class ToolRegistry
             (object)new
             {
                 name = "load_solution",
-                description = "Load a .NET solution for analysis. MUST be called before using any other analysis tools. Returns: projectCount, documentCount, and load time. Use health_check to verify current state.",
+                description = "Load a .NET solution for analysis. MUST be called before using any other analysis tools. Returns projectCount and documentCount, plus load-fidelity fields so a partial load is never silent: declaredProjectCount (from the solution file), a partial flag (true when a project was dropped or fewer loaded than declared), and loadFailures (projects MSBuild couldn't load, e.g. an unresolvable ProjectReference). If partial is true, downstream results are based on an incomplete solution. Use health_check to re-check without reloading.",
                 inputSchema = new
                 {
                     type = "object",
@@ -313,7 +313,7 @@ FILTERS: All specified filters are combined with AND logic. Omit a filter to ski
             (object)new
             {
                 name = "get_diagnostics",
-                description = "Get compiler errors, warnings, info messages, AND configured analyzer findings (StyleCop, Roslynator, NetAnalyzers, custom analyzers; editorconfig-resolved severities) for a file or project. Use before committing - this matches what CI will fail on. Response includes analyzersRan and analyzerCount so callers know whether analyzers contributed.",
+                description = "Get compiler errors, warnings, info messages, AND configured analyzer findings (StyleCop, Roslynator, NetAnalyzers, custom analyzers; editorconfig-resolved severities) for a file or project. Response includes analyzersRan/analyzerCount and analysisMode='live-compilation': these are Roslyn's live diagnostics, which closely track CI but can differ from a full `dotnet build` - a partially-loaded solution especially inflates unresolved-type errors, so check health_check's partial flag if counts look off.",
                 inputSchema = new
                 {
                     type = "object",

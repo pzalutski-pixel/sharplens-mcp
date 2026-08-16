@@ -277,10 +277,10 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 ### Infrastructure (12 tools)
 | Tool | Description |
 |------|-------------|
-| `health_check` | Server status |
+| `health_check` | Server status + load fidelity (`partial` flag, declared-vs-loaded projects, `loadFailures`) — check without reloading |
 | `find_unused_dependencies` | PackageReferences/ProjectReferences the compiler never needs |
 | `fix_all` | Compute the fix for every instance of a diagnostic id (generation-only) |
-| `load_solution` | Load .sln/.slnx for analysis |
+| `load_solution` | Load .sln/.slnx; reports partial loads (`partial` + `loadFailures`) so dropped projects / unresolvable references aren't silent |
 | `sync_documents` | Sync file changes into loaded solution |
 | `get_project_structure` | Solution structure |
 | `dependency_graph` | Project dependencies |
