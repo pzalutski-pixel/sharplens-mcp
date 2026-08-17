@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.6.3] - 2026-08-16
+
+### Fixed
+- `load_solution` no longer silently drops projects it can't load. When MSBuild can't resolve a `ProjectReference` (or a project fails to load for any reason), the response now reports `partial: true`, `declaredProjectCount` (from the solution file) alongside the loaded count, and `loadFailures` naming what failed — so a partial load isn't mistaken for a clean one (`success: true` with a silently smaller `projectCount`). `health_check` exposes the same fidelity without a reload. `get_diagnostics` gains `analysisMode: "live-compilation"` to signal its counts are Roslyn's live diagnostics, which can differ from a full `dotnet build`.
+
 ## [1.6.2] - 2026-08-08
 
 ### Added

@@ -8,7 +8,7 @@
     <LangVersion>latest</LangVersion>
 
     <!-- Package metadata -->
-    <Version>1.6.2</Version>
+    <Version>1.6.3</Version>
     <Authors>Peter Zalutski</Authors>
     <Copyright>Copyright (c) 2025 Peter Zalutski</Copyright>
     <Description>MCP server providing 92 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
@@ -18,9 +18,9 @@
     <PackageTags>mcp;roslyn;csharp;dotnet;code-analysis;ai;semantic-analysis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
-v1.6.2
-Added:
-- find_path_between - point-to-point call-graph reachability: can any source method reach any target, and through what call chain? Bounded bidirectional search that follows virtual/interface dispatch, with optional barriers (avoidThrough) and a single checkpoint (mustPassThrough), and an actionable no-path result.
+v1.6.3
+Fixed:
+- load_solution no longer silently drops projects it can't load. A partial load now reports partial:true, declaredProjectCount (from the solution file) alongside the loaded count, and loadFailures naming what failed - so it isn't mistaken for a clean load. health_check exposes the same without a reload; get_diagnostics gains analysisMode:"live-compilation" to signal its counts can differ from a dotnet build.
 Full history: CHANGELOG.md in the repository.
     </PackageReleaseNotes>
 
