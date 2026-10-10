@@ -64,6 +64,9 @@ jobs:
   publish-npm:
     needs: build-and-test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # trusted publishing proves this job's identity to npm with GitHub's OIDC token
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -71,14 +74,18 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
+      # Trusted publishing needs npm 11.5.1 or later; the one Node bundles may be older.
+      - name: Use an npm that supports trusted publishing
+        run: npm install --global npm@11.17.0
+
+      # npm accepts this publish through trusted publishing: the package's settings on npmjs.com trust this
+      # repository's release.yml, and the job proves who it is with GitHub's OIDC token, so no npm token is stored.
       - name: Publish to npm
         working-directory: npm
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
           npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
