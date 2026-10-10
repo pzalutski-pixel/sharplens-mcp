@@ -51,6 +51,9 @@ jobs:
   publish-nuget:
     needs: build-and-test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # trusted publishing proves this job's identity to nuget.org with GitHub's OIDC token
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -58,8 +61,16 @@ jobs:
           name: nuget-package
           path: ./artifacts
 
+      # nuget.org accepts this push through trusted publishing: its policy trusts this repository's release.yml,
+      # and NuGet/login trades the job's GitHub OIDC token for an API key that lasts one hour.
+      - name: Get a short-lived NuGet API key
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: pzalutski
+
       - name: Push to NuGet
-        run: dotnet nuget push ./artifacts/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+        run: dotnet nuget push ./artifacts/*.nupkg --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
 
   publish-npm:
     needs: build-and-test
