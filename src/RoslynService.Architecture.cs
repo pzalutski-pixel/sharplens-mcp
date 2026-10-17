@@ -3,9 +3,12 @@ using Microsoft.CodeAnalysis;
 namespace SharpLensMcp;
 
 // check_architecture: enforce dependency rules like {from: "MyApp.Domain*",
-// deny: "MyApp.Infrastructure*"} over the real type-dependency graph (the
-// same collector find_god_objects uses, with one representative syntax
-// location per edge). Read-only: reports violations, changes nothing.
+// deny: "MyApp.Infrastructure*"} over the real type-dependency graph (the same collector
+// find_god_objects uses, CollectTypeDependencyEdgesAsync: every type-to-type edge of a
+// type's own declaration, with one representative syntax location per edge). Each source
+// type is checked once, a multi-targeted project's types under the project's plain name.
+// Violations are listed by source type, then target type. Read-only: reports
+// violations, changes nothing.
 public partial class RoslynService
 {
     public async Task<object> CheckArchitectureAsync(
@@ -33,12 +36,17 @@ public partial class RoslynService
                 context: new { level });
         }
 
-        // Every source type in the solution, remembering which project each
-        // came from (needed for project-level rules; a multi-targeted type
-        // keeps its first project).
+        // Every source type in the solution, remembering which logical project declares
+        // it (needed for project-level rules). Keyed by cross-compilation identity: an
+        // edge target is the type as its SOURCE's compilation binds it, which for a type
+        // from another project is a distinct (retargeted) instance of the same
+        // declaration, and must still resolve to its declaring project. A multi-targeted
+        // project's types are collected once per target framework (each compiles its own
+        // #if branches) and merge into one source type.
+        var logicalProjects = GetLogicalProjects();
         var allTypes = new List<INamedTypeSymbol>();
-        var projectOf = new Dictionary<INamedTypeSymbol, string>(SymbolEqualityComparer.Default);
-        foreach (var project in _solution!.Projects)
+        var projectOf = new Dictionary<INamedTypeSymbol, string>(CrossCompilationSymbolComparer.Instance);
+        foreach (var project in logicalProjects.Projects.SelectMany(p => p.Projects))
         {
             var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
@@ -46,10 +54,8 @@ public partial class RoslynService
             {
                 if (!type.Locations.Any(l => l.IsInSource)) continue;
                 if (!SymbolEqualityComparer.Default.Equals(type.ContainingAssembly, compilation.Assembly)) continue;
-                var key = (INamedTypeSymbol)type.OriginalDefinition;
-                if (projectOf.ContainsKey(key)) continue;
                 allTypes.Add(type);
-                projectOf[key] = project.Name;
+                projectOf.TryAdd((INamedTypeSymbol)type.OriginalDefinition, logicalProjects.Of(project).Name);
             }
         }
 
@@ -61,7 +67,7 @@ public partial class RoslynService
             ? projectOf.GetValueOrDefault((INamedTypeSymbol)type.OriginalDefinition, type.ContainingAssembly?.Name ?? "")
             : type.ContainingNamespace?.ToDisplayString() ?? "";
 
-        var violations = new List<object>();
+        var violations = new List<(string fromType, string toType, ArchitectureRule rule, Location? location)>();
         var edgesChecked = 0;
         foreach (var (source, outbound) in edges)
         {
@@ -70,27 +76,30 @@ public partial class RoslynService
             {
                 edgesChecked++;
                 var targetScope = ScopeOf(target);
-                foreach (var rule in rules)
-                {
-                    if (!MatchesGlobPattern(sourceScope, rule.From)) continue;
-                    if (!MatchesGlobPattern(targetScope, rule.Deny)) continue;
-                    violations.Add(new
-                    {
-                        fromType = source.ToDisplayString(),
-                        toType = target.ToDisplayString(),
-                        rule = new { from = rule.From, deny = rule.Deny },
-                        location = location is { } loc && loc.IsInSource
-                            ? new
-                            {
-                                filePath = FormatPath(loc.GetLineSpan().Path),
-                                line = loc.GetLineSpan().StartLinePosition.Line
-                            }
-                            : null as object
-                    });
-                    break; // one violation entry per edge, first matching rule
-                }
+                var rule = rules.FirstOrDefault(r =>
+                    MatchesGlobPattern(sourceScope, r.From) && MatchesGlobPattern(targetScope, r.Deny));
+                // One violation entry per edge, the first matching rule.
+                if (rule != null) violations.Add((source.ToDisplayString(), target.ToDisplayString(), rule, location));
             }
         }
+
+        var ordered = violations
+            .OrderBy(v => v.fromType, StringComparer.Ordinal)
+            .ThenBy(v => v.toType, StringComparer.Ordinal)
+            .Select(v => new
+            {
+                fromType = v.fromType,
+                toType = v.toType,
+                rule = new { from = v.rule.From, deny = v.rule.Deny },
+                location = v.location is { IsInSource: true } loc
+                    ? new
+                    {
+                        filePath = FormatPath(loc.GetLineSpan().Path),
+                        line = loc.GetLineSpan().StartLinePosition.Line
+                    }
+                    : null as object
+            })
+            .ToList();
 
         return CreateSuccessResponse(
             data: new
@@ -98,17 +107,16 @@ public partial class RoslynService
                 level = normalizedLevel,
                 rulesEvaluated = rules.Count,
                 edgesChecked,
-                violationCount = violations.Count,
-                violations
+                violationCount = ordered.Count,
+                violations = ordered
             },
-            suggestedNextTools: violations.Count > 0
+            ResultCounts.Complete(ordered.Count),
+            suggestedNextTools: ordered.Count > 0
                 ? new[]
                 {
                     "find_references on a violating fromType to map the full dependency",
                     "Introduce an abstraction in the allowed layer and invert the dependency"
                 }
-                : new[] { "No violations: the dependency rules hold" },
-            totalCount: violations.Count,
-            returnedCount: violations.Count);
+                : new[] { "No violations: the dependency rules hold" });
     }
 }

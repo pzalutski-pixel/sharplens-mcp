@@ -86,12 +86,13 @@ public class StdioIntegrationTests
                 "the tools/list response over the real stdio pipe must match the golden snapshot exactly; " +
                 $"live count {liveTools.Count()}, golden count {goldenTools.Count()}");
 
-            // 3. health_check: DOTNET_SOLUTION_PATH auto-load must have worked.
+            // 3. health_check: DOTNET_SOLUTION_PATH auto-load must have worked. The load runs
+            // beside the request loop; a tools/call waits for it to finish.
             var health = ParseInner(await RoundTripAsync(process,
                 """{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"health_check","arguments":{} } }"""));
             health["success"]!.Value<bool>().Should().BeTrue($"health_check must succeed; got {health}");
             health["data"]!["solution"]!["loaded"]!.Value<bool>().Should().BeTrue(
-                "the solution must auto-load from DOTNET_SOLUTION_PATH before the first request is served");
+                "the first tools/call must see the solution auto-loaded from DOTNET_SOLUTION_PATH");
             health["data"]!["solution"]!["projects"]!.Value<int>().Should().Be(3);
 
             // 4. A representative query tool end-to-end.
@@ -151,8 +152,8 @@ public class StdioIntegrationTests
             var deps = ParseInner(await RoundTripAsync(process,
                 """{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"find_unused_dependencies","arguments":{"projectName":"SharpLensMcp"} } }"""));
             deps["success"]!.Value<bool>().Should().BeTrue($"find_unused_dependencies must succeed; got {deps}");
-            (deps["data"]!["projects"] as JArray)![0]["packagesChecked"]!.Value<int>().Should().Be(7,
-                "the src csproj declares exactly seven PackageReference entries");
+            (deps["data"]!["projects"] as JArray)![0]["packagesChecked"]!.Value<int>().Should().Be(8,
+                "the src csproj declares exactly eight PackageReference entries");
 
             // 7. EOF on stdin → clean shutdown.
             process.StandardInput.Close();
@@ -173,7 +174,7 @@ public class StdioIntegrationTests
 
     // Writes one request line and reads exactly one response line, asserting
     // stdout purity: the line must parse as a JSON-RPC envelope. The first
-    // round-trip absorbs the startup solution load, so the read timeout is
+    // tools/call absorbs the startup solution load, so the read timeout is
     // generous for cold CI machines.
     private static async Task<JObject> RoundTripAsync(Process process, string requestJson)
     {

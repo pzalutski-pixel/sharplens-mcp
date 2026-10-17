@@ -467,10 +467,11 @@ public class IncompleteDisposable : IDisposable
         // POSITIVE case for the InlineVariable wrapper. Target GreetingFor's
         // `var temp = "Hello, " + name; return temp;` — Roslyn's InlineTemporary
         // refactoring substitutes temp's initializer at the return site.
-        var searchResult = await Service.SearchSymbolsAsync("GreetingFor", kind: "Method", maxResults: 10);
+        var searchResult = await Service.SearchSymbolsAsync("GreetingFor", kind: "Method", maxResults: 50);
         var symbols = GetData(searchResult)["results"] as JArray;
         symbols.Should().NotBeNullOrEmpty();
-        var loc = symbols![0]["location"]!;
+        var loc = symbols!.First(s =>
+            s["containingType"]!.Value<string>()!.Contains("RefactoringTarget"))["location"]!;
         var file = loc["filePath"]!.Value<string>()!;
         var absoluteFile = Path.Combine(Path.GetDirectoryName(SolutionPath)!, file);
 
@@ -518,7 +519,7 @@ public class IncompleteDisposable : IDisposable
         // POSITIVE case for the ExtractVariable wrapper. Target the `a * 2 + 7`
         // expression in Compute → Roslyn's IntroduceVariable refactoring extracts
         // it to a local.
-        var searchResult = await Service.SearchSymbolsAsync("Compute", kind: "Method", maxResults: 10);
+        var searchResult = await Service.SearchSymbolsAsync("Compute", kind: "Method", maxResults: 500);
         var symbols = GetData(searchResult)["results"] as JArray;
         var compute = symbols!.First(s =>
             s["containingType"]?.Value<string>()?.Contains("RefactoringTarget") == true);

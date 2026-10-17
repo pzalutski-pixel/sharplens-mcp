@@ -105,10 +105,11 @@ namespace Production
         var service = new RoslynService();
         service.LoadFromWorkspaceForTesting(workspace);
 
-        // File scope: the constructor entry reports its real parameter count, not 0.
+        // File scope: the constructor entry — named by its type, as C# declares it — reports
+        // its real parameter count, not 0.
         var fileJson = JObject.FromObject(await service.GetComplexityMetricsAsync(document.FilePath!));
         var ctor = (fileJson["data"]!["methods"] as JArray)!
-            .Single(m => m["name"]!.Value<string>() == ".ctor")["metrics"]!;
+            .Single(m => m["name"]!.Value<string>() == "WithCtor")["metrics"]!;
         ctor["parameters"]!.Value<int>().Should().Be(2, "the constructor declares two parameters");
 
         // Cursor on the constructor: the position path analyzes it, not SymbolNotFound.

@@ -41,7 +41,10 @@ namespace Demo
         JObject.FromObject(result)["success"]!.Value<bool>().Should().BeTrue(JObject.FromObject(result).ToString());
 
         var applied = (await workspace.CurrentSolution.GetDocument(document.Id)!.GetTextAsync()).ToString();
-        applied.Should().Contain("5.Add(1,2,default)", "the two existing args stay aligned; one new arg is appended");
+        applied.Should().Be(code
+            .Replace("Add(this int self, int a, int b)", "Add(this int self, int a, int b, int c)")
+            .Replace("5.Add(1, 2)", "5.Add(1, 2, default)"),
+            "the two existing args stay aligned; one new arg is appended");
 
         var compilation = await workspace.CurrentSolution.Projects.Single().GetCompilationAsync();
         compilation!.GetDiagnostics()

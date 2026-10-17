@@ -2,33 +2,118 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Text;
+using System.Text;
 
 namespace SharpLensMcp;
 
-// Code-validation tools: standalone-compile check and type-compatibility check.
+// Code-validation tools: snippet compile check and type-compatibility check.
 public partial class RoslynService
 {
-    // References for a standalone/no-context validation compilation. The richest
-    // project's reference set (most likely to resolve a snippet's types) is chosen
-    // deterministically, rather than the arbitrary first project in the solution.
-    private IReadOnlyList<MetadataReference> StandaloneValidationReferences() =>
+    // The project a snippet without a context file compiles as a new file of: the one
+    // with the most references (the most likely to resolve a snippet's types), by name on
+    // a tie — chosen deterministically, and the single source of the references, language
+    // version, preprocessor symbols, compilation options and global usings.
+    private Project ValidationReferenceProject() =>
         _solution!.Projects
             .OrderByDescending(p => p.MetadataReferences.Count)
             .ThenBy(p => p.Name, StringComparer.Ordinal)
-            .First()
-            .MetadataReferences.ToList();
+            .First();
 
-    // The language version the loaded projects parse at, used so standalone
-    // validation matches what they would accept. Falls back to the compiler default
-    // when no project declares one explicitly.
-    private LanguageVersion SolutionLanguageVersion() =>
-        _solution!.Projects
-            .Select(p => (p.ParseOptions as CSharpParseOptions)?.LanguageVersion)
-            .FirstOrDefault(v => v != null) ?? LanguageVersion.Default;
+    // A compilation of the tree as a new file of the project: the project's references and
+    // compilation options (nullable context, unsafe code, ...) as a library, and its global
+    // using directives — but none of its other source.
+    private async Task<Compilation> NewFileCompilationAsync(Project project, SyntaxTree tree, CancellationToken cancellationToken)
+    {
+        var projectCompilation = await GetProjectCompilationAsync(project, cancellationToken);
+        var options = ((projectCompilation?.Options as CSharpCompilationOptions) ?? new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary))
+            .WithOutputKind(OutputKind.DynamicallyLinkedLibrary);
+        var trees = new List<SyntaxTree> { tree };
+        if (projectCompilation != null)
+        {
+            var globalUsings = new StringBuilder();
+            foreach (var projectTree in projectCompilation.SyntaxTrees)
+            {
+                if (await projectTree.GetRootAsync(cancellationToken) is not CompilationUnitSyntax unit) continue;
+                foreach (var directive in unit.Usings.Where(u => u.GlobalKeyword.IsKind(SyntaxKind.GlobalKeyword)))
+                {
+                    globalUsings.AppendLine(directive.WithoutTrivia().ToFullString());
+                }
+            }
+            if (globalUsings.Length > 0)
+            {
+                trees.Add(CSharpSyntaxTree.ParseText(globalUsings.ToString(), (CSharpParseOptions)tree.Options,
+                    path: "ValidationGlobalUsings.g.cs", cancellationToken: cancellationToken));
+            }
+        }
+        return CSharpCompilation.Create("ValidationAssembly", trees, projectCompilation?.References ?? project.MetadataReferences, options);
+    }
+
+    // The fully-qualified names (with generic arity) of the types a file declares, nested
+    // types included: what decides whether a complete-file snippet is a new version of its
+    // context file (it redeclares one of the file's types) or a new file beside it.
+    private static HashSet<string> DeclaredTypeNames(SyntaxNode root)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var declaration in root.DescendantNodes().OfType<MemberDeclarationSyntax>())
+        {
+            var (identifier, arity) = declaration switch
+            {
+                TypeDeclarationSyntax type => (type.Identifier.ValueText, type.Arity),
+                EnumDeclarationSyntax @enum => (@enum.Identifier.ValueText, 0),
+                DelegateDeclarationSyntax @delegate => (@delegate.Identifier.ValueText, @delegate.Arity),
+                _ => ((string?)null, 0)
+            };
+            if (identifier == null) continue;
+            var qualifiers = declaration.Ancestors().Select(ancestor => ancestor switch
+            {
+                BaseNamespaceDeclarationSyntax ns => ns.Name.ToString(),
+                TypeDeclarationSyntax outer => $"{outer.Identifier.ValueText}`{outer.Arity}",
+                _ => null
+            }).OfType<string>().Reverse();
+            names.Add(string.Join(".", qualifiers.Append($"{identifier}`{arity}")));
+        }
+        return names;
+    }
+
+    // What a snippet is: a complete file (namespace or type declarations), else statements
+    // when it parses as statements, else members when it parses as class members, else
+    // statements (whose errors then describe the snippet).
+    private static SnippetShape ClassifySnippet(string code, CSharpParseOptions parseOptions)
+    {
+        var probe = CSharpSyntaxTree.ParseText(code, parseOptions);
+        if (probe.GetRoot() is CompilationUnitSyntax unit
+            && unit.Members.Any(m => m is BaseNamespaceDeclarationSyntax or BaseTypeDeclarationSyntax or DelegateDeclarationSyntax))
+        {
+            return SnippetShape.CompleteFile;
+        }
+        if (!SyntaxFactory.ParseStatement("{\n" + code + "\n}", options: parseOptions).GetDiagnostics()
+                .Any(d => d.Severity == DiagnosticSeverity.Error))
+        {
+            return SnippetShape.Statements;
+        }
+        var members = CSharpSyntaxTree.ParseText("class ValidationProbe {\n" + code + "\n}", parseOptions);
+        return members.GetDiagnostics().Any(d => d.Severity == DiagnosticSeverity.Error)
+            ? SnippetShape.Statements
+            : SnippetShape.Members;
+    }
+
+    // The scaffold around a statement or member snippet: the text before it (ending with
+    // the indentation of its first line) and after it. fileUsings go before the namespace,
+    // namespaceUsings inside it.
+    private static (string Prefix, string Suffix) SnippetWrapper(
+        SnippetShape shape, string fileUsings, string namespaceName, string namespaceUsings = "") =>
+        shape == SnippetShape.Members
+            ? ($"{fileUsings}\nnamespace {namespaceName} {{\n{namespaceUsings}    public class ValidationClass {{\n        ",
+               "\n    }\n}")
+            : ($"{fileUsings}\nnamespace {namespaceName} {{\n{namespaceUsings}    public class ValidationClass {{\n        public void ValidationMethod() {{\n            ",
+               "\n        }\n    }\n}");
+
+    // The usings a snippet without a context file gets, inside its namespace.
+    private const string CommonNamespaceUsings = "    using System;\n    using System.Collections.Generic;\n    using System.Linq;\n";
 
     // Locate a type by its canonical fully-qualified name within a compilation —
     // source declarations AND referenced metadata, merged in the global namespace.
-    // The name is already disambiguated by FindTypeByNameAsync, so this is an exact
+    // The name is already disambiguated by ResolveTypeByNameAsync, so this is an exact
     // match (no contains/first-wins guesswork).
     private static INamedTypeSymbol? FindTypeByFqn(Compilation compilation, string fullyQualifiedName)
     {
@@ -48,10 +133,9 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
-        // Standalone validation sources its metadata references from the richest loaded
-        // project; with no projects at all there are none to draw from. Report that
-        // directly instead of letting StandaloneValidationReferences().First() throw and
-        // surface as a misleading "Check syntax" error.
+        // A snippet compiles in a project of the solution; with no projects at all there is
+        // none to compile in. Report that directly instead of letting
+        // ValidationReferenceProject() throw and surface as a misleading "Check syntax" error.
         if (!_solution!.Projects.Any())
         {
             return CreateErrorResponse(
@@ -63,8 +147,11 @@ public partial class RoslynService
 
         try
         {
-            SyntaxTree syntaxTree;
-            Compilation compilation;
+            // The compilations to check — one per target framework that compiles the
+            // context file, else one of the reference project — each with the tree that
+            // holds the snippet.
+            var checks = new List<(Compilation Compilation, SyntaxTree Tree)>();
+            Project contextProject;
             // Lines the wrapper scaffold adds before the user's snippet; subtracted
             // from diagnostic positions so reported lines map to the snippet itself.
             var snippetLineOffset = 0;
@@ -72,29 +159,10 @@ public partial class RoslynService
             // diagnostic on the snippet's first line maps its column back too.
             var snippetColumnOffset = 0;
 
-            if (standalone)
+            if (!standalone && !string.IsNullOrEmpty(contextFilePath))
             {
-                // Treat as complete file, parsed at the loaded solution's language
-                // version so the snippet is held to the same syntax the real projects
-                // accept rather than the newest the compiler understands.
-                syntaxTree = CSharpSyntaxTree.ParseText(code, new CSharpParseOptions(SolutionLanguageVersion()));
-                var references = StandaloneValidationReferences();
-                compilation = CSharpCompilation.Create(
-                    "ValidationAssembly",
-                    new[] { syntaxTree },
-                    references,
-                    new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)
-                );
-            }
-            else if (!string.IsNullOrEmpty(contextFilePath))
-            {
-                // Inject into context of existing file
-                Document document;
-                try
-                {
-                    document = await GetDocumentAsync(contextFilePath);
-                }
-                catch (FileNotFoundException)
+                var document = TryFindDocument(contextFilePath);
+                if (document == null)
                 {
                     return CreateErrorResponse(
                         ErrorCodes.FileNotInSolution,
@@ -103,78 +171,77 @@ public partial class RoslynService
                         context: new { contextFilePath }
                     );
                 }
+                contextProject = document.Project;
 
-                var project = document.Project;
-                // The snippet must parse with the PROJECT's language version:
-                // mixing a default-parsed (Latest) tree into a compilation whose
-                // trees carry the project's LangVersion throws "Inconsistent
-                // language versions" from AddSyntaxTrees.
-                var contextParseOptions = project.ParseOptions as CSharpParseOptions
-                    ?? CSharpParseOptions.Default;
-
-                // A snippet that is already a complete file (own usings/
-                // namespace/type declarations) joins the project compilation as
-                // its own tree — wrapping it inside a method body would only
-                // manufacture syntax errors.
-                var probe = CSharpSyntaxTree.ParseText(code, contextParseOptions, cancellationToken: cancellationToken);
-                var probeRoot = await probe.GetRootAsync(cancellationToken) as CompilationUnitSyntax;
-                if (probeRoot != null && probeRoot.Members.Any(
-                        m => m is BaseNamespaceDeclarationSyntax or BaseTypeDeclarationSyntax))
+                foreach (var linked in DocumentsSharingPath(document))
                 {
-                    syntaxTree = probe;
-                }
-                else
-                {
-                    var existingTree = await document.GetSyntaxTreeAsync(cancellationToken);
-                    var existingRoot = await existingTree!.GetRootAsync(cancellationToken) as CompilationUnitSyntax;
+                    // The snippet parses with the PROJECT's parse options: mixing a tree of
+                    // another language version into the compilation throws "Inconsistent
+                    // language versions".
+                    var parseOptions = linked.Project.ParseOptions as CSharpParseOptions ?? CSharpParseOptions.Default;
+                    var projectCompilation = await GetProjectCompilationAsync(linked.Project, cancellationToken);
+                    var contextTree = await linked.GetSyntaxTreeAsync(cancellationToken);
+                    if (projectCompilation == null || contextTree == null) continue;
 
-                    // Get usings from context
-                    var usings = existingRoot?.Usings.ToFullString() ?? "";
-                    var ns = existingRoot?.Members.OfType<BaseNamespaceDeclarationSyntax>().FirstOrDefault();
-                    var nsName = ns?.Name.ToString() ?? "";
+                    var shape = ClassifySnippet(code, parseOptions);
+                    if (shape == SnippetShape.CompleteFile)
+                    {
+                        // A complete file that redeclares a type of the context file is that
+                        // file's new version: it replaces the file in the project, so its types
+                        // do not collide with the version they replace. Any other complete file
+                        // is a new file of the context file's project, compiled beside it.
+                        var snippetTree = CSharpSyntaxTree.ParseText(code, parseOptions, cancellationToken: cancellationToken);
+                        var contextRootForTypes = await contextTree.GetRootAsync(cancellationToken);
+                        var isNewVersion = DeclaredTypeNames(await snippetTree.GetRootAsync(cancellationToken))
+                            .Overlaps(DeclaredTypeNames(contextRootForTypes));
+                        if (isNewVersion && projectCompilation.ContainsSyntaxTree(contextTree))
+                        {
+                            var replacement = CSharpSyntaxTree.ParseText(code, parseOptions, path: contextTree.FilePath, cancellationToken: cancellationToken);
+                            checks.Add((projectCompilation.ReplaceSyntaxTree(contextTree, replacement), replacement));
+                        }
+                        else
+                        {
+                            checks.Add((projectCompilation.AddSyntaxTrees(snippetTree), snippetTree));
+                        }
+                        continue;
+                    }
 
-                    // Wrap code in namespace context
-                    var wrapperPrefix = $@"
-{usings}
-namespace {(string.IsNullOrEmpty(nsName) ? "ValidationNamespace" : nsName)} {{
-    public class ValidationClass {{
-        public void ValidationMethod() {{
-            ";
-                    var wrappedCode = wrapperPrefix + code + @"
-        }
-    }
-}";
-                    snippetLineOffset = wrapperPrefix.Count(c => c == '\n');
-                    snippetColumnOffset = wrapperPrefix.Length - wrapperPrefix.LastIndexOf('\n') - 1;
-                    syntaxTree = CSharpSyntaxTree.ParseText(wrappedCode, contextParseOptions, cancellationToken: cancellationToken);
+                    // Statements or members, wrapped in a class (and method) of the context
+                    // file's namespace, with its usings.
+                    var contextRoot = await contextTree.GetRootAsync(cancellationToken) as CompilationUnitSyntax;
+                    var usings = contextRoot?.Usings.ToFullString() ?? "";
+                    var namespaceName = contextRoot?.Members.OfType<BaseNamespaceDeclarationSyntax>().FirstOrDefault()?.Name.ToString();
+                    var (prefix, suffix) = SnippetWrapper(shape, usings, string.IsNullOrEmpty(namespaceName) ? "ValidationNamespace" : namespaceName);
+                    snippetLineOffset = prefix.Count(c => c == '\n');
+                    snippetColumnOffset = prefix.Length - prefix.LastIndexOf('\n') - 1;
+                    var wrapped = CSharpSyntaxTree.ParseText(prefix + code + suffix, parseOptions, cancellationToken: cancellationToken);
+                    checks.Add((projectCompilation.AddSyntaxTrees(wrapped), wrapped));
                 }
-                compilation = (await GetProjectCompilationAsync(project, cancellationToken))!
-                    .AddSyntaxTrees(syntaxTree);
             }
             else
             {
-                // No context - wrap in minimal class
-                var wrapperPrefix = @"
-using System;
-using System.Collections.Generic;
-using System.Linq;
-
-public class ValidationClass {
-    public void ValidationMethod() {
-        ";
-                var wrappedCode = wrapperPrefix + code + @"
-    }
-}";
-                snippetLineOffset = wrapperPrefix.Count(c => c == '\n');
-                snippetColumnOffset = wrapperPrefix.Length - wrapperPrefix.LastIndexOf('\n') - 1;
-                syntaxTree = CSharpSyntaxTree.ParseText(wrappedCode);
-                var references = StandaloneValidationReferences();
-                compilation = CSharpCompilation.Create(
-                    "ValidationAssembly",
-                    new[] { syntaxTree },
-                    references,
-                    new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)
-                );
+                // A new file of the reference project: the snippet as a complete file
+                // (standalone), or wrapped as statements or members with the common
+                // usings (placed inside the namespace, so they never clash with the
+                // project's global usings).
+                contextProject = ValidationReferenceProject();
+                var parseOptions = contextProject.ParseOptions as CSharpParseOptions ?? CSharpParseOptions.Default;
+                SyntaxTree tree;
+                if (standalone)
+                {
+                    tree = CSharpSyntaxTree.ParseText(code, parseOptions, cancellationToken: cancellationToken);
+                }
+                else
+                {
+                    var shape = ClassifySnippet(code, parseOptions);
+                    var (prefix, suffix) = shape == SnippetShape.CompleteFile
+                        ? ("", "")
+                        : SnippetWrapper(shape, "", "ValidationNamespace", CommonNamespaceUsings);
+                    snippetLineOffset = prefix.Count(c => c == '\n');
+                    snippetColumnOffset = prefix.Length - prefix.LastIndexOf('\n') - 1;
+                    tree = CSharpSyntaxTree.ParseText(prefix + code + suffix, parseOptions, cancellationToken: cancellationToken);
+                }
+                checks.Add((await NewFileCompilationAsync(contextProject, tree, cancellationToken), tree));
             }
 
             // Map a wrapped-file line back to the snippet: subtract the scaffold
@@ -195,33 +262,27 @@ public class ValidationClass {
                 return MapLine(d) == 0 ? Math.Max(0, column - snippetColumnOffset) : column;
             }
 
-            // In context mode the compilation carries the whole project; only
-            // diagnostics located in the validated tree are about the snippet.
-            // Location-less diagnostics (e.g. CS5001 'no Main', analyzer/config errors)
-            // are project-wide, not about the snippet, so they are excluded.
-            var diagnostics = compilation.GetDiagnostics(cancellationToken)
-                .Where(d => d.Location.SourceTree == syntaxTree)
-                .ToList();
+            // The compilation carries the project; only diagnostics located in the
+            // validated tree are about the snippet. Location-less diagnostics (e.g.
+            // CS5001 'no Main', analyzer/config errors) are project-wide, not about the
+            // snippet, so they are excluded. A diagnostic every target framework reports
+            // is listed once.
+            var diagnostics = new List<(string Id, string Message, int Line, int Column, DiagnosticSeverity Severity)>();
+            foreach (var (compilation, tree) in checks)
+            {
+                foreach (var d in compilation.GetDiagnostics(cancellationToken).Where(d => d.Location.SourceTree == tree))
+                {
+                    var entry = (d.Id, d.GetMessage(), MapLine(d), MapColumn(d), d.Severity);
+                    if (!diagnostics.Contains(entry)) diagnostics.Add(entry);
+                }
+            }
             var errors = diagnostics
                 .Where(d => d.Severity == DiagnosticSeverity.Error)
-                .Select(d => new
-                {
-                    id = d.Id,
-                    message = d.GetMessage(),
-                    line = MapLine(d),
-                    column = MapColumn(d)
-                })
+                .Select(d => new { id = d.Id, message = d.Message, line = d.Line, column = d.Column })
                 .ToList();
-
             var warnings = diagnostics
                 .Where(d => d.Severity == DiagnosticSeverity.Warning)
-                .Select(d => new
-                {
-                    id = d.Id,
-                    message = d.GetMessage(),
-                    line = MapLine(d),
-                    column = MapColumn(d)
-                })
+                .Select(d => new { id = d.Id, message = d.Message, line = d.Line, column = d.Column })
                 .ToList();
 
             return CreateSuccessResponse(
@@ -230,6 +291,7 @@ public class ValidationClass {
                     compiles = errors.Count == 0,
                     errorCount = errors.Count,
                     warningCount = warnings.Count,
+                    contextProject = GetLogicalProjects().Of(contextProject).Name,
                     errors,
                     warnings
                 },
@@ -265,10 +327,12 @@ public class ValidationClass {
 
         // Resolve each name to a canonical type up front through the shared,
         // ambiguity-aware resolver — a name matching several distinct types errors
-        // here instead of being silently resolved to an arbitrary first match.
-        var (sourceSymbol, sourceError) = await FindTypeByNameAsync(sourceType, cancellationToken);
-        if (sourceError != null) return sourceError;
-        if (sourceSymbol == null)
+        // here instead of being silently resolved to an arbitrary first match. A name
+        // resolved to a source type that shadows same-named framework types is disclosed
+        // in notice.
+        var sourceResolution = await ResolveTypeByNameAsync(sourceType, cancellationToken);
+        if (sourceResolution.Error != null) return sourceResolution.Error;
+        if (sourceResolution.Type is not { } sourceSymbol)
         {
             return CreateErrorResponse(
                 ErrorCodes.TypeNotFound,
@@ -276,9 +340,9 @@ public class ValidationClass {
                 hint: "Use fully qualified name or check spelling",
                 context: new { sourceType });
         }
-        var (targetSymbol, targetError) = await FindTypeByNameAsync(targetType, cancellationToken);
-        if (targetError != null) return targetError;
-        if (targetSymbol == null)
+        var targetResolution = await ResolveTypeByNameAsync(targetType, cancellationToken);
+        if (targetResolution.Error != null) return targetResolution.Error;
+        if (targetResolution.Type is not { } targetSymbol)
         {
             return CreateErrorResponse(
                 ErrorCodes.TypeNotFound,
@@ -286,6 +350,8 @@ public class ValidationClass {
                 hint: "Use fully qualified name or check spelling",
                 context: new { targetType });
         }
+        var notices = new[] { sourceResolution.ShadowNotice, targetResolution.ShadowNotice }.OfType<string>().Distinct().ToList();
+        var notice = notices.Count > 0 ? string.Join(" ", notices) : null;
 
         // ClassifyConversion only gives correct answers for symbols from the SAME
         // compilation — resolving each type from whichever project happens to have
@@ -394,7 +460,8 @@ public class ValidationClass {
                 isReferenceConversion = conversion.IsReference,
                 isNumericConversion = conversion.IsNumeric,
                 isBoxing = conversion.IsBoxing,
-                isUnboxing = conversion.IsUnboxing
+                isUnboxing = conversion.IsUnboxing,
+                notice
             },
             suggestedNextTools: new[]
             {

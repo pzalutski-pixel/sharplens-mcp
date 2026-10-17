@@ -4,9 +4,10 @@ using Xunit;
 
 namespace SharpLensMcp.Tests;
 
-// find_naming_violations must not flag primary-constructor parameters (records and
-// C# 12 classes/structs) as camelCase violations — they follow PascalCase because
-// they seed or become properties. A regular constructor parameter still must.
+// find_naming_violations treats primary-constructor parameters as the compiler's IDE1006
+// does: a record's are not checked (they are the names of its positional properties), a
+// C# 12 class's are parameters like any other and follow the camelCase parameter rule —
+// as does a regular constructor's.
 public class FindNamingViolationsPrimaryConstructorTests
 {
     private const string Code = @"
@@ -22,7 +23,7 @@ namespace Demo
 }";
 
     [Fact]
-    public async Task PrimaryConstructorParameters_AreNotFlagged_RegularCtorParamIs()
+    public async Task RecordParameters_AreNotFlagged_ClassPrimaryAndRegularCtorParamsAre()
     {
         var (workspace, _) = TestHelpers.CreateWorkspaceWithCode(Code, "Primary.cs");
         var service = new RoslynService();
@@ -32,11 +33,8 @@ namespace Demo
         var symbols = (data["violations"] as JArray)!
             .Select(v => v["symbol"]!.Value<string>()!).ToList();
 
-        symbols.Should().Contain(s => s.Contains("BadParam"),
-            "a regular constructor parameter in PascalCase still violates the camelCase rule");
-        symbols.Should().NotContain(s => s.Contains("TotalAmount"),
-            "a record's primary-constructor parameter follows PascalCase and is not a violation");
-        symbols.Should().NotContain(s => s.Contains("InitialValue"),
-            "a C# 12 class's primary-constructor parameter follows PascalCase and is not a violation");
+        symbols.Should().Equal(
+            "Demo.Box.Box(int) parameter 'InitialValue'",
+            "Demo.Regular.Regular(int) parameter 'BadParam'");
     }
 }

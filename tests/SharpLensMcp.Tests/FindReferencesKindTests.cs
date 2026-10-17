@@ -126,21 +126,17 @@ public class FindReferencesKindTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task FindReferences_WithUnknownKindFilter_ReturnsEmptyButReportsTrueTotal()
+    public async Task FindReferences_WithUnknownKindFilter_IsInvalidParameter()
     {
+        // An unknown kind is a caller error naming the accepted kinds, never an empty
+        // "no such references" success.
         var (file, line, col) = await LocateAsync("TrackedField", kind: "Field");
         var result = await Service.FindReferencesAsync(file, line, col, maxResults: null, kindFilter: "no-such-kind");
-        AssertSuccess(result);
+        AssertError(result, ErrorCodes.InvalidParameter);
 
-        var data = GetData(result);
-        var refs = data["references"] as JArray;
-        refs.Should().NotBeNull();
-        refs!.Count.Should().Be(0, "no reference has the kind 'no-such-kind'");
-
-        data["totalReferencesAfterFilter"].Should().NotBeNull();
-        data["totalReferencesAfterFilter"]!.Value<int>().Should().Be(0);
-        data["totalReferences"].Should().NotBeNull();
-        data["totalReferences"]!.Value<int>().Should().BeGreaterThan(0,
-            "unfiltered total must still reflect all real references");
+        var error = JObject.FromObject(result)["error"]!;
+        error["Context"]!["parameter"]!.Value<string>().Should().Be("kind");
+        error["Context"]!["allowedValues"]!.Values<string>().Should().Equal(
+            "write", "invocation", "cast", "typeof", "nameof", "attribute", "read");
     }
 }

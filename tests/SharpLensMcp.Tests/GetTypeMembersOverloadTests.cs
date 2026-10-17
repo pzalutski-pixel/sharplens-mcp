@@ -69,10 +69,10 @@ namespace Production
         var label = members.Single(m => m["name"]!.Value<string>() == "Label");
         label["overloadCount"].Should().BeNull();
 
-        // totalMembers counts name+kind groups: Ping (collapsed), Solo, Label,
-        // and Label's get_Label/set_Label accessors, which GetMembers() surfaces
-        // as declared method symbols.
-        data["totalMembers"]!.Value<int>().Should().Be(5);
+        // totalMembers counts name+kind groups: Ping (collapsed), Solo, Label. The
+        // property's get_Label/set_Label accessors are represented by Label and never
+        // listed as members of their own.
+        data["totalMembers"]!.Value<int>().Should().Be(3);
     }
 
     [Fact]

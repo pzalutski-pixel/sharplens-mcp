@@ -288,9 +288,9 @@ public partial class RoslynService
             );
         }
 
-        var (type, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
-        if (ambiguousType != null) return ambiguousType;
-        if (type == null)
+        var resolution = await ResolveTypeByNameAsync(typeName, cancellationToken);
+        if (resolution.Error != null) return resolution.Error;
+        if (resolution.Type is not { } type)
         {
             return CreateErrorResponse(
                 ErrorCodes.TypeNotFound,
@@ -299,26 +299,31 @@ public partial class RoslynService
             );
         }
 
-        // Base type chain (first 3)
+        // The base-class chain, nearest first, below the roots every type of its kind
+        // derives from (object, ValueType, Enum, Delegate, MulticastDelegate); the count
+        // is the length of exactly this list.
         var baseTypes = new List<string>();
-        var currentBase = type.BaseType;
-        var count = 0;
-        while (currentBase != null && currentBase.SpecialType != SpecialType.System_Object && count < 3)
+        for (var currentBase = type.TypeKind == TypeKind.Interface ? null : type.BaseType;
+             currentBase != null && currentBase.SpecialType is not (SpecialType.System_Object or SpecialType.System_ValueType
+                 or SpecialType.System_Enum or SpecialType.System_Delegate or SpecialType.System_MulticastDelegate);
+             currentBase = currentBase.BaseType)
         {
             baseTypes.Add(currentBase.ToDisplayString());
-            currentBase = currentBase.BaseType;
-            count++;
         }
 
-        // Member counts
-        var members = type.GetMembers().Where(m => !m.IsImplicitlyDeclared).ToList();
+        // Member counts over the members every member-listing tool lists, by kind.
+        var listed = UserVisibleMembers.Of(type, includeInherited: false);
+        int Count(MemberKind kind) => listed.Count(m => m.Kind == kind);
         var memberSummary = new
         {
-            methods = members.OfType<IMethodSymbol>().Count(m => m.MethodKind == MethodKind.Ordinary),
-            properties = members.OfType<IPropertySymbol>().Count(),
-            fields = members.OfType<IFieldSymbol>().Count(),
-            events = members.OfType<IEventSymbol>().Count(),
-            constructors = members.OfType<IMethodSymbol>().Count(m => m.MethodKind == MethodKind.Constructor)
+            methods = Count(MemberKind.Method),
+            properties = Count(MemberKind.Property),
+            fields = Count(MemberKind.Field),
+            events = Count(MemberKind.Event),
+            constructors = Count(MemberKind.Constructor),
+            indexers = Count(MemberKind.Indexer),
+            operators = Count(MemberKind.Operator) + Count(MemberKind.Conversion),
+            nestedTypes = Count(MemberKind.NestedType)
         };
 
         return CreateSuccessResponse(
@@ -332,10 +337,11 @@ public partial class RoslynService
                 isSealed = type.IsSealed,
                 isStatic = type.IsStatic,
                 baseTypes,
-                baseTypeCount = type.BaseType != null ? baseTypes.Count + (currentBase != null ? 1 : 0) : 0,
+                baseTypeCount = baseTypes.Count,
                 interfaceCount = type.AllInterfaces.Length,
                 memberSummary,
-                location = GetSymbolLocation(type)
+                location = GetSymbolLocation(type),
+                notice = resolution.ShadowNotice
             },
             suggestedNextTools: new[]
             {
@@ -369,56 +375,21 @@ public partial class RoslynService
                 "typeName and methodName are required"
             );
         }
+        if (ParameterValidation.Limit("maxCallers", maxCallers, 1000) is { } maxCallersError) return CreateErrorResponse(maxCallersError);
+        if (ParameterValidation.Limit("maxOutgoingCalls", maxOutgoingCalls, 1000) is { } maxOutgoingError) return CreateErrorResponse(maxOutgoingError);
 
-        var (type, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
-        if (ambiguousType != null) return ambiguousType;
-        if (type == null)
+        // The member the name denotes in the canonical overload order every tool's
+        // overloadIndex refers to; an overloaded name without overloadIndex is refused
+        // with the candidates.
+        var resolution = await ResolveMemberByNameAsync(typeName, methodName, overloadIndex, cancellationToken);
+        if (resolution.Symbol is not { } symbol) return resolution.Error!;
+        if (symbol is not IMethodSymbol method)
         {
             return CreateErrorResponse(
-                ErrorCodes.TypeNotFound,
-                $"Type '{typeName}' not found"
-            );
-        }
-
-        var overloads = type.GetMembers(methodName).OfType<IMethodSymbol>().ToList();
-        if (overloads.Count == 0)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                $"Method '{methodName}' not found on type '{type.Name}'"
-            );
-        }
-
-        IMethodSymbol method;
-        if (overloadIndex.HasValue)
-        {
-            if (overloadIndex.Value < 0 || overloadIndex.Value >= overloads.Count)
-            {
-                return CreateErrorResponse(
-                    ErrorCodes.InvalidParameter,
-                    $"overloadIndex {overloadIndex.Value} is out of range for '{methodName}' (0..{overloads.Count - 1})",
-                    context: new { overloadIndex = overloadIndex.Value, overloadCount = overloads.Count });
-            }
-            method = overloads[overloadIndex.Value];
-        }
-        else if (overloads.Count > 1)
-        {
-            // Picking the first overload silently analyzes an arbitrary one. Surface
-            // the ambiguity with every signature so the caller can choose by index.
-            return CreateErrorResponse(
-                ErrorCodes.AmbiguousMatch,
-                $"'{methodName}' has {overloads.Count} overloads on '{type.Name}'; pass overloadIndex to choose one",
-                hint: "overloadIndex is 0-based, matching the listed order",
-                context: new
-                {
-                    overloads = overloads
-                        .Select((o, i) => new { index = i, signature = o.ToDisplayString() })
-                        .ToList()
-                });
-        }
-        else
-        {
-            method = overloads[0];
+                ErrorCodes.NotAMethod,
+                $"'{symbol.ToDisplayString()}' is not a method",
+                hint: "analyze_method analyzes methods, constructors and operators; use get_symbol_info for other members.",
+                context: new { typeName, methodName, kind = symbol.Kind.ToString() });
         }
 
         // Get signature details
@@ -503,17 +474,14 @@ public partial class RoslynService
             }
         }
 
-        // Get outgoing calls if requested — via the shared collector so this list
-        // matches get_outgoing_calls/get_call_graph (symbol-equality dedup,
-        // qualified + unqualified property references).
+        // Get outgoing calls if requested — the direct calls of the shared call model, in
+        // get_outgoing_calls' projection, so the two lists match exactly (depth is null
+        // here — this is a single-hop list, not a depth walk).
         List<object>? outgoingCalls = null;
         var totalOutgoingCalls = 0;
         if (includeOutgoingCalls)
         {
-            var references = await CollectOutgoingReferencesAsync(method, includeProperties: true, cancellationToken);
-            // Shared projection so analyze_method's outgoing calls match get_outgoing_calls
-            // exactly (depth is null here — this is a single-hop list, not a depth walk).
-            var calls = references.Select(reference => BuildOutgoingCall(reference, null)).ToList();
+            var calls = await CollectDirectOutgoingCallsAsync(method, cancellationToken);
 
             totalOutgoingCalls = calls.Count;
             outgoingCalls = calls.Take(maxOutgoingCalls).ToList();
@@ -530,7 +498,8 @@ public partial class RoslynService
                 totalOutgoingCalls,
                 outgoingCallsShown = outgoingCalls?.Count ?? 0,
                 location = GetSymbolLocation(method),
-                overloadCount = type.GetMembers(methodName).OfType<IMethodSymbol>().Count()
+                overloadCount = GetOverloadSet(method, includeInherited: false).Count,
+                notice = resolution.Type?.ShadowNotice
             },
             suggestedNextTools: new[]
             {
@@ -551,13 +520,8 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
-        if (maxMembersPerType is < 1 or > 1000)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"maxMembersPerType must be between 1 and 1000 (got {maxMembersPerType})",
-                context: new { maxMembersPerType });
-        }
+        if (ParameterValidation.Limit("maxMembersPerType", maxMembersPerType, 1000) is { } maxMembersError)
+            return CreateErrorResponse(maxMembersError);
 
         Document document;
         try
@@ -633,7 +597,7 @@ public partial class RoslynService
                     name = symbol?.Name ?? td.Identifier.Text,
                     kind = td.Kind().ToString().Replace("Declaration", ""),
                     line = td.GetLocation().GetLineSpan().StartLinePosition.Line,
-                    memberCount = td.Members.Count,
+                    memberCount = allMembers.Count,
                     members = allMembers.Take(maxMembersPerType).ToList(),
                     membersTruncated = allMembers.Count > maxMembersPerType
                 };

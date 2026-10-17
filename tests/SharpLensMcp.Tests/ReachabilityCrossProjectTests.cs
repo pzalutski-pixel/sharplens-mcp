@@ -75,7 +75,7 @@ public class ReachabilityCrossProjectTests
             var pair = (JObject)((JArray)json["data"]!["pairs"]!)[0];
             pair["reachable"]!.Value<bool>().Should().BeTrue(
                 "the path closes only if the cross-project caller of Sink is found via FindReferences");
-            pair["hopCount"]!.Value<int>().Should().Be(3, "Entry -> Mid -> Sink");
+            pair["hopCount"]!.Value<int>().Should().Be(2, "Entry -> Mid -> Sink is two edges");
             var hops = ((JArray)pair["hops"]!).Select(h => h["symbol"]!.Value<string>()!).ToList();
             hops.First().Should().EndWith("Service.Entry()");
             hops.Last().Should().EndWith("Target.Sink()");

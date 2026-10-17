@@ -47,7 +47,9 @@ public partial class RoslynService
         }
 
         // Interface members this symbol satisfies: explicit first, then implicit
-        // (deduplicated — an explicit implementation also satisfies the member).
+        // (deduplicated — an explicit implementation also satisfies the member). The
+        // implementation the type maps a member to may be the other part of a partial
+        // member, so parts compare as one member.
         var implementsList = new List<object>();
         var seen = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
         foreach (var explicitMember in GetExplicitInterfaceImplementations(symbol))
@@ -66,8 +68,7 @@ public partial class RoslynService
                 foreach (var interfaceMember in iface.GetMembers())
                 {
                     var implementation = containingType.FindImplementationForInterfaceMember(interfaceMember);
-                    if (implementation == null
-                        || !SymbolEqualityComparer.Default.Equals(implementation, symbol)) continue;
+                    if (implementation == null || !SymbolParts.SameMember(implementation, symbol)) continue;
                     if (seen.Add(interfaceMember))
                     {
                         implementsList.Add(DescribeSuperSymbol(interfaceMember));
@@ -82,17 +83,17 @@ public partial class RoslynService
                 symbol = symbol.ToDisplayString(),
                 kind = symbol.Kind.ToString(),
                 overrides,
-                implements = implementsList
+                implements = implementsList,
+                notice = address.TypeResolution?.ShadowNotice
             },
+            ResultCounts.Complete(overrides.Count + implementsList.Count),
             suggestedNextTools: overrides.Count > 0 || implementsList.Count > 0
                 ? new[]
                 {
                     "get_method_source on a base/interface member to read its contract",
                     "get_documentation to see the inherited docs"
                 }
-                : new[] { "This member neither overrides nor implements anything" },
-            totalCount: overrides.Count + implementsList.Count,
-            returnedCount: overrides.Count + implementsList.Count);
+                : new[] { "This member neither overrides nor implements anything" });
     }
 
     private static ISymbol? GetOverriddenSymbol(ISymbol symbol) => symbol switch
@@ -111,26 +112,17 @@ public partial class RoslynService
         _ => Enumerable.Empty<ISymbol>()
     };
 
+    // A base or interface member: its signature, declaring type, and location
+    // ({ filePath, line, column }), or null with inMetadata for a member without source.
     private object DescribeSuperSymbol(ISymbol symbol)
     {
-        var location = symbol.Locations.FirstOrDefault(l => l.IsInSource);
-        if (location != null)
-        {
-            var lineSpan = location.GetLineSpan();
-            return new
-            {
-                signature = symbol.ToDisplayString(),
-                containingType = symbol.ContainingType?.ToDisplayString(),
-                location = new { filePath = FormatPath(lineSpan.Path), line = lineSpan.StartLinePosition.Line, column = lineSpan.StartLinePosition.Character },
-                inMetadata = false
-            };
-        }
+        var location = GetSymbolLocation(symbol);
         return new
         {
             signature = symbol.ToDisplayString(),
             containingType = symbol.ContainingType?.ToDisplayString(),
-            location = (object?)null,
-            inMetadata = true
+            location,
+            inMetadata = location == null
         };
     }
 }

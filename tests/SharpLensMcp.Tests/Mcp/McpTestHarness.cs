@@ -234,7 +234,12 @@ public abstract class McpTestBase
         });
         var results = data["results"] as JArray;
         results.Should().NotBeNullOrEmpty($"search_symbols('{query}') must return at least one result");
-        var match = predicate != null ? results!.FirstOrDefault(predicate) : results![0];
+        // search_symbols matches substrings and sorts by fully-qualified name, so without a
+        // predicate the symbol named exactly `query` is the one meant (the first result
+        // only for a wildcard query, which no name equals).
+        var match = predicate != null
+            ? results!.FirstOrDefault(predicate)
+            : results!.FirstOrDefault(r => r["name"]!.Value<string>() == query) ?? results![0];
         match.Should().NotBeNull($"no result matching predicate for '{query}'");
         var loc = match!["location"]!;
         var rawPath = loc["filePath"]!.Value<string>()!;

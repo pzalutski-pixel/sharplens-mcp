@@ -5,6 +5,7 @@ internal sealed record UntestedCodeData(
     string ProductionProject,
     IReadOnlyList<string> TestProjectsScanned,
     int TestMethodCount,
+    EntryPointCounts EntryPointCounts,
     int ReachableSymbolCount,
     int TotalCount,
     IReadOnlyList<UncoveredSymbolEntry> Symbols);

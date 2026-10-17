@@ -43,17 +43,17 @@ public class NameBasedAddressingTests : RoslynServiceTestBase
         byNameData["symbolKind"]!.Value<string>().Should().Be("Method");
 
         // The fixture declares the method and calls it once from the same file —
-        // exactly one changed file. The diff may merge the two nearby edits into
-        // one text-change chunk, so count the renamed occurrences in the emitted
-        // newText instead of the chunk count: declaration + call site = 2.
+        // exactly one changed file with two minimal edits, the declaration and the
+        // CallUniqueComputeValue call site. Each replaces only the differing part:
+        // "UniqueComputeValue" -> "RenamedComputeValue" shares the "ComputeValue" suffix.
         var changes = byNameData["changes"] as JArray;
         changes.Should().NotBeNull();
         changes!.Count.Should().Be(1, "declaration and call site live in the one fixture file");
         changes[0]["filePath"]!.Value<string>().Should().EndWith("NameAddressingFixture.cs");
-        var renamedOccurrences = changes[0]["changes"]!
-            .Sum(c => CountOccurrences(c["newText"]!.Value<string>()!, "RenamedComputeValue"));
-        renamedOccurrences.Should().Be(2,
+        changes[0]["changeCount"]!.Value<int>().Should().Be(2,
             "the rename hits the declaration and the CallUniqueComputeValue call site");
+        changes[0]["changes"]!.Select(c => (c["oldText"]!.Value<string>(), c["newText"]!.Value<string>()))
+            .Should().Equal(("Unique", "Renamed"), ("Unique", "Renamed"));
 
         JToken.DeepEquals(positionalData["changes"], byNameData["changes"]).Should().BeTrue(
             "name-based addressing must resolve to the same symbol the positional call targets");
@@ -299,7 +299,7 @@ public class NameBasedAddressingTests : RoslynServiceTestBase
     {
         var result = await Service.ChangeSignatureAsync(
             null, null, null,
-            changes: new List<SignatureChange>(),
+            changes: new List<SignatureChange> { new() { Action = "add", Name = "extra", Type = "int", DefaultValue = "0" } },
             preview: true,
             typeName: "ChangeSignatureMethodHolder",
             memberName: "Concat");
@@ -307,6 +307,7 @@ public class NameBasedAddressingTests : RoslynServiceTestBase
         var data = GetData(result);
         data["methodName"]!.Value<string>().Should().Be("Concat");
         data["oldSignature"]!.Value<string>().Should().Be("int Concat(int first, int second, int third)");
+        data["newSignature"]!.Value<string>().Should().Be("int Concat(int first, int second, int third, int extra = 0)");
         data["callSitesCount"]!.Value<int>().Should().Be(5,
             "ChangeSignatureFixture invokes Concat five times across its holder methods");
     }
@@ -323,16 +324,5 @@ public class NameBasedAddressingTests : RoslynServiceTestBase
         AssertError(result, ErrorCodes.InvalidParameter);
         var json = JObject.FromObject(result);
         json["error"]!["Message"]!.Value<string>().Should().Contain("requires memberName");
-    }
-
-    private static int CountOccurrences(string text, string value)
-    {
-        var count = 0;
-        for (var i = text.IndexOf(value, StringComparison.Ordinal); i >= 0;
-             i = text.IndexOf(value, i + value.Length, StringComparison.Ordinal))
-        {
-            count++;
-        }
-        return count;
     }
 }

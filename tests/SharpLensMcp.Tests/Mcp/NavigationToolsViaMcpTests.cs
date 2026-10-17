@@ -414,13 +414,13 @@ public class NavigationToolsViaMcpTests : McpTestBase
     {
         var data = await CallAndGetDataAsync("search_symbols", new
         {
-            query = "RoslynService", maxResults = 10
+            query = "RoslynService", maxResults = 100
         });
         var results = (data["results"] as JArray)!;
         results.Should().NotBeEmpty();
         var classEntry = results.FirstOrDefault(r =>
-            r["name"]?.Value<string>() == "RoslynService"
-            && r["kind"]?.Value<string>() == "NamedType");
+            r["name"]!.Value<string>() == "RoslynService"
+            && r["kind"]!.Value<string>() == "Class");
         classEntry.Should().NotBeNull("the class itself must appear among results");
         // RoslynService is a partial class; Roslyn returns one partial as the
         // canonical declaration. Any of them is acceptable as long as the

@@ -66,7 +66,9 @@ public class RoslynServiceHelpersTests
         var service = new RoslynService();
         var graph = new Dictionary<string, List<string>>();
 
-        service.DetectCycles(graph).Should().BeEmpty();
+        var analysis = service.DetectCycles(graph);
+        analysis.Cycles.Should().BeEmpty();
+        analysis.StronglyConnectedComponents.Should().BeEmpty();
     }
 
     [Fact]
@@ -82,7 +84,9 @@ public class RoslynServiceHelpersTests
             ["D"] = new()
         };
 
-        service.DetectCycles(graph).Should().BeEmpty();
+        var analysis = service.DetectCycles(graph);
+        analysis.Cycles.Should().BeEmpty();
+        analysis.StronglyConnectedComponents.Should().BeEmpty();
     }
 
     [Fact]
@@ -96,11 +100,10 @@ public class RoslynServiceHelpersTests
             ["B"] = new() { "A" }
         };
 
-        var cycles = service.DetectCycles(graph);
+        var cycles = service.DetectCycles(graph).Cycles;
         cycles.Should().HaveCount(1);
-        // Per the impl the cycle is reported as
-        // [first-node, ..., back-edge-target, first-node-repeated]. For A→B→A
-        // starting from A, the output is [A, B, A].
+        // A cycle is reported closed, starting at its ordinally smallest node:
+        // A→B→A is [A, B, A].
         cycles[0].Should().Equal("A", "B", "A");
     }
 
@@ -114,9 +117,10 @@ public class RoslynServiceHelpersTests
             ["A"] = new() { "A" }
         };
 
-        var cycles = service.DetectCycles(graph);
-        cycles.Should().HaveCount(1);
-        cycles[0].Should().Equal("A", "A");
+        var analysis = service.DetectCycles(graph);
+        analysis.Cycles.Should().HaveCount(1);
+        analysis.Cycles[0].Should().Equal("A", "A");
+        analysis.StronglyConnectedComponents.Select(c => string.Join(",", c)).Should().Equal("A");
     }
 
     [Fact]
@@ -131,7 +135,7 @@ public class RoslynServiceHelpersTests
             ["C"] = new() { "A" }
         };
 
-        var cycles = service.DetectCycles(graph);
+        var cycles = service.DetectCycles(graph).Cycles;
         cycles.Should().HaveCount(1);
         cycles[0].Should().Equal("A", "B", "C", "A");
     }
@@ -149,8 +153,9 @@ public class RoslynServiceHelpersTests
             ["D"] = new() { "C" }
         };
 
-        var cycles = service.DetectCycles(graph);
-        cycles.Should().HaveCount(2);
+        var analysis = service.DetectCycles(graph);
+        analysis.Cycles.Select(c => string.Join(">", c)).Should().Equal("A>B>A", "C>D>C");
+        analysis.StronglyConnectedComponents.Select(c => string.Join(",", c)).Should().Equal("A,B", "C,D");
     }
 
     [Fact]
@@ -166,7 +171,7 @@ public class RoslynServiceHelpersTests
             ["B"] = new() { "A" }
         };
 
-        var cycles = service.DetectCycles(graph);
+        var cycles = service.DetectCycles(graph).Cycles;
         cycles.Should().HaveCount(1);
         cycles[0].Should().Equal("A", "B", "A");
     }

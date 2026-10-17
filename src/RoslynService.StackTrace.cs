@@ -4,22 +4,47 @@ using System.Text.RegularExpressions;
 
 namespace SharpLensMcp;
 
-// resolve_stack_trace: paste a .NET stack trace, get frames mapped to
-// file/line/symbol with source snippets, compiler name mangling undone.
-// Handles both modern traces (file:line present, async frames already
-// demangled by the runtime) and legacy/mangled shapes: async state machines
-// (Type+<Method>d__N.MoveNext), lambdas (<Method>b__N_M, including
-// <>c/<>c__DisplayClass containers), and local functions
-// (<Method>g__Local|N_M). Frames that resolve to nothing in the solution
-// (BCL, third-party) pass through unmodified with resolved: false.
+// resolve_stack_trace: paste a .NET stack trace, get frames mapped to file/line/symbol
+// with source snippets, compiler name mangling undone. Frame lines are read in the shapes
+// runtimes print them:
+//   - .NET: "at Ns.Type.Method(String s) in path:line N";
+//   - Mono / Unity: "at Ns.Type.Method (System.String s) [0x00000] in path:N";
+//   - localized runtimes: the "at", "in" and "line" words in the runtime's language
+//     ("bei ... in ...:Zeile N", "à ... dans ...:ligne N").
+// A line number too large for an int is no line. Names are demangled: async state
+// machines (Type+<Method>d__N.MoveNext), lambdas and closures (<Method>b__N_M in a "<>c" or
+// "<>c__DisplayClass" container, joined by "+" or "."), async lambdas
+// (<<Method>b__N_M>d.MoveNext), local functions (<Method>g__Local|N_M), demangled iterator
+// frames (Method(args)+MoveNext()), static constructors (Type..cctor), nested types
+// (Outer+Inner or Outer.Inner) and explicit interface implementations
+// (Type.Ns.IFace.Member). The method is chosen among overloads by generic arity,
+// parameter count and the parameter types the frame names, and by the reported line when
+// the frame carries one. Frames that resolve to nothing in the solution (BCL, third-party)
+// pass through with resolved: false. Each frame carries its type resolution's shadow
+// notice.
 public partial class RoslynService
 {
+    // A frame line in English: "at <signature>[ [0x...]][ in <file>:line <n>]".
     private static readonly Regex StackFrameRegex = new(
-        @"^\s*at\s+(?<sig>.+?)(\s+in\s+(?<file>.+):line\s+(?<line>\d+))?\s*$",
+        @"^\s*at\s+(?<sig>.+?)(?:\s+\[0x[0-9a-fA-F]+\])?(?:\s+in\s+(?<file>.+?):(?:line\s+)?(?<line>\d+))?\s*$",
         RegexOptions.Compiled);
 
+    // A frame line in any language: one leading word, a dotted member name with an
+    // argument list, and optionally an IL offset and "<word> <file>:[<word> ]<n>". The
+    // dotted name and the parentheses keep exception messages from matching.
+    private static readonly Regex LocalizedStackFrameRegex = new(
+        @"^\s*\S+\s+(?<sig>[^\s(]*\.[^\s(.]+\s?\(.*?\)(?:\+MoveNext\(\))?)(?:\s+\[0x[0-9a-fA-F]+\])?(?:\s+\S+\s+(?<file>.+?):(?:[^\s:\\/\d]+\s?)?(?<line>\d+))?\s*$",
+        RegexOptions.Compiled);
+
+    // A demangled iterator frame: "Method(args)+MoveNext()".
+    private static readonly Regex IteratorFrameRegex = new(
+        @"^(?<call>.+\))\+MoveNext\(\)$", RegexOptions.Compiled);
+
     private static readonly Regex AsyncFrameRegex = new(
-        @"^(?<type>.+?)[+.]<(?<method>[^>]+)>d__\d+\.MoveNext$", RegexOptions.Compiled);
+        @"^(?<type>.+?)[+.]<(?<method>[^<>]+)>d(?:__\d+)?\.MoveNext$", RegexOptions.Compiled);
+
+    private static readonly Regex AsyncLambdaFrameRegex = new(
+        @"^(?<prefix>.+?)[+.]<<(?<method>[^<>]+)>b__[\d_]+>d(?:__\d+)?\.MoveNext$", RegexOptions.Compiled);
 
     private static readonly Regex LocalFunctionFrameRegex = new(
         @"^(?<prefix>.+?)[+.]?<(?<method>[^>]+)>g__(?<local>[^|]+)\|[\d_]+$", RegexOptions.Compiled);
@@ -27,8 +52,12 @@ public partial class RoslynService
     private static readonly Regex LambdaFrameRegex = new(
         @"^(?<prefix>.+?)[+.]?<(?<method>[^>]+)>b__[\d_]+$", RegexOptions.Compiled);
 
+    // The compiler's closure containers, "<>c" and "<>c__DisplayClassN_M", in either
+    // spelling of the nesting separator.
     private static readonly Regex CompilerContainerRegex = new(
-        @"\+<>c(__DisplayClass[\d_]+)?", RegexOptions.Compiled);
+        @"[+.]<>c(__DisplayClass[\d_]+)?", RegexOptions.Compiled);
+
+    private const int MaxStackTraceContextLines = 20;
 
     public async Task<object> ResolveStackTraceAsync(
         string stackTrace, int contextLines = 2, CancellationToken cancellationToken = default)
@@ -42,12 +71,9 @@ public partial class RoslynService
                 "stackTrace must contain at least one stack frame line",
                 context: new { });
         }
-        if (contextLines is < 0 or > 20)
+        if (ParameterValidation.Limit("contextLines", contextLines, MaxStackTraceContextLines, minimum: 0) is { } invalid)
         {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"contextLines must be between 0 and 20 (got {contextLines})",
-                context: new { contextLines });
+            return CreateErrorResponse(invalid);
         }
 
         var frames = new List<object>();
@@ -59,6 +85,7 @@ public partial class RoslynService
             if (string.IsNullOrWhiteSpace(line)) continue;
 
             var match = StackFrameRegex.Match(line);
+            if (!match.Success) match = LocalizedStackFrameRegex.Match(line);
             if (!match.Success)
             {
                 // Exception messages, "--- End of stack trace ---" separators,
@@ -72,18 +99,18 @@ public partial class RoslynService
                     resolved = false,
                     ambiguousOverload = false,
                     location = (object?)null,
-                    snippet = (string?)null
+                    snippet = (string?)null,
+                    notice = (string?)null
                 });
                 continue;
             }
 
+            var file = match.Groups["file"].Success ? match.Groups["file"].Value : null;
+            int? zeroBasedLine = match.Groups["line"].Success && int.TryParse(match.Groups["line"].Value, out var oneBasedLine) && oneBasedLine > 0
+                ? oneBasedLine - 1
+                : null;
             var frame = await ResolveFrameAsync(
-                line.Trim(),
-                match.Groups["sig"].Value,
-                match.Groups["file"].Success ? match.Groups["file"].Value : null,
-                match.Groups["line"].Success ? int.Parse(match.Groups["line"].Value) - 1 : null,
-                contextLines,
-                cancellationToken);
+                line.Trim(), match.Groups["sig"].Value, file, zeroBasedLine, contextLines, cancellationToken);
             frames.Add(frame.entry);
             if (frame.resolved) resolvedCount++;
         }
@@ -108,42 +135,59 @@ public partial class RoslynService
         string raw, string signature, string? tracedFile, int? tracedLine,
         int contextLines, CancellationToken cancellationToken)
     {
-        // Split "Ns.Type.Method(args)" into the dotted part and the argument list.
+        var frameKind = "method";
+
+        // "Method(args)+MoveNext()": a demangled iterator's MoveNext; the arguments are the
+        // iterator method's own.
+        if (IteratorFrameRegex.Match(signature) is { Success: true } iteratorMatch)
+        {
+            frameKind = "iterator";
+            signature = iteratorMatch.Groups["call"].Value;
+        }
+
+        // Split "Ns.Type.Method(args)" into the dotted part and the argument list (a Mono
+        // frame puts a space before the parenthesis).
         var parenIndex = signature.IndexOf('(');
-        var dotted = parenIndex >= 0 ? signature[..parenIndex] : signature;
-        int? arity = null;
+        var dotted = (parenIndex >= 0 ? signature[..parenIndex] : signature).TrimEnd();
+        IReadOnlyList<string>? parameterTypes = null;
         int? typeParamCount = null;
         if (parenIndex >= 0 && signature.EndsWith(')'))
         {
-            arity = CountParameters(signature[(parenIndex + 1)..^1]);
+            parameterTypes = SplitTopLevel(signature[(parenIndex + 1)..^1]);
         }
 
-        var frameKind = "method";
         string typePart;
         string methodName;
         string? localName = null;
 
-        if (AsyncFrameRegex.Match(dotted) is { Success: true } asyncMatch)
+        if (AsyncLambdaFrameRegex.Match(dotted) is { Success: true } asyncLambdaMatch)
+        {
+            frameKind = "lambda";
+            typePart = StripCompilerContainers(asyncLambdaMatch.Groups["prefix"].Value);
+            methodName = asyncLambdaMatch.Groups["method"].Value;
+            parameterTypes = null; // MoveNext() says nothing about the containing method
+        }
+        else if (AsyncFrameRegex.Match(dotted) is { Success: true } asyncMatch)
         {
             frameKind = "async";
             typePart = asyncMatch.Groups["type"].Value;
             methodName = asyncMatch.Groups["method"].Value;
-            arity = null; // MoveNext() arity says nothing about the real method
+            parameterTypes = null;
         }
         else if (LocalFunctionFrameRegex.Match(dotted) is { Success: true } localMatch)
         {
             frameKind = "localFunction";
-            typePart = CompilerContainerRegex.Replace(localMatch.Groups["prefix"].Value, "").TrimEnd('.');
+            typePart = StripCompilerContainers(localMatch.Groups["prefix"].Value);
             methodName = localMatch.Groups["method"].Value;
             localName = localMatch.Groups["local"].Value;
-            arity = null;
+            parameterTypes = null;
         }
         else if (LambdaFrameRegex.Match(dotted) is { Success: true } lambdaMatch)
         {
             frameKind = "lambda";
-            typePart = CompilerContainerRegex.Replace(lambdaMatch.Groups["prefix"].Value, "").TrimEnd('.');
+            typePart = StripCompilerContainers(lambdaMatch.Groups["prefix"].Value);
             methodName = lambdaMatch.Groups["method"].Value;
-            arity = null;
+            parameterTypes = null;
         }
         else
         {
@@ -154,7 +198,7 @@ public partial class RoslynService
                 {
                     raw, symbol = (string?)null, frameKind = "unknown",
                     resolved = false, ambiguousOverload = false,
-                    location = (object?)null, snippet = (string?)null
+                    location = (object?)null, snippet = (string?)null, notice = (string?)null
                 }, false);
             }
             typePart = dotted[..lastDot];
@@ -164,36 +208,36 @@ public partial class RoslynService
             var bracketIndex = methodName.IndexOf('[');
             if (bracketIndex > 0 && methodName.EndsWith(']'))
             {
-                typeParamCount = CountParameters(methodName[(bracketIndex + 1)..^1]);
+                typeParamCount = SplitTopLevel(methodName[(bracketIndex + 1)..^1]).Count;
                 methodName = methodName[..bracketIndex];
             }
-            if (methodName == "ctor" && typePart.EndsWith('.'))
+            // Type..ctor / Type..cctor: the constructor name carries its own leading dot.
+            if (methodName is "ctor" or "cctor" && typePart.EndsWith('.'))
             {
                 typePart = typePart.TrimEnd('.');
-                methodName = ".ctor";
+                methodName = "." + methodName;
             }
         }
 
         var typeDisplay = typePart.Replace('+', '.');
-        // A constructor frame demangles to methodName ".ctor"; it already carries
-        // its own leading dot, so joining with another '.' would double it
-        // (Type..ctor). Every other frame needs the separating dot.
+        // A constructor frame demangles to methodName ".ctor"/".cctor"; it already carries
+        // its own leading dot, so joining with another '.' would double it (Type..ctor).
+        // Every other frame needs the separating dot.
         var symbol = (methodName.StartsWith('.') ? $"{typeDisplay}{methodName}" : $"{typeDisplay}.{methodName}") +
                      (localName != null ? $".{localName}" : "");
 
-        // Resolve the demangled name up front so a file:line frame can be validated
-        // against the real declaration — a stale PDB can point at a line that no
-        // longer belongs to this method.
-        var (type, _) = await FindTypeByNameAsync(typePart, cancellationToken);
-        var (method, ambiguousOverload) = type == null
-            ? ((IMethodSymbol?)null, false)
-            : PickFrameMethod(type, methodName, arity, typeParamCount);
+        // Resolve the demangled name up front so a file:line frame can be validated against
+        // the real declaration — a stale PDB can point at a line that no longer belongs to
+        // this method.
+        var tracedDocument = tracedFile != null ? TryFindDocument(tracedFile) : null;
+        var (method, ambiguousOverload, notice) = await ResolveFrameMethodAsync(
+            typePart, methodName, parameterTypes, typeParamCount, tracedDocument, tracedLine, cancellationToken);
 
-        // A file:line frame points at the exact statement — trust it when the line
-        // falls inside the resolved method's own declaration, or when there is no
-        // resolved symbol to validate against. A stale line that lands outside the
-        // method falls through to the declaration location below.
-        if (tracedFile != null && tracedLine != null && TryFindDocument(tracedFile) is { } tracedDocument
+        // A file:line frame points at the exact statement — trust it when the line falls
+        // inside the resolved method's own declaration, or when there is no resolved
+        // symbol to validate against. A stale line that lands outside the method falls
+        // through to the declaration location below.
+        if (tracedDocument != null && tracedLine != null
             && (method == null || MethodSpansLine(method, tracedDocument, tracedLine.Value)))
         {
             var snippet = await ExtractSnippetAsync(tracedDocument, tracedLine.Value, contextLines, cancellationToken);
@@ -205,7 +249,8 @@ public partial class RoslynService
                 resolved = true,
                 ambiguousOverload,
                 location = (object?)new { filePath = FormatPath(tracedDocument.FilePath), line = tracedLine.Value },
-                snippet
+                snippet,
+                notice
             }, true);
         }
 
@@ -217,7 +262,7 @@ public partial class RoslynService
             {
                 raw, symbol = (string?)symbol, frameKind,
                 resolved = false, ambiguousOverload = false,
-                location = (object?)null, snippet = (string?)null
+                location = (object?)null, snippet = (string?)null, notice
             }, false);
         }
 
@@ -238,57 +283,161 @@ public partial class RoslynService
                 filePath = FormatPath(lineSpan.Path),
                 line = lineSpan.StartLinePosition.Line
             },
-            snippet = declarationSnippet
+            snippet = declarationSnippet,
+            notice
         }, true);
     }
 
-    // Count top-level parameters in a frame's argument list. Splitting on ','
-    // over-counts a single parameter whose type carries its own commas — a tuple
-    // `(int, int) p`, a generic `Dictionary<int, string> d`, an array rank. Only
-    // commas at bracket depth zero separate parameters.
-    private static int CountParameters(string args)
+    private static string StripCompilerContainers(string prefix) =>
+        CompilerContainerRegex.Replace(prefix, "").TrimEnd('.');
+
+    // The frame's method, with its type resolution's shadow notice. The type part is the
+    // longest prefix of the dotted name that names a type: an explicit interface
+    // implementation's member name is qualified by the interface ("Type.Ns.IFace.Member"),
+    // so while a prefix names no type its last segment belongs to the member name. Once a
+    // prefix names a type, the frame's method is looked up there alone (a BCL frame's type
+    // resolves to metadata and has no in-source method).
+    private async Task<(IMethodSymbol? method, bool ambiguous, string? notice)> ResolveFrameMethodAsync(
+        string typePart, string methodName, IReadOnlyList<string>? parameterTypes, int? typeParamCount,
+        Document? tracedDocument, int? tracedLine, CancellationToken cancellationToken)
     {
-        var trimmed = args.Trim();
-        if (trimmed.Length == 0) return 0;
-        var depth = 0;
-        var count = 1;
-        foreach (var c in trimmed)
+        var memberName = methodName;
+        var candidateType = typePart;
+        while (true)
         {
-            if (c is '(' or '<' or '[') depth++;
-            else if (c is ')' or '>' or ']') { if (depth > 0) depth--; }
-            else if (c == ',' && depth == 0) count++;
+            var resolution = await ResolveTypeByNameAsync(candidateType, cancellationToken);
+            if (resolution.Type is { } type)
+            {
+                var (method, ambiguous) = PickFrameMethod(type, memberName, parameterTypes, typeParamCount, tracedDocument, tracedLine);
+                return (method, ambiguous, resolution.ShadowNotice);
+            }
+            var lastDot = candidateType.LastIndexOf('.');
+            if (lastDot <= 0 || methodName.StartsWith('.')) return (null, false, null);
+            memberName = $"{candidateType[(lastDot + 1)..]}.{memberName}";
+            candidateType = candidateType[..lastDot];
         }
-        return count;
     }
 
-    // Resolves the frame's method, reporting whether the choice was ambiguous —
-    // i.e. more than one in-source overload remained after narrowing by generic
-    // arity and parameter count (always so for async/lambda/local frames, whose
-    // mangled names carry no parameter count).
-    private static (IMethodSymbol? method, bool ambiguous) PickFrameMethod(
-        INamedTypeSymbol type, string methodName, int? arity, int? typeParamCount)
+    // The top-level comma-separated items of a frame's argument or type-argument list.
+    // Splitting on every ',' over-splits a single item whose type carries its own commas —
+    // a tuple `(int, int) p`, a generic `Dictionary<int, string> d`, an array rank — so
+    // only commas at bracket depth zero separate items.
+    private static IReadOnlyList<string> SplitTopLevel(string list)
     {
-        var candidates = (methodName == ".ctor"
-                ? type.InstanceConstructors.AsEnumerable()
-                : type.GetMembers(methodName).OfType<IMethodSymbol>())
+        var items = new List<string>();
+        var trimmed = list.Trim();
+        if (trimmed.Length == 0) return items;
+        var depth = 0;
+        var start = 0;
+        for (var i = 0; i < trimmed.Length; i++)
+        {
+            var c = trimmed[i];
+            if (c is '(' or '<' or '[') depth++;
+            else if (c is ')' or '>' or ']') { if (depth > 0) depth--; }
+            else if (c == ',' && depth == 0)
+            {
+                items.Add(trimmed[start..i].Trim());
+                start = i + 1;
+            }
+        }
+        items.Add(trimmed[start..].Trim());
+        return items;
+    }
+
+    // Resolves the frame's method among its overloads, narrowing by generic arity, then
+    // by parameter count, then by the parameter types the frame names, then by the method
+    // whose declaration spans the reported line. ambiguous: more than one in-source
+    // overload remained (always so for async/lambda/local frames with no parameters and no
+    // line to decide).
+    private static (IMethodSymbol? method, bool ambiguous) PickFrameMethod(
+        INamedTypeSymbol type, string methodName, IReadOnlyList<string>? parameterTypes, int? typeParamCount,
+        Document? tracedDocument, int? tracedLine)
+    {
+        var candidates = (methodName switch
+            {
+                ".ctor" => type.InstanceConstructors.AsEnumerable(),
+                ".cctor" => type.StaticConstructors.AsEnumerable(),
+                _ => type.GetMembers(methodName).OfType<IMethodSymbol>()
+            })
             .Where(m => m.Locations.Any(l => l.IsInSource))
             .ToList();
         if (candidates.Count == 0) return (null, false);
 
-        // Narrow by generic arity first when the frame carried `[T,U]`.
-        if (typeParamCount != null)
+        List<IMethodSymbol> Narrow(Func<IMethodSymbol, bool> predicate)
         {
-            var byTypeParams = candidates.Where(m => m.Arity == typeParamCount).ToList();
-            if (byTypeParams.Count > 0) candidates = byTypeParams;
+            var narrowed = candidates.Where(predicate).ToList();
+            return narrowed.Count > 0 ? narrowed : candidates;
         }
 
-        if (arity != null)
+        if (typeParamCount != null) candidates = Narrow(m => m.Arity == typeParamCount);
+        if (parameterTypes != null)
         {
-            var arityMatches = candidates.Where(m => m.Parameters.Length == arity).ToList();
-            if (arityMatches.Count > 0) return (arityMatches[0], arityMatches.Count > 1);
+            candidates = Narrow(m => m.Parameters.Length == parameterTypes.Count);
+            candidates = Narrow(m => m.Parameters.Length == parameterTypes.Count
+                                     && m.Parameters.Zip(parameterTypes).All(p => FrameTypeMatches(p.Second, p.First.Type)));
+        }
+        if (candidates.Count > 1 && tracedDocument != null && tracedLine != null)
+        {
+            candidates = Narrow(m => MethodSpansLine(m, tracedDocument, tracedLine.Value));
         }
         return (candidates[0], candidates.Count > 1);
     }
+
+    // Whether a frame's parameter text ("String s", "System.String s", "Int32[] xs",
+    // "IEnumerable`1 items", "(int, int) pair", "Int32& x") names the parameter's type.
+    // The frame prints the type by its simple metadata name (namespace-qualified on Mono);
+    // a shape it cannot read never rules a candidate out.
+    private static bool FrameTypeMatches(string parameterText, ITypeSymbol type)
+    {
+        var text = parameterText.Trim();
+        // Drop the parameter name: the last space-separated token outside brackets.
+        var depth = 0;
+        var nameSeparator = -1;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var c = text[i];
+            if (c is '(' or '<' or '[') depth++;
+            else if (c is ')' or '>' or ']') { if (depth > 0) depth--; }
+            else if (c == ' ' && depth == 0) nameSeparator = i;
+        }
+        var typeText = (nameSeparator > 0 ? text[..nameSeparator] : text).Trim();
+        return TypeTextMatches(typeText, type);
+    }
+
+    private static bool TypeTextMatches(string typeText, ITypeSymbol type)
+    {
+        if (typeText.EndsWith('&')) typeText = typeText[..^1];
+        if (typeText.Length == 0) return true;
+        if (typeText.StartsWith('(') && typeText.EndsWith(')'))
+        {
+            return type is INamedTypeSymbol { IsTupleType: true } tuple
+                   && tuple.TupleElements.Length == SplitTopLevel(typeText[1..^1]).Count;
+        }
+        if (typeText.EndsWith(']') && typeText.LastIndexOf('[') is var open and > 0)
+        {
+            return type is IArrayTypeSymbol array && TypeTextMatches(typeText[..open], array.ElementType);
+        }
+        if (typeText.EndsWith('*'))
+        {
+            return type is IPointerTypeSymbol pointer && TypeTextMatches(typeText[..^1], pointer.PointedAtType);
+        }
+
+        // A C#-spelled generic ("List<int>") is compared by its name before the type arguments.
+        var genericOpen = typeText.IndexOf('<');
+        var name = genericOpen > 0 ? typeText[..genericOpen] : typeText;
+        name = name[(Math.Max(name.LastIndexOf('.'), name.LastIndexOf('+')) + 1)..];
+        if (KeywordTypeNames.TryGetValue(name, out var metadataName)) name = metadataName;
+        return name == type.MetadataName || name == type.Name;
+    }
+
+    private static readonly Dictionary<string, string> KeywordTypeNames = new(StringComparer.Ordinal)
+    {
+        ["bool"] = "Boolean", ["byte"] = "Byte", ["sbyte"] = "SByte", ["char"] = "Char",
+        ["decimal"] = "Decimal", ["double"] = "Double", ["float"] = "Single", ["int"] = "Int32",
+        ["uint"] = "UInt32", ["long"] = "Int64", ["ulong"] = "UInt64", ["short"] = "Int16",
+        ["ushort"] = "UInt16", ["object"] = "Object", ["string"] = "String", ["nint"] = "IntPtr",
+        ["nuint"] = "UIntPtr"
+    };
 
     // Whether the method has a declaration in `document` whose span contains the
     // given line — the validation that a file:line frame really belongs here.

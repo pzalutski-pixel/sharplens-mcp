@@ -7,20 +7,25 @@ namespace SharpLensMcp.Tests;
 
 // In-memory tests for find_untested_code covering test-framework attribute detection
 // (xUnit Theory, NUnit, MSTest), the includeProperties flag, the includeInternal flag,
-// the IsTestMethod (ns,name) match (false-positive guard), and the InvalidParameter
-// branch for unknown projects. Uses the AdhocWorkspace test seam so we can simulate
-// each framework's attribute classes without taking real NuGet dependencies on NUnit
-// or MSTest.
+// the exact-namespace match of framework types (false-positive guard), and the
+// InvalidParameter branch for unknown projects. Uses the AdhocWorkspace test seam so we
+// can simulate each framework's attribute classes without taking real NuGet dependencies
+// on NUnit or MSTest.
 public class UntestedCodeFrameworkTests
 {
-    // Each framework gets its own minimal attribute class in the SAME namespace as
-    // the real framework. The IsTestMethod detection matches by (namespace, name)
-    // so these stub attributes are indistinguishable from the real thing.
+    // Each framework gets minimal attribute types in the SAME namespace and with the SAME
+    // base type or interface as the real framework. Test detection follows each
+    // framework's discovery contract (xUnit: derives from Xunit.FactAttribute; NUnit:
+    // implements ITestBuilder or ISimpleTestBuilder; MSTest: derives from
+    // TestMethodAttribute), so these stubs are indistinguishable from the real thing.
     private const string XunitTheoryCode = @"
 namespace Xunit
 {
     [System.AttributeUsage(System.AttributeTargets.Method)]
-    public class TheoryAttribute : System.Attribute { }
+    public class FactAttribute : System.Attribute { }
+
+    [System.AttributeUsage(System.AttributeTargets.Method)]
+    public class TheoryAttribute : FactAttribute { }
 }
 
 namespace Production
@@ -46,10 +51,15 @@ namespace Tests
 }";
 
     private const string NUnitTestCode = @"
+namespace NUnit.Framework.Interfaces
+{
+    public interface ISimpleTestBuilder { }
+}
+
 namespace NUnit.Framework
 {
     [System.AttributeUsage(System.AttributeTargets.Method)]
-    public class TestAttribute : System.Attribute { }
+    public class TestAttribute : System.Attribute, NUnit.Framework.Interfaces.ISimpleTestBuilder { }
 }
 
 namespace Production
@@ -219,7 +229,7 @@ namespace Tests
     public async Task FindUntestedCode_RecognizesXunitTheory()
     {
         var data = await RunAndGetData(XunitTheoryCode, includeProperties: true, includeInternal: true);
-        // Locks the (ns, name) test-attribute match for ("Xunit", "TheoryAttribute").
+        // Locks xUnit's contract: Xunit.TheoryAttribute derives from Xunit.FactAttribute.
         data["testMethodCount"]!.Value<int>().Should().Be(1,
             "the fixture declares exactly one [Xunit.Theory] method");
         data["productionProject"]!.Value<string>().Should().Be("TestProject");
@@ -235,7 +245,7 @@ namespace Tests
     public async Task FindUntestedCode_RecognizesNUnitTest()
     {
         var data = await RunAndGetData(NUnitTestCode, includeProperties: true, includeInternal: true);
-        // Locks the (ns, name) test-attribute match for ("NUnit.Framework", "TestAttribute").
+        // Locks NUnit's contract: NUnit.Framework.TestAttribute implements ISimpleTestBuilder.
         data["testMethodCount"]!.Value<int>().Should().Be(1,
             "the fixture declares exactly one [NUnit.Framework.Test] method");
         data["productionProject"]!.Value<string>().Should().Be("TestProject");
@@ -251,7 +261,7 @@ namespace Tests
     public async Task FindUntestedCode_RecognizesMSTestTestMethod()
     {
         var data = await RunAndGetData(MSTestCode, includeProperties: true, includeInternal: true);
-        // Locks the (ns, name) test-attribute match for the MSTest TestMethodAttribute.
+        // Locks MSTest's contract: the attribute is (or derives from) TestMethodAttribute.
         data["testMethodCount"]!.Value<int>().Should().Be(1,
             "the fixture declares exactly one MSTest [TestMethod] method");
         data["productionProject"]!.Value<string>().Should().Be("TestProject");
@@ -295,14 +305,14 @@ namespace Tests
     public async Task FindUntestedCode_DoesNotMatchSameNameDifferentNamespace()
     {
         // MyApp.Attributes.FactAttribute has the same simple name as xUnit's [Fact]
-        // but a different namespace — must NOT be treated as a test attribute. The
-        // (ns, name) tuple lookup is the guard against this kind
+        // but a different namespace — must NOT be treated as a test attribute. Framework
+        // types are matched by exact namespace and name, the guard against this kind
         // of false positive that would inflate the reachable set.
         var data = await RunAndGetData(FalsePositiveSameNameCode, includeProperties: true, includeInternal: true);
         data["testMethodCount"]!.Value<int>().Should().Be(0,
-            "the look-alike attribute lives in MyApp.Attributes, not Xunit — IsTestMethod must reject it");
+            "the look-alike attribute lives in MyApp.Attributes, not Xunit — test detection must reject it");
 
-        // testProjectsScanned tracks projects where IsTestMethod found something.
+        // testProjectsScanned tracks projects where an entry point was found.
         // With zero hits, the set must stay empty.
         var scanned = (data["testProjectsScanned"] as JArray)!;
         scanned.Count.Should().Be(0,

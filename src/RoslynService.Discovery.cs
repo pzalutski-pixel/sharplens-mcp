@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Text;
 using System.Collections.Immutable;
 using System.Xml.Linq;
 
@@ -8,251 +9,132 @@ namespace SharpLensMcp;
 
 public partial class RoslynService
 {
-
+    // Every application of the attribute in the scoped projects — the same walk as
+    // get_attributes (FindAttributeApplicationsAsync), so both tools cover the same targets
+    // — one entry per application, in the order the attributes are written.
     public async Task<object> FindAttributeUsagesAsync(
         string attributeName, string? projectName = null, int maxResults = 100,
         CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var results = new List<object>();
-        var totalFound = 0;
-        var projects = projectName != null
-            ? _solution!.Projects.Where(p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase))
-            : _solution!.Projects;
+        if (ParameterValidation.Limit("maxResults", maxResults, MaxListLimit) is { } invalidLimit)
+            return CreateErrorResponse(invalidLimit);
+        var (projects, scopeError) = ResolveProjectScope(projectName);
+        if (projects == null) return scopeError!;
 
-        foreach (var project in projects)
+        var applications = await FindAttributeApplicationsAsync(projects, includeTree: null, attributeName, cancellationToken);
+        var results = applications.Take(maxResults).Select(m =>
         {
-            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
-            if (compilation == null) continue;
-
-            foreach (var type in GetAllNamedTypes(compilation))
+            var application = m.Item;
+            var attr = application.Attribute;
+            return WithTargetFrameworks(new Dictionary<string, object?>
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                // GetAllNamedTypes walks the merged global namespace, which includes
-                // every referenced assembly — restrict to this project's own source
-                // types so the BCL isn't scanned and sibling projects aren't double-
-                // counted by their referencing projects' iterations.
-                if (!SymbolEqualityComparer.Default.Equals(type.ContainingAssembly, compilation.Assembly)) continue;
-
-                foreach (var attr in type.GetAttributes())
-                {
-                    if (!MatchesAttribute(attr, attributeName)) continue;
-                    totalFound++;
-                    if (results.Count >= maxResults) continue;
-                    results.Add(new
-                    {
-                        symbolName = type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat),
-                        symbolKind = "Type",
-                        attributeName = attr.AttributeClass?.Name,
-                        arguments = attr.ConstructorArguments.Select(a => a.ToCSharpString()).ToList(),
-                        namedArguments = attr.NamedArguments.ToDictionary(a => a.Key, a => a.Value.ToCSharpString()),
-                        location = GetSymbolLocation(type)
-                    });
-                }
-
-                foreach (var member in type.GetMembers())
-                {
-                    // Nested types are reported by the outer type walk, not as members
-                    // of their container.
-                    if (member is INamedTypeSymbol) continue;
-                    foreach (var attr in member.GetAttributes())
-                    {
-                        if (!MatchesAttribute(attr, attributeName)) continue;
-                        totalFound++;
-                        if (results.Count >= maxResults) continue;
-                        results.Add(new
-                        {
-                            symbolName = $"{type.Name}.{member.Name}",
-                            symbolKind = member.Kind.ToString(),
-                            attributeName = attr.AttributeClass?.Name,
-                            arguments = attr.ConstructorArguments.Select(a => a.ToCSharpString()).ToList(),
-                            namedArguments = attr.NamedArguments.ToDictionary(a => a.Key, a => a.Value.ToCSharpString()),
-                            location = GetSymbolLocation(member)
-                        });
-                    }
-                }
-            }
-        }
+                ["symbolName"] = AttributeOwnerDisplayName(application.Owner),
+                ["symbolKind"] = AttributeOwnerKind(application.Owner),
+                ["target"] = application.Target,
+                ["attributeName"] = attr.AttributeClass?.Name,
+                ["arguments"] = attr.ConstructorArguments.Select(a => a.ToCSharpString()).ToList(),
+                ["namedArguments"] = attr.NamedArguments.ToDictionary(a => a.Key, a => a.Value.ToCSharpString()),
+                ["location"] = GetSymbolLocation(application.Owner),
+                ["attributeLocation"] = FormatLocation(application.AttributeLocation)
+            }, m.TargetFrameworks);
+        }).ToList();
 
         return CreateSuccessResponse(
             data: new { attributeFilter = attributeName, usages = results },
-            suggestedNextTools: new[] { "get_type_overview", "find_references" },
-            totalCount: totalFound,
-            returnedCount: results.Count
+            ResultCounts.Capped(applications.Count, results.Count),
+            suggestedNextTools: new[] { "get_type_overview", "find_references" }
         );
     }
 
+    // The name find_attribute_usages reports an owner by: a type minimally qualified, a
+    // member as Type.Member, a parameter or type parameter under its declaring member, the
+    // assembly or module by its name.
+    private static string AttributeOwnerDisplayName(ISymbol owner) => owner switch
+    {
+        INamedTypeSymbol type => type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat),
+        IParameterSymbol or ITypeParameterSymbol => $"{AttributeOwnerDisplayName(owner.ContainingSymbol)}.{owner.Name}",
+        { ContainingType: { } containingType } => $"{containingType.Name}.{owner.Name}",
+        _ => owner.Name
+    };
+
+    // The dependency-injection registrations (DiRegistrationReader) in every source tree of
+    // the scoped projects, generator output included.
     public async Task<object> GetDiRegistrationsAsync(
         string? projectName = null, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var registrations = new List<object>();
-        var diMethodPatterns = new[]
-        {
-            "AddScoped", "AddTransient", "AddSingleton", "AddHostedService",
-            "TryAddScoped", "TryAddTransient", "TryAddSingleton",
-            "AddKeyedScoped", "AddKeyedTransient", "AddKeyedSingleton"
-        };
+        var (projects, scopeError) = ResolveProjectScope(projectName);
+        if (projects == null) return scopeError!;
 
-        var projects = projectName != null
-            ? _solution!.Projects.Where(p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase))
-            : _solution!.Projects;
-
+        var found = new List<(DiRegistration Registration, int Index, string? TargetFramework)>();
         foreach (var project in projects)
         {
             var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
+            var targetFramework = LogicalProject.TargetFrameworkOf(project);
 
-            foreach (var document in project.Documents)
+            foreach (var syntaxTree in compilation.SyntaxTrees)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
-                if (syntaxTree == null) continue;
-
-                var semanticModel = compilation.GetSemanticModel(syntaxTree);
                 var root = await syntaxTree.GetRootAsync(cancellationToken);
-
-                var invocations = root.DescendantNodes().OfType<InvocationExpressionSyntax>();
-                foreach (var invocation in invocations)
+                SemanticModel? semanticModel = null;
+                foreach (var invocation in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
                 {
-                    var methodName = GetInvocationMethodName(invocation);
-                    // Exact match: a `StartsWith` test would also catch a user's own
-                    // AddSingletonCache / AddScopedFactory helpers.
-                    if (methodName == null || !diMethodPatterns.Contains(methodName)) continue;
-
-                    var symbolInfo = semanticModel.GetSymbolInfo(invocation);
-                    if (symbolInfo.Symbol is not IMethodSymbol methodSymbol) continue;
-
-                    var containingType = methodSymbol.ContainingType?.ToDisplayString();
-                    if (containingType == null || !containingType.Contains("ServiceCollection")) continue;
-
-                    var lifetime = methodName.Contains("Scoped") ? "Scoped"
-                        : methodName.Contains("Transient") ? "Transient"
-                        : methodName.Contains("Singleton") ? "Singleton"
-                        : methodName.Contains("Hosted") ? "Singleton"
-                        : "Unknown";
-
-                    var typeArgs = methodSymbol.TypeArguments;
-                    var serviceType = typeArgs.Length > 0
-                        ? typeArgs[0].ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat) : null;
-                    var implementationType = typeArgs.Length > 1
-                        ? typeArgs[1].ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)
-                        : typeArgs.Length == 1 ? serviceType : null;
-
-                    if (methodName == "AddHostedService" && typeArgs.Length >= 1)
+                    semanticModel ??= compilation.GetSemanticModel(syntaxTree);
+                    var index = 0;
+                    foreach (var registration in DiRegistrationReader.Read(invocation, semanticModel, cancellationToken))
                     {
-                        // AddHostedService<T> registers T as the IHostedService service,
-                        // not as its own service type.
-                        implementationType = typeArgs[0].ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
-                        serviceType = "IHostedService";
+                        found.Add((registration, index++, targetFramework));
                     }
-
-                    // Non-generic registrations carry the types as typeof(...) arguments
-                    // or a factory lambda whose produced type is the implementation.
-                    if (serviceType == null || implementationType == null)
-                    {
-                        var systemType = compilation.GetTypeByMetadataName("System.Type");
-                        var typeofTypes = new List<string>();
-                        string? factoryType = null;
-                        var args = invocation.ArgumentList.Arguments;
-                        for (var i = 0; i < args.Count; i++)
-                        {
-                            var expr = args[i].Expression;
-                            // Only typeof arguments bound to a System.Type parameter are
-                            // service/implementation types; a keyed overload's object key
-                            // is skipped. argument[i] aligns with Parameters[i] for both
-                            // the reduced-extension and static-call symbol shapes.
-                            var param = i < methodSymbol.Parameters.Length ? methodSymbol.Parameters[i] : null;
-                            var paramIsType = param == null
-                                || (systemType != null && SymbolEqualityComparer.Default.Equals(param.Type, systemType));
-
-                            if (expr is TypeOfExpressionSyntax typeOf && paramIsType
-                                && semanticModel.GetTypeInfo(typeOf.Type, cancellationToken).Type is { } resolvedType)
-                            {
-                                typeofTypes.Add(resolvedType.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat));
-                            }
-                            else if (expr is LambdaExpressionSyntax lambda
-                                && FactoryProducedType(lambda, semanticModel, cancellationToken) is { } producedType)
-                            {
-                                factoryType = producedType.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
-                            }
-                        }
-                        serviceType ??= typeofTypes.ElementAtOrDefault(0);
-                        implementationType ??= typeofTypes.ElementAtOrDefault(1) ?? factoryType ?? serviceType;
-                    }
-
-                    var lineSpan = invocation.GetLocation().GetLineSpan();
-                    registrations.Add(new
-                    {
-                        lifetime,
-                        serviceType,
-                        implementationType,
-                        method = methodName,
-                        location = new
-                        {
-                            filePath = FormatPath(lineSpan.Path),
-                            line = lineSpan.StartLinePosition.Line,
-                            column = lineSpan.StartLinePosition.Character
-                        }
-                    });
                 }
             }
         }
 
+        // One registration per call (and per descriptor of a call that adds several), each
+        // once however many target frameworks compile it, in the canonical location order.
+        var merged = CanonicalOrder.ByLocation(
+            TargetFrameworkDeduplication.By(
+                found,
+                f => $"{SourceSpanKey.From(f.Registration.Location)}|{f.Index}",
+                StringComparer.Ordinal,
+                f => f.TargetFramework),
+            m => ReportedLocation(m.Item.Registration.Location));
+        var registrations = merged.Select(m => WithTargetFrameworks(new Dictionary<string, object?>
+        {
+            ["lifetime"] = m.Item.Registration.Lifetime,
+            ["serviceType"] = m.Item.Registration.ServiceType,
+            ["implementationType"] = m.Item.Registration.ImplementationType,
+            ["method"] = m.Item.Registration.Method,
+            ["location"] = FormatLocation(m.Item.Registration.Location)
+        }, m.TargetFrameworks)).ToList();
+
         return CreateSuccessResponse(
             data: new { registrations },
-            suggestedNextTools: new[] { "find_references", "get_type_overview" },
-            totalCount: registrations.Count,
-            returnedCount: registrations.Count
+            ResultCounts.Complete(registrations.Count),
+            suggestedNextTools: new[] { "find_references", "get_type_overview" }
         );
     }
 
-    // The type a DI factory lambda produces: the body expression for an
-    // expression-bodied lambda, or the last return in a block-bodied one (skipping
-    // returns that belong to nested lambdas/local functions).
-    private static ITypeSymbol? FactoryProducedType(
-        LambdaExpressionSyntax lambda, SemanticModel semanticModel, CancellationToken cancellationToken)
-    {
-        if (lambda.Body is ExpressionSyntax expr)
-            return semanticModel.GetTypeInfo(expr, cancellationToken).Type;
-        if (lambda.Body is BlockSyntax block)
-        {
-            var returned = block
-                .DescendantNodes(n => n is not AnonymousFunctionExpressionSyntax
-                                   && n is not LocalFunctionStatementSyntax)
-                .OfType<ReturnStatementSyntax>()
-                .Select(r => r.Expression)
-                .LastOrDefault(e => e != null);
-            if (returned != null)
-                return semanticModel.GetTypeInfo(returned, cancellationToken).Type;
-        }
-        return null;
-    }
-
+    // The reflection calls (IsReflectionCall) in the documents of the scoped projects.
     public async Task<object> FindReflectionUsageAsync(
         string? projectName = null, int maxResults = 100, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var hits = new List<(bool lowSignal, object entry)>();
-        var reflectionApis = new[]
-        {
-            "GetType", "GetMethod", "GetProperty", "GetField", "GetEvent",
-            "GetMember", "GetMembers", "GetMethods", "GetProperties", "GetFields",
-            "CreateInstance", "Invoke", "GetValue", "SetValue", "DynamicInvoke",
-            "MakeGenericType", "MakeGenericMethod"
-        };
+        if (ParameterValidation.Limit("maxResults", maxResults, MaxListLimit) is { } invalidLimit)
+            return CreateErrorResponse(invalidLimit);
+        var (projects, scopeError) = ResolveProjectScope(projectName);
+        if (projects == null) return scopeError!;
 
-        var projects = projectName != null
-            ? _solution!.Projects.Where(p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase))
-            : _solution!.Projects;
-
+        var hits = new List<(IMethodSymbol Method, InvocationExpressionSyntax Invocation, string? TargetFramework)>();
         foreach (var project in projects)
         {
             var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
+            var targetFramework = LogicalProject.TargetFrameworkOf(project);
 
             foreach (var document in project.Documents)
             {
@@ -262,239 +144,188 @@ public partial class RoslynService
 
                 var semanticModel = compilation.GetSemanticModel(syntaxTree);
                 var root = await syntaxTree.GetRootAsync(cancellationToken);
-
-                var invocations = root.DescendantNodes().OfType<InvocationExpressionSyntax>();
-                foreach (var invocation in invocations)
+                foreach (var invocation in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
                 {
-                    var symbolInfo = semanticModel.GetSymbolInfo(invocation);
-                    if (symbolInfo.Symbol is not IMethodSymbol methodSymbol) continue;
-
-                    var containingNamespace = methodSymbol.ContainingType?.ContainingNamespace?.ToDisplayString();
-                    if (containingNamespace == null) continue;
-
-                    // System.Type members (Type.GetType, GetMethod, …), Activator,
-                    // Delegate.DynamicInvoke, everything in System.Reflection, and the
-                    // instance Object.GetType() runtime-type query. The last is the
-                    // highest-volume and lowest-signal of these; it stays distinguishable
-                    // by the "Object.GetType" reflectionApi so callers can filter it out.
-                    var isReflection = containingNamespace.StartsWith("System.Reflection")
-                        || (containingNamespace == "System" && methodSymbol.ContainingType?.Name == "Type" && reflectionApis.Contains(methodSymbol.Name))
-                        || (containingNamespace == "System" && methodSymbol.ContainingType?.Name == "Object" && methodSymbol.Name == "GetType")
-                        || (containingNamespace == "System" && methodSymbol.ContainingType?.Name == "Activator")
-                        || (containingNamespace == "System" && methodSymbol.ContainingType?.Name == "Delegate" && methodSymbol.Name == "DynamicInvoke");
-
-                    if (!isReflection) continue;
-
-                    var lowSignal = methodSymbol.ContainingType?.Name == "Object" && methodSymbol.Name == "GetType";
-                    var lineSpan = invocation.GetLocation().GetLineSpan();
-                    hits.Add((lowSignal, new
+                    if (semanticModel.GetSymbolInfo(invocation, cancellationToken).Symbol is IMethodSymbol method
+                        && IsReflectionCall(method))
                     {
-                        reflectionApi = $"{methodSymbol.ContainingType?.Name}.{methodSymbol.Name}",
-                        context = TruncateForSnippet(invocation.ToString(), 200, "..."),
-                        location = new
-                        {
-                            filePath = FormatPath(lineSpan.Path),
-                            line = lineSpan.StartLinePosition.Line,
-                            column = lineSpan.StartLinePosition.Character
-                        }
-                    }));
-                }
-            }
-        }
-
-        // High-signal (string-driven) reflection is ordered ahead of the common
-        // Object.GetType() runtime-type query so the latter never crowds the
-        // meaningful hits out of a capped page (stable within each group).
-        var usages = hits
-            .OrderBy(h => h.lowSignal ? 1 : 0)
-            .Take(maxResults)
-            .Select(h => h.entry)
-            .ToList();
-
-        return CreateSuccessResponse(
-            data: new { usages },
-            suggestedNextTools: new[] { "find_references", "get_symbol_info" },
-            totalCount: hits.Count,
-            returnedCount: usages.Count
-        );
-    }
-
-    public Task<object> FindCircularDependenciesAsync(
-        string? level = null, CancellationToken cancellationToken = default)
-    {
-        EnsureSolutionLoaded();
-
-        var analysisLevel = level?.ToLower() ?? "project";
-
-        // Validate level explicitly — silently treating unknown values as namespace
-        // (the prior behavior) hides typos from callers and produces wrong-but-plausible
-        // output. The supported set is just {project, namespace}.
-        if (analysisLevel != "project" && analysisLevel != "namespace")
-        {
-            return Task.FromResult(CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"level must be 'project' or 'namespace' (got '{level}')",
-                context: new { level }
-            ));
-        }
-
-        if (analysisLevel == "project")
-        {
-            var projectGraph = new Dictionary<string, List<string>>();
-            foreach (var project in _solution!.Projects)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var dependencies = project.ProjectReferences
-                    .Select(pr => _solution!.GetProject(pr.ProjectId)?.Name)
-                    .Where(name => name != null)
-                    .Cast<string>()
-                    .ToList();
-                projectGraph[project.Name] = dependencies;
-            }
-
-            var cycles = DetectCycles(projectGraph);
-            return Task.FromResult(CreateSuccessResponse(
-                data: new { level = analysisLevel, hasCycles = cycles.Count > 0, cycles, graph = projectGraph },
-                suggestedNextTools: new[] { "dependency_graph", "get_project_structure" }
-            ));
-        }
-
-        // Namespace level
-        return FindNamespaceCircularDependenciesAsync(cancellationToken);
-    }
-
-    private async Task<object> FindNamespaceCircularDependenciesAsync(CancellationToken cancellationToken = default)
-    {
-        var namespaceGraph = new Dictionary<string, HashSet<string>>();
-
-        foreach (var project in _solution!.Projects)
-        {
-            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
-            if (compilation == null) continue;
-
-            foreach (var syntaxTree in compilation.SyntaxTrees)
-            {
-                var root = await syntaxTree.GetRootAsync(cancellationToken);
-                var semanticModel = compilation.GetSemanticModel(syntaxTree);
-                var fileUsings = (root as CompilationUnitSyntax)?.Usings ?? default;
-
-                // Every namespace declared in the file — not just the first — and the
-                // usings actually in scope for each (its own + enclosing + file-level).
-                foreach (var namespaceDecl in root.DescendantNodes().OfType<BaseNamespaceDeclarationSyntax>())
-                {
-                    var currentNamespace =
-                        (semanticModel.GetDeclaredSymbol(namespaceDecl, cancellationToken) as INamespaceSymbol)
-                            ?.ToDisplayString() ?? namespaceDecl.Name.ToString();
-
-                    if (!namespaceGraph.ContainsKey(currentNamespace))
-                        namespaceGraph[currentNamespace] = new HashSet<string>();
-
-                    var inScopeUsings = namespaceDecl.AncestorsAndSelf()
-                        .OfType<BaseNamespaceDeclarationSyntax>()
-                        .SelectMany(n => n.Usings)
-                        .Concat(fileUsings);
-                    foreach (var u in inScopeUsings)
-                    {
-                        if (u.Name == null) continue;
-                        // Resolve the using to its namespace symbol so aliases and
-                        // global:: prefixes map to the canonical namespace name.
-                        var referencedNamespace =
-                            (semanticModel.GetSymbolInfo(u.Name, cancellationToken).Symbol as INamespaceSymbol)
-                                ?.ToDisplayString() ?? u.Name.ToString();
-                        if (referencedNamespace != currentNamespace)
-                        {
-                            namespaceGraph[currentNamespace].Add(referencedNamespace);
-                        }
+                        hits.Add((method, invocation, targetFramework));
                     }
                 }
             }
         }
 
-        var graphForCycleDetection = namespaceGraph.ToDictionary(
-            kvp => kvp.Key,
-            kvp => kvp.Value.ToList()
-        );
-        var cycles = DetectCycles(graphForCycleDetection);
+        // Each call once however many target frameworks compile it. High-signal
+        // (string-driven) reflection is ordered ahead of the common Object.GetType()
+        // runtime-type query so the latter never crowds the meaningful hits out of a capped
+        // page; each group is in the canonical location order.
+        var ordered = CanonicalOrder.ByLocation(
+                TargetFrameworkDeduplication.ByLocation(hits, h => SourceSpanKey.From(h.Invocation.GetLocation())!.Value, h => h.TargetFramework),
+                m => ReportedLocation(m.Item.Invocation.GetLocation()))
+            .OrderBy(m => IsObjectGetType(m.Item.Method) ? 1 : 0)
+            .ToList();
+        var usages = ordered.Take(maxResults).Select(m => WithTargetFrameworks(new Dictionary<string, object?>
+        {
+            ["reflectionApi"] = $"{m.Item.Method.ContainingType?.Name}.{m.Item.Method.Name}",
+            ["context"] = TruncateForSnippet(m.Item.Invocation.ToString(), 200, "..."),
+            ["location"] = FormatLocation(m.Item.Invocation.GetLocation())
+        }, m.TargetFrameworks)).ToList();
 
         return CreateSuccessResponse(
-            data: new
-            {
-                level = "namespace",
-                hasCycles = cycles.Count > 0,
-                cycles,
-                namespaceCount = namespaceGraph.Count,
-                // Emit the graph for consistency with the project-level response. Without
-                // this, the namespace-level response shape diverged from project-level for
-                // no documented reason.
-                graph = graphForCycleDetection
-            },
+            data: new { usages },
+            ResultCounts.Capped(ordered.Count, usages.Count),
+            suggestedNextTools: new[] { "find_references", "get_symbol_info" }
+        );
+    }
+
+    // A call that looks up or invokes code by reflection, decided by the API itself rather
+    // than a list of names: anything in System.Reflection (Assembly.GetTypes,
+    // MethodInfo.Invoke, PropertyInfo.GetValue, ...); a System.Type member that returns
+    // reflection metadata — a MemberInfo (Type, MethodInfo, ConstructorInfo, EventInfo, ...)
+    // or an array of them — or invokes a member (InvokeMember); Activator and
+    // AppDomain.CreateInstance*; Delegate.DynamicInvoke; and the instance Object.GetType()
+    // runtime-type query, the highest-volume and lowest-signal of these, reported as
+    // "Object.GetType" so callers can filter it out. A System.Type query that only answers
+    // a question (IsAssignableFrom, IsSubclassOf) is not reflection.
+    private static bool IsReflectionCall(IMethodSymbol method)
+    {
+        var type = method.ContainingType;
+        if (type == null) return false;
+        if (type.ContainingNamespace?.ToDisplayString() is { } ns && (ns == "System.Reflection" || ns.StartsWith("System.Reflection.", StringComparison.Ordinal)))
+            return true;
+        if (TestFrameworkContracts.Is(type, "System", "Type"))
+            return method.Name == "InvokeMember" || ReturnsReflectionMetadata(method.ReturnType);
+        if (TestFrameworkContracts.Is(type, "System", "Activator")) return true;
+        if (TestFrameworkContracts.Is(type, "System", "AppDomain")) return method.Name.StartsWith("CreateInstance", StringComparison.Ordinal);
+        if (TestFrameworkContracts.Is(type, "System", "Delegate")) return method.Name == "DynamicInvoke";
+        return IsObjectGetType(method);
+    }
+
+    private static bool ReturnsReflectionMetadata(ITypeSymbol returnType)
+    {
+        var element = returnType is IArrayTypeSymbol array ? array.ElementType : returnType;
+        return TestFrameworkContracts.DerivesFrom(element, "System.Reflection", "MemberInfo");
+    }
+
+    private static bool IsObjectGetType(IMethodSymbol method) =>
+        method.Name == "GetType" && method.ContainingType is { } type && TestFrameworkContracts.Is(type, "System", "Object");
+
+    // The cycles of the project graph (BuildProjectGraph) or the namespace graph
+    // (BuildNamespaceGraphAsync): every elementary cycle (up to the cap, cyclesTruncated
+    // when more exist) and every strongly connected component, with the graph itself as
+    // nodes and edges — one shape for both levels.
+    public async Task<object> FindCircularDependenciesAsync(
+        string? level = null, CancellationToken cancellationToken = default)
+    {
+        EnsureSolutionLoaded();
+
+        if (ParameterValidation.Choice("level", level, new[] { "project", "namespace" }, out var canonicalLevel) is { } invalidLevel)
+            return CreateErrorResponse(invalidLevel);
+        var analysisLevel = canonicalLevel ?? "project";
+
+        var graph = analysisLevel == "project"
+            ? BuildProjectGraph()
+            : await BuildNamespaceGraphAsync(cancellationToken);
+        var cycles = DetectCycles(graph.ToAdjacency());
+
+        var data = new Dictionary<string, object?>
+        {
+            ["level"] = analysisLevel,
+            ["hasCycles"] = cycles.Cycles.Count > 0,
+            ["cycles"] = cycles.Cycles,
+            ["cyclesTruncated"] = cycles.Truncated,
+            ["stronglyConnectedComponents"] = cycles.StronglyConnectedComponents,
+            ["nodes"] = FormatGraphNodes(graph),
+            ["edges"] = FormatGraphEdges(graph)
+        };
+        if (analysisLevel == "namespace") data["namespaceCount"] = graph.Nodes.Count;
+
+        return CreateSuccessResponse(
+            data,
+            CycleCounts(cycles),
             suggestedNextTools: new[] { "dependency_graph", "get_project_structure" }
         );
     }
 
+    // The package references of each project file in scope, as MSBuild evaluates them
+    // (CollectEffectivePackageReferences: imports, Conditions, $(Property) versions,
+    // Update=, Central Package Management). One entry per project file: a multi-targeted
+    // project is evaluated for each of its target frameworks in scope and reported once,
+    // identical references merged, and its entry and each package carry the frameworks they
+    // apply to (targetFrameworks, present only on a multi-targeted project). Packages are in
+    // evaluation order; a project file that cannot be evaluated reports why in parseError.
     public Task<object> GetNuGetDependenciesAsync(
         string? projectName = null, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var projectDependencies = new List<object>();
-        var projects = projectName != null
-            ? _solution!.Projects.Where(p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase))
-            : _solution!.Projects;
+        var (projects, scopeError) = ResolveProjectScope(projectName);
+        if (projects == null) return Task.FromResult(scopeError!);
 
-        foreach (var project in projects)
+        var model = GetLogicalProjects();
+        var projectDependencies = new List<object>();
+        using var evaluator = new MSBuildProjectEvaluator();
+        foreach (var members in projects.GroupBy(model.Of))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var packages = new List<object>();
-            var projectFilePath = project.FilePath;
+            var logical = members.Key;
+            var targetFrameworks = members.Select(LogicalProject.TargetFrameworkOf).ToList();
 
-            string? parseError = null;
-            if (projectFilePath != null && File.Exists(projectFilePath))
+            var packages = new List<(EvaluatedPackageReference Reference, List<string> TargetFrameworks)>();
+            var parseErrors = new List<string>();
+            if (logical.FilePath != null && File.Exists(logical.FilePath))
             {
-                // Effective references: merges Directory.Build.props and resolves CPM
-                // versions from Directory.Packages.props, not just the leaf csproj. A
-                // malformed props/csproj is reported via parseError, not swallowed.
-                var parseErrors = new List<string>();
-                foreach (var pkgRef in CollectEffectivePackageReferences(projectFilePath, parseErrors))
+                foreach (var targetFramework in targetFrameworks)
                 {
-                    packages.Add(new
+                    foreach (var reference in CollectEffectivePackageReferences(logical.FilePath, parseErrors, targetFramework, evaluator))
                     {
-                        packageName = pkgRef.Name,
-                        version = pkgRef.Version ?? "unknown",
-                        privateAssets = pkgRef.PrivateAssets,
-                        excludeAssets = pkgRef.ExcludeAssets
-                    });
+                        var index = packages.FindIndex(p => p.Reference == reference);
+                        if (index < 0) packages.Add((reference, new List<string>()));
+                        if (targetFramework != null) packages[index < 0 ? packages.Count - 1 : index].TargetFrameworks.Add(targetFramework);
+                    }
                 }
-                if (parseErrors.Count > 0) parseError = string.Join("; ", parseErrors);
             }
 
-            projectDependencies.Add(new
+            var entry = new Dictionary<string, object?>
             {
-                projectName = project.Name,
-                projectPath = FormatPath(project.FilePath ?? ""),
-                packages,
-                parseError
-            });
+                ["projectName"] = logical.Name,
+                ["projectPath"] = FormatPath(logical.FilePath ?? "")
+            };
+            if (logical.IsMultiTargeted) entry["targetFrameworks"] = targetFrameworks.OfType<string>().OrderBy(t => t, StringComparer.Ordinal).ToList();
+            entry["packages"] = packages.Select(p =>
+            {
+                var package = new Dictionary<string, object?>
+                {
+                    ["packageName"] = p.Reference.Name,
+                    ["version"] = p.Reference.Version ?? "unknown",
+                    ["privateAssets"] = p.Reference.PrivateAssets,
+                    ["excludeAssets"] = p.Reference.ExcludeAssets
+                };
+                if (logical.IsMultiTargeted) package["targetFrameworks"] = p.TargetFrameworks.OrderBy(t => t, StringComparer.Ordinal).ToList();
+                return package;
+            }).ToList();
+            entry["parseError"] = parseErrors.Count > 0 ? string.Join("; ", parseErrors.Distinct(StringComparer.Ordinal)) : null;
+            projectDependencies.Add(entry);
         }
 
         return Task.FromResult(CreateSuccessResponse(
             data: new { projects = projectDependencies },
-            suggestedNextTools: new[] { "get_project_structure", "dependency_graph" },
-            totalCount: projectDependencies.Count,
-            returnedCount: projectDependencies.Count
+            ResultCounts.Complete(projectDependencies.Count),
+            suggestedNextTools: new[] { "get_project_structure", "dependency_graph" }
         ));
     }
 
+    // The generators of each scoped project (per target framework: each compiles with its
+    // own generator output) with their timing, and the files they generate in path order.
     public async Task<object> GetSourceGeneratorsAsync(
         string? projectName = null, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var generatorResults = new List<object>();
-        var projects = projectName != null
-            ? _solution!.Projects.Where(p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase))
-            : _solution!.Projects;
+        var (projects, scopeError) = ResolveProjectScope(projectName);
+        if (projects == null) return scopeError!;
 
+        var generatorResults = new List<object>();
         foreach (var project in projects)
         {
             var generators = project.AnalyzerReferences
@@ -544,18 +375,19 @@ public partial class RoslynService
                 project.Documents.Where(d => d.FilePath != null).Select(d => d.FilePath!),
                 OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
 
-            var generatedFiles = new List<object>();
+            var generatedFiles = new List<(string HintPath, object Entry)>();
             foreach (var tree in compilation.SyntaxTrees)
             {
                 if (projectDocumentPaths.Contains(tree.FilePath)) continue;
 
                 var text = await tree.GetTextAsync(cancellationToken);
-                generatedFiles.Add(new
+                var hintPath = FormatPath(tree.FilePath);
+                generatedFiles.Add((hintPath, new
                 {
                     fileName = Path.GetFileName(tree.FilePath),
-                    hintPath = tree.FilePath,
+                    hintPath,
                     lineCount = text.Lines.Count
-                });
+                }));
             }
 
             generatorResults.Add(new
@@ -571,15 +403,17 @@ public partial class RoslynService
                         elapsedMs = elapsedByGenerator.TryGetValue(g, out var ms) ? ms : (double?)null
                     };
                 }).ToList(),
-                generatedFiles
+                generatedFiles = generatedFiles
+                    .OrderBy(f => f.HintPath, StringComparer.Ordinal)
+                    .Select(f => f.Entry)
+                    .ToList()
             });
         }
 
         return CreateSuccessResponse(
             data: new { projects = generatorResults },
-            suggestedNextTools: new[] { "get_generated_code", "get_diagnostics" },
-            totalCount: generatorResults.Count,
-            returnedCount: generatorResults.Count
+            ResultCounts.Complete(generatorResults.Count),
+            suggestedNextTools: new[] { "get_generated_code", "get_diagnostics" }
         );
     }
 
@@ -599,65 +433,125 @@ public partial class RoslynService
         return inner?.GetType() ?? t;
     }
 
+    // The source of one generated file, addressed by its file name or the trailing whole
+    // segments of its generated path ("GenImpl.g.cs", "MyGenerator/GenImpl.g.cs", or the
+    // hintPath get_source_generators reports); a part of a segment never matches. The
+    // project scope resolves like every project-scoped tool: "Multi" covers each target
+    // framework, whose identical output is one file (with targetFrameworks), while
+    // "Multi(net8.0)" selects one. A name that matches generated files at several paths, or
+    // one path whose content differs between target frameworks, is AMBIGUOUS_MATCH listing
+    // the candidates; no match is FILE_NOT_FOUND listing the generated file names.
     public async Task<object> GetGeneratedCodeAsync(
         string projectName, string generatedFileName, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var project = _solution!.Projects.FirstOrDefault(p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase));
-        if (project == null)
+        if (string.IsNullOrWhiteSpace(projectName))
         {
-            return ProjectNotFoundError(projectName);
+            return CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                "projectName is required",
+                hint: "Pass the project that runs the generator (see get_source_generators).",
+                context: new { parameter = "projectName" });
         }
+        var (projects, scopeError) = ResolveProjectScope(projectName);
+        if (projects == null) return scopeError!;
 
-        var compilation = await GetProjectCompilationAsync(project, cancellationToken);
-        if (compilation == null)
+        var generated = new List<(string HintPath, SourceText Text, string? TargetFramework)>();
+        foreach (var project in projects)
         {
-            return CreateErrorResponse(ErrorCodes.AnalysisFailed, "Could not get compilation");
-        }
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
+            if (compilation == null) continue;
 
-        // Only search generated trees (not the project's hand-written documents).
-        var projectDocumentPaths = new HashSet<string>(
-            project.Documents.Where(d => d.FilePath != null).Select(d => d.FilePath!),
-            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
-
-        foreach (var tree in compilation.SyntaxTrees)
-        {
-            if (projectDocumentPaths.Contains(tree.FilePath)) continue;
-
-            if (tree.FilePath.Contains(generatedFileName, StringComparison.OrdinalIgnoreCase) ||
-                Path.GetFileName(tree.FilePath).Contains(generatedFileName, StringComparison.OrdinalIgnoreCase))
+            // Only generated trees (not the project's hand-written documents).
+            var projectDocumentPaths = new HashSet<string>(
+                project.Documents.Where(d => d.FilePath != null).Select(d => d.FilePath!),
+                OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+            foreach (var tree in compilation.SyntaxTrees)
             {
-                var text = await tree.GetTextAsync(cancellationToken);
-                return CreateSuccessResponse(
-                    data: new
-                    {
-                        fileName = Path.GetFileName(tree.FilePath),
-                        hintPath = tree.FilePath,
-                        sourceCode = text.ToString(),
-                        lineCount = text.Lines.Count
-                    },
-                    suggestedNextTools: new[] { "get_diagnostics", "get_file_overview" }
-                );
+                if (projectDocumentPaths.Contains(tree.FilePath)) continue;
+                generated.Add((FormatPath(tree.FilePath), await tree.GetTextAsync(cancellationToken), LogicalProject.TargetFrameworkOf(project)));
             }
         }
 
-        return CreateErrorResponse(ErrorCodes.FileNotFound, $"Generated file '{generatedFileName}' not found in project '{projectName}'");
+        var requested = generatedFileName.Replace('\\', '/');
+        var suffix = "/" + requested.TrimStart('/');
+        var matches = generated
+            .Where(g => g.HintPath.Equals(requested, PathComparison) || g.HintPath.EndsWith(suffix, PathComparison))
+            .ToList();
+        if (matches.Count == 0)
+        {
+            var availableFiles = generated
+                .Select(g => Path.GetFileName(g.HintPath))
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(n => n, StringComparer.Ordinal)
+                .ToList();
+            return CreateErrorResponse(
+                ErrorCodes.FileNotFound,
+                $"Generated file '{generatedFileName}' not found in project '{projectName}'",
+                hint: availableFiles.Count > 0
+                    ? $"Generated files: {string.Join(", ", availableFiles)}"
+                    : "The project has no generated files (see get_source_generators).",
+                context: new { projectName, generatedFileName, availableFiles });
+        }
+
+        var byPath = matches
+            .GroupBy(m => m.HintPath, SitePathComparer)
+            .OrderBy(g => g.Key, StringComparer.Ordinal)
+            .ToList();
+        if (byPath.Count > 1)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AmbiguousMatch,
+                $"'{generatedFileName}' matches {byPath.Count} generated files",
+                hint: "Pass more of the generated path (a generator folder and the file name) to name one of them.",
+                context: new { projectName, generatedFileName, candidates = byPath.Select(g => g.Key).ToList() });
+        }
+
+        var file = byPath[0].ToList();
+        if (file.Select(f => f.Text.ToString()).Distinct(StringComparer.Ordinal).Count() > 1)
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AmbiguousMatch,
+                $"'{generatedFileName}' differs between the target frameworks of '{projectName}'",
+                hint: "Pass the project name with its target framework, e.g. 'Name(net8.0)'.",
+                context: new { projectName, generatedFileName, targetFrameworks = file.Select(f => f.TargetFramework).OfType<string>().OrderBy(t => t, StringComparer.Ordinal).ToList() });
+        }
+
+        var chosen = file[0];
+        var data = WithTargetFrameworks(new Dictionary<string, object?>
+        {
+            ["fileName"] = Path.GetFileName(chosen.HintPath),
+            ["hintPath"] = chosen.HintPath,
+            ["sourceCode"] = chosen.Text.ToString(),
+            ["lineCount"] = chosen.Text.Lines.Count
+        }, file.Select(f => f.TargetFramework).OfType<string>().Distinct(StringComparer.Ordinal).OrderBy(t => t, StringComparer.Ordinal).ToList());
+
+        return CreateSuccessResponse(
+            data: data,
+            suggestedNextTools: new[] { "get_diagnostics", "get_file_overview" }
+        );
     }
 
+    // Whether an attribute's class is the one a name denotes, case-insensitively: its
+    // simple name with or without the trailing "Attribute" suffix ("Obsolete",
+    // "ObsoleteAttribute"), or its fully-qualified name with or without it
+    // ("System.Obsolete", "System.ObsoleteAttribute").
     private static bool MatchesAttribute(AttributeData attr, string attributeName)
     {
-        var className = attr.AttributeClass?.Name;
-        if (className == null) return false;
+        if (attr.AttributeClass is not { } attributeClass) return false;
+        return NameMatches(attributeClass.Name) || NameMatches(attributeClass.ToDisplayString());
 
-        // Strip only a TRAILING "Attribute" suffix — not every occurrence — so
-        // "FooAttributeBarAttribute" reduces to "FooAttributeBar", never "FooBar".
-        var withoutSuffix = className.EndsWith("Attribute", StringComparison.Ordinal)
-            ? className[..^"Attribute".Length]
-            : className;
-        return className.Equals(attributeName, StringComparison.OrdinalIgnoreCase)
-            || className.Equals($"{attributeName}Attribute", StringComparison.OrdinalIgnoreCase)
-            || withoutSuffix.Equals(attributeName, StringComparison.OrdinalIgnoreCase);
+        bool NameMatches(string className)
+        {
+            // Strip only a TRAILING "Attribute" suffix — not every occurrence — so
+            // "FooAttributeBarAttribute" reduces to "FooAttributeBar", never "FooBar".
+            var withoutSuffix = className.EndsWith("Attribute", StringComparison.Ordinal)
+                ? className[..^"Attribute".Length]
+                : className;
+            return className.Equals(attributeName, StringComparison.OrdinalIgnoreCase)
+                || withoutSuffix.Equals(attributeName, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     private static IEnumerable<INamedTypeSymbol> GetAllNamedTypes(Compilation compilation)
@@ -688,16 +582,5 @@ public partial class RoslynService
                 yield return deepNested;
         }
     }
-
-    private static string? GetInvocationMethodName(InvocationExpressionSyntax invocation)
-    {
-        return invocation.Expression switch
-        {
-            MemberAccessExpressionSyntax memberAccess => memberAccess.Name.Identifier.Text,
-            IdentifierNameSyntax identifier => identifier.Identifier.Text,
-            _ => null
-        };
-    }
-
 
 }

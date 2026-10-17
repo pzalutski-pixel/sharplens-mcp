@@ -1,121 +1,104 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.FindSymbols;
 
 namespace SharpLensMcp;
 
-// Call-relationship analysis: who calls a method (find_callers), what a method
-// calls (get_outgoing_calls), and the transitive call graph (get_call_graph),
-// plus the BFS/cycle-detection helpers they share. Extracted from the broader
-// inspection partial so each partial's name predicts its contents.
+// Call-relationship analysis: who calls a method (find_callers), what a method calls
+// (get_outgoing_calls, and analyze_method's outgoing list), and the transitive call graph
+// (get_call_graph). All of them read one call model, CallGraphSession over
+// CallEdgeCollector, so they agree on what a call is: every call the compiler emits
+// (extension and generic calls as one edge per declaration, constructors, accessors,
+// operators, partial implementations), lambdas and local functions as part of their
+// containing member, and interface or virtual calls fanned out to the implementations the
+// receiver type can reach, flagged viaDispatch.
 public partial class RoslynService
 {
+    private const int MaxCallersResults = 1000;
+    private const int MaxCallDepth = 10;
+    private const int MaxCallGraphNodes = 10000;
+
+    private static readonly string[] CallGraphDirections = { "callees", "callers", "both" };
+
+    // The call model of one tool call.
+    private CallGraphSession CreateCallGraphSession() =>
+        new(_solution!, GetProjectCompilationAsync, GetLogicalProjects());
+
+    // The wire name of a call kind: its CallEdgeKind name in camelCase (invocation,
+    // objectCreation, propertyGet, ...).
+    internal static string CallKindName(CallEdgeKind kind)
+    {
+        var name = kind.ToString();
+        return char.ToLowerInvariant(name[0]) + name[1..];
+    }
+
     public async Task<object> FindCallersAsync(
         string filePath, int line, int column, int? maxResults = null,
         CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var maxResultsToReturn = maxResults ?? 100; // Default to 100
+        if (ParameterValidation.Limit("maxResults", maxResults, MaxCallersResults) is { } invalid) return CreateErrorResponse(invalid);
+        var maxResultsToReturn = maxResults ?? 100;
 
         var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
         if (symbol == null) return error!;
 
-        // Find callers works best for methods, properties, and constructors
-        if (symbol is not (IMethodSymbol or IPropertySymbol))
+        // A property is called through its accessors.
+        var targets = symbol switch
+        {
+            IMethodSymbol method => new[] { method },
+            IPropertySymbol property => new[] { property.GetMethod, property.SetMethod }.OfType<IMethodSymbol>().ToArray(),
+            _ => null
+        };
+        if (targets == null)
         {
             return CreateErrorResponse(
                 ErrorCodes.NotAMethod,
                 "Not a callable symbol",
-                hint: "This tool works for methods, properties, and constructors. Use find_references for other symbol types.",
+                hint: "This tool works for methods, constructors, accessors, operators and properties. Use find_references for other symbol types.",
                 context: new { actualKind = symbol.Kind.ToString(), symbolName = symbol.Name }
             );
         }
 
-        var callers = await SymbolFinder.FindCallersAsync(symbol, _solution!, cancellationToken);
+        var session = CreateCallGraphSession();
+        var sites = new List<CallerSite>();
+        foreach (var target in targets) sites.AddRange(await session.CallersAsync(target, cancellationToken));
 
-        // totalCallers counts individual call SITES (every in-source location), matching
-        // this tool's one-entry-per-site list. analyze_method reports totalCallerGroups
-        // instead — distinct calling symbols — so the two never use the same field name
-        // for different units. SymbolFinder now returns call sites inside generated trees
-        // too, so the loop is deduped against the generated scan (authoritative for
-        // generated callers) by (file, line, column); the scan supplies the flagged
-        // entries, each counted once.
-        var generatedHits = (await ScanGeneratedReferencesAsync(symbol, cancellationToken))
-            .Where(h => h.Kind is "invocation" or "read" or "write")
-            .ToList();
-        var generatedSites = new HashSet<(string?, int, int)>(
-            generatedHits.Select(h => ((string?)h.HintPath, h.Line, h.Column)));
-
-        var totalCallers = 0;
+        // One entry per call site, in canonical location order; the cap keeps the first.
+        var entries = CanonicalOrder.ByLocation(
+            sites.Select(site => (site, location: SiteResultLocation(site.Edge.Site))),
+            entry => entry.location);
         var callerList = new List<object>();
-        foreach (var caller in callers)
+        foreach (var (site, location) in entries.Take(maxResultsToReturn))
         {
-            var callingSymbol = caller.CallingSymbol;
-
-            foreach (var location in caller.Locations.Where(loc => loc.IsInSource))
-            {
-                if (location.SourceTree == null) continue;
-
-                var lineSpan = location.GetLineSpan();
-                if (generatedSites.Contains((location.SourceTree.FilePath,
-                    lineSpan.StartLinePosition.Line, lineSpan.StartLinePosition.Character)))
-                    continue;
-
-                var callerDocument = _solution!.GetDocument(location.SourceTree);
-                if (callerDocument == null) continue;
-
-                totalCallers++;
-                if (callerList.Count >= maxResultsToReturn) continue;
-
-                var text = location.SourceTree.GetText();
-                var lineText = text.Lines[lineSpan.StartLinePosition.Line].ToString().Trim();
-
-                callerList.Add(new
-                {
-                    callingSymbol = new
-                    {
-                        name = callingSymbol.Name,
-                        kind = callingSymbol.Kind.ToString(),
-                        containingType = callingSymbol.ContainingType?.ToDisplayString(),
-                        signature = callingSymbol.ToDisplayString()
-                    },
-                    location = new
-                    {
-                        filePath = FormatPath(callerDocument.FilePath),
-                        line = lineSpan.StartLinePosition.Line,
-                        column = lineSpan.StartLinePosition.Character,
-                        lineText
-                    }
-                });
-            }
-        }
-
-        // Callers inside generator output, surfaced once (deduped against above).
-        foreach (var hit in generatedHits)
-        {
-            totalCallers++;
-            if (callerList.Count >= maxResultsToReturn) continue;
+            var caller = site.Caller;
+            var tree = site.Edge.Site.SourceTree!;
             callerList.Add(new
             {
                 callingSymbol = new
                 {
-                    name = hit.EnclosingSymbol?.Name ?? "(generated)",
-                    kind = hit.EnclosingSymbol?.Kind.ToString() ?? "Unknown",
-                    containingType = hit.EnclosingSymbol?.ContainingType?.ToDisplayString(),
-                    signature = hit.EnclosingSymbol?.ToDisplayString() ?? "(generated code)"
+                    name = caller.Name,
+                    kind = caller.Kind.ToString(),
+                    containingType = caller.ContainingType?.ToDisplayString(),
+                    signature = caller.ToDisplayString()
                 },
                 location = new
                 {
-                    filePath = FormatPath(hit.HintPath),
-                    line = hit.Line,
-                    column = hit.Column,
-                    lineText = hit.LineText
+                    filePath = location.FilePath,
+                    line = location.Line,
+                    column = location.Column,
+                    lineText = tree.GetText(cancellationToken).Lines[location.Line].ToString().Trim()
                 },
-                inGeneratedCode = true
+                kind = CallKindName(site.Edge.Kind),
+                viaDispatch = site.Edge.ViaDispatch,
+                inGeneratedCode = !IsSolutionSourceTree(tree)
             });
         }
 
+        // totalCount counts individual call SITES (every in-source location), matching this
+        // tool's one-entry-per-site list. analyze_method reports totalCallerGroups instead —
+        // distinct calling symbols — so the two never use the same field name for different
+        // units.
         return CreateSuccessResponse(
             data: new
             {
@@ -124,14 +107,19 @@ public partial class RoslynService
                 symbolSignature = symbol.ToDisplayString(),
                 callers = callerList
             },
+            ResultCounts.Capped(entries.Count, callerList.Count),
             suggestedNextTools: new[]
             {
                 "get_containing_member for caller context",
                 "find_references for all usages including non-call references"
-            },
-            totalCount: totalCallers,
-            returnedCount: callerList.Count
-        );
+            });
+    }
+
+    // A call site as a location result, with the path as the tools report it.
+    private ResultLocation SiteResultLocation(Location site)
+    {
+        var span = site.GetLineSpan();
+        return new ResultLocation(FormatPath(span.Path), span.StartLinePosition.Line, span.StartLinePosition.Character);
     }
 
     /// <summary>
@@ -144,89 +132,17 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
+        if (ParameterValidation.Limit("maxDepth", maxDepth, MaxCallDepth) is { } invalid) return CreateErrorResponse(invalid);
         var depth = maxDepth ?? 1;
-        if (depth <= 0 || depth > 10)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"maxDepth must be between 1 and 10 (got {depth})",
-                hint: "Depths above 10 explode for highly-connected codebases. Use get_call_graph for whole-graph traversal.",
-                context: new { maxDepth = depth }
-            );
-        }
 
         var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
         if (pos == null) return posError!;
-        var semanticModel = pos.Model;
 
-        // Find the nearest method OR local function declaration. Without including
-        // LocalFunctionStatementSyntax, a cursor inside a local function walked past
-        // it to the enclosing method and analyzed the WRONG member's outgoing calls.
-        var methodDecl = pos.Token.Parent?.AncestorsAndSelf()
-            .FirstOrDefault(n => n is MethodDeclarationSyntax || n is LocalFunctionStatementSyntax);
-        if (methodDecl == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.NotAMethod,
-                "No method declaration found at position",
-                hint: "Place cursor inside a method or local function body",
-                context: new { filePath, line, column }
-            );
-        }
+        var (methodSymbol, memberError) = MemberAtPosition(pos, filePath, line, column, cancellationToken);
+        if (methodSymbol == null) return memberError!;
 
-        var methodSymbol = semanticModel.GetDeclaredSymbol(methodDecl, cancellationToken) as IMethodSymbol;
-        if (methodSymbol == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "Could not resolve method symbol",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var calls = new List<object>();
-        var recorded = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
-        // Methods whose bodies have been (or are queued to be) walked, keyed by
-        // symbol so a method reached over two paths is expanded once.
-        var expanded = new HashSet<ISymbol>(SymbolEqualityComparer.Default) { methodSymbol };
-        var truncatedByDepth = false;
-
-        // BFS over method bodies: hop 1 records the direct calls (the default), each
-        // further hop walks the bodies of in-source callees discovered one hop earlier.
-        var queue = new Queue<(IMethodSymbol method, int hop)>();
-        queue.Enqueue((methodSymbol, 1));
-
-        while (queue.Count > 0)
-        {
-            var (current, hop) = queue.Dequeue();
-
-            foreach (var reference in await CollectOutgoingReferencesAsync(current, includeProperties: true, cancellationToken))
-            {
-                var symbol = reference.Symbol;
-                var location = symbol.Locations.FirstOrDefault(l => l.IsInSource);
-
-                if (recorded.Add(symbol))
-                {
-                    calls.Add(BuildOutgoingCall(reference, hop));
-                }
-
-                // Properties are recorded but never traversed; only in-source methods
-                // can be traced deeper.
-                if (reference.IsProperty || location == null) continue;
-                var callee = (IMethodSymbol)symbol;
-                if (hop < depth)
-                {
-                    if (expanded.Add(callee)) queue.Enqueue((callee, hop + 1));
-                }
-                // At the depth boundary, only a callee that ITSELF has callees represents
-                // a path we truncated — a true leaf loses nothing by not being expanded.
-                else if (!expanded.Contains(callee)
-                    && (await CollectOutgoingReferencesAsync(callee, includeProperties: false, cancellationToken)).Count > 0)
-                {
-                    truncatedByDepth = true;
-                }
-            }
-        }
+        var session = CreateCallGraphSession();
+        var (calls, truncatedByDepth) = await CollectOutgoingCallsAsync(session, methodSymbol, depth, cancellationToken);
 
         return CreateSuccessResponse(
             data: new
@@ -235,25 +151,185 @@ public partial class RoslynService
                 containingType = methodSymbol.ContainingType?.ToDisplayString(),
                 maxDepth = depth,
                 truncatedByDepth,
-                calls
+                calls = calls.Select(BuildOutgoingCall).ToList()
             },
+            // The calls array is complete for the requested depth; truncated reflects the
+            // depth bound (paths beyond maxDepth were not expanded).
+            ResultCounts.Bounded(calls.Count, truncatedByDepth),
             suggestedNextTools: new[]
             {
                 "get_outgoing_calls on a called method to trace deeper",
                 "find_callers to see who calls this method"
-            },
-            totalCount: calls.Count,
-            returnedCount: calls.Count,
-            // The calls array is complete for the requested depth; meta.Truncated
-            // reflects the depth bound (paths beyond maxDepth were not expanded).
-            truncated: truncatedByDepth
-        );
+            });
     }
 
-    // Transitive call-graph: BFS up to maxDepth, capped at maxNodes, with cycle detection.
-    // Replaces the N-round-trip pattern of agents calling find_callers / get_outgoing_calls
-    // iteratively to trace an impact chain. Returns nodes + edges (streamable) rather than
-    // a nested tree (avoids exponential blowup on diamond-shaped graphs).
+    // The member whose body a position addresses: the nearest enclosing method,
+    // constructor, finalizer, operator, conversion, accessor or local function (a lambda
+    // belongs to its containing member); a property's expression body or a property with a
+    // single accessor addresses that accessor.
+    private (IMethodSymbol? method, object? error) MemberAtPosition(
+        ResolvedPosition pos, string filePath, int line, int column, CancellationToken cancellationToken)
+    {
+        var declaration = pos.Token.Parent?.AncestorsAndSelf().FirstOrDefault(n => n
+            is LocalFunctionStatementSyntax
+            or AccessorDeclarationSyntax
+            or BaseMethodDeclarationSyntax
+            or ArrowExpressionClauseSyntax { Parent: BasePropertyDeclarationSyntax }
+            or BasePropertyDeclarationSyntax);
+
+        var symbol = declaration switch
+        {
+            ArrowExpressionClauseSyntax { Parent: BasePropertyDeclarationSyntax property } =>
+                (pos.Model.GetDeclaredSymbol(property, cancellationToken) as IPropertySymbol)?.GetMethod,
+            BasePropertyDeclarationSyntax property =>
+                pos.Model.GetDeclaredSymbol(property, cancellationToken) switch
+                {
+                    IPropertySymbol { GetMethod: { } getter, SetMethod: null } => getter,
+                    IPropertySymbol { GetMethod: null, SetMethod: { } setter } => setter,
+                    _ => null
+                },
+            null => null,
+            _ => pos.Model.GetDeclaredSymbol(declaration, cancellationToken) as IMethodSymbol
+        };
+
+        if (symbol != null) return (symbol, null);
+        return (null, CreateErrorResponse(
+            ErrorCodes.NotAMethod,
+            declaration is BasePropertyDeclarationSyntax
+                ? "The position is on a property with several accessors"
+                : "No method declaration found at position",
+            hint: "Place the cursor inside a method, constructor, finalizer, operator, accessor or local function body",
+            context: new { filePath, line, column }));
+    }
+
+    // What `root` calls, breadth-first to maxDepth hops: each callee once, at the first hop
+    // it is found, with the first call site that reaches it (a direct call preferred over a
+    // dispatched one at the same hop). A hop's entries are in call-site location order, a
+    // call's dispatch targets after the member it is bound to. Only callees with a body in
+    // the solution are expanded. truncatedByDepth: a callee at the last hop calls a member
+    // not yet listed.
+    private static async Task<(List<OutgoingCall> calls, bool truncatedByDepth)> CollectOutgoingCallsAsync(
+        CallGraphSession session, IMethodSymbol root, int maxDepth, CancellationToken cancellationToken)
+    {
+        var calls = new List<OutgoingCall>();
+        var recorded = new HashSet<ISymbol>(CrossCompilationSymbolComparer.Instance);
+        var expanded = new HashSet<ISymbol>(CrossCompilationSymbolComparer.Instance) { root };
+        var frontier = new List<IMethodSymbol> { root };
+
+        for (var hop = 1; hop <= maxDepth && frontier.Count > 0; hop++)
+        {
+            var discovered = new List<OutgoingCall>();
+            foreach (var node in frontier)
+            {
+                foreach (var edge in (await session.BodyAsync(node, cancellationToken)).Callees)
+                {
+                    discovered.Add(new OutgoingCall(edge.Target, edge.Kind, edge.ViaDispatch, edge.Site, hop));
+                }
+            }
+
+            var ordered = OrderOutgoing(discovered);
+            var added = new List<OutgoingCall>();
+            foreach (var call in ordered.Where(c => !c.ViaDispatch).Concat(ordered.Where(c => c.ViaDispatch)))
+            {
+                if (recorded.Add(call.Target)) added.Add(call);
+            }
+
+            frontier = new List<IMethodSymbol>();
+            foreach (var call in OrderOutgoing(added))
+            {
+                calls.Add(call);
+                if (CallGraphSession.HasSourceBody(call.Target) && expanded.Add(call.Target)) frontier.Add(call.Target);
+            }
+        }
+
+        var truncatedByDepth = false;
+        foreach (var node in frontier)
+        {
+            if ((await session.BodyAsync(node, cancellationToken)).Callees.Any(edge => !recorded.Contains(edge.Target)))
+            {
+                truncatedByDepth = true;
+                break;
+            }
+        }
+        return (calls, truncatedByDepth);
+    }
+
+    private static List<OutgoingCall> OrderOutgoing(IEnumerable<OutgoingCall> calls) => calls
+        .OrderBy(c => ResultLocation.From(c.Site) ?? new ResultLocation("", 0, 0), ResultLocationComparer.Instance)
+        .ThenBy(c => c.ViaDispatch)
+        .ThenBy(c => SymbolOrderKey.Of(c.Target))
+        .ToList();
+
+    // analyze_method's outgoing list: the direct calls, in get_outgoing_calls' projection.
+    internal async Task<List<object>> CollectDirectOutgoingCallsAsync(IMethodSymbol method, CancellationToken cancellationToken)
+    {
+        var (calls, _) = await CollectOutgoingCallsAsync(CreateCallGraphSession(), method, 1, cancellationToken);
+        return calls.Select(call => BuildOutgoingCall(call with { Depth = 0 })).ToList();
+    }
+
+    // The single outgoing-call projection shared by get_outgoing_calls and analyze_method,
+    // so the two never drift. depth is the hop for get_outgoing_calls, null for
+    // analyze_method's single-hop list (Depth 0).
+    private object BuildOutgoingCall(OutgoingCall call)
+    {
+        var target = call.Target;
+        var location = target.Locations.FirstOrDefault(l => l.IsInSource);
+        var lineSpan = location?.GetLineSpan();
+        return new
+        {
+            method = target.ToDisplayString(),
+            shortName = ShortName(target),
+            returnType = target.ReturnType.ToDisplayString(),
+            isAsync = target.IsAsync,
+            isExternal = location == null,
+            kind = CallKindName(call.Kind),
+            viaDispatch = call.ViaDispatch,
+            depth = call.Depth == 0 ? (int?)null : call.Depth,
+            location = lineSpan != null
+                ? new
+                {
+                    filePath = FormatPath(lineSpan.Value.Path),
+                    line = lineSpan.Value.StartLinePosition.Line,
+                    column = lineSpan.Value.StartLinePosition.Character
+                }
+                : null
+        };
+    }
+
+    // A callee's name with its type's simple name, as C# spells the member: Type.Method,
+    // Type.Property.get / .set, Type.Event.add / .remove, Type.Type for a constructor,
+    // Type.~Type for a finalizer, Type.operator + for an operator.
+    private static string ShortName(IMethodSymbol method)
+    {
+        var typeName = method.ContainingType?.Name;
+        var memberName = method switch
+        {
+            { AssociatedSymbol: { } associated } => method.MethodKind switch
+            {
+                MethodKind.PropertyGet => $"{associated.Name}.get",
+                MethodKind.PropertySet => $"{associated.Name}.set",
+                MethodKind.EventAdd => $"{associated.Name}.add",
+                MethodKind.EventRemove => $"{associated.Name}.remove",
+                _ => method.Name
+            },
+            { MethodKind: MethodKind.Constructor or MethodKind.StaticConstructor } => typeName,
+            { MethodKind: MethodKind.Destructor } => $"~{typeName}",
+            { MethodKind: MethodKind.UserDefinedOperator or MethodKind.Conversion } =>
+                method.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat).Split('(')[0],
+            _ => method.Name
+        };
+        return $"{typeName}.{memberName}";
+    }
+
+    // Transitive call graph: a breadth-first walk to maxDepth, capped at maxNodes, with cycle
+    // detection. Replaces the N-round-trip pattern of agents calling find_callers /
+    // get_outgoing_calls iteratively to trace an impact chain. Returns nodes + edges
+    // (streamable) rather than a nested tree (avoids exponential blowup on diamond-shaped
+    // graphs). direction "both" is the callers tree of the root united with its callees
+    // tree: a node reached by the callee walk is expanded only for its callees, one reached
+    // by the caller walk only for its callers. The walk is level by level; the members a
+    // level discovers are registered in canonical symbol order, so node ids and the set kept
+    // at the node cap are the same on every run.
     public async Task<object> GetCallGraphAsync(
         string filePath,
         int line,
@@ -265,55 +341,45 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
-        if (maxDepth <= 0 || maxDepth > 10)
+        if (ParameterValidation.Limit("maxDepth", maxDepth, MaxCallDepth) is { } invalidDepth) return CreateErrorResponse(invalidDepth);
+        if (ParameterValidation.Limit("maxNodes", maxNodes, MaxCallGraphNodes) is { } invalidNodes) return CreateErrorResponse(invalidNodes);
+        if (ParameterValidation.Choice("direction", direction ?? "callees", CallGraphDirections, out var chosenDirection) is { } invalidDirection)
         {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"maxDepth must be between 1 and 10 (got {maxDepth})",
-                hint: "Depths above 10 explode for highly-connected codebases. Drill iteratively with smaller depths.",
-                context: new { maxDepth });
+            return CreateErrorResponse(invalidDirection);
         }
-
-        var dir = direction?.ToLowerInvariant() ?? "callees";
-        if (dir != "callees" && dir != "callers" && dir != "both")
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"direction must be 'callees', 'callers', or 'both' (got '{direction}')",
-                context: new { direction });
-        }
+        var dir = chosenDirection!;
 
         var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
         if (symbol == null) return error!;
 
-        if (symbol is not IMethodSymbol rootSymbol)
+        if (symbol is not IMethodSymbol rootMethod)
         {
             return CreateErrorResponse(
                 ErrorCodes.NotAMethod,
                 "Not a method symbol",
-                hint: "Position the cursor on a method declaration or call site.",
+                hint: "Position the cursor on a method, constructor, accessor or operator declaration, or a call site.",
                 context: new { filePath, line, column });
         }
+        var rootSymbol = (IMethodSymbol)CallEdgeCollector.ResolveBodyCarrier(rootMethod);
 
-        // Node table keyed by symbol; assign sequential ids for the wire format.
-        var nodeIds = new Dictionary<IMethodSymbol, int>(SymbolEqualityComparer.Default);
+        var session = CreateCallGraphSession();
+        var nodeIds = new Dictionary<ISymbol, int>(CrossCompilationSymbolComparer.Instance);
+        var nodeSymbols = new List<IMethodSymbol>();
         var nodes = new List<object>();
         var edges = new List<object>();
-        // Typed adjacency for cycle-detection BFS — avoids dynamic dispatch through
-        // anonymous-typed edge records (which was both slow and fragile).
+        // Typed adjacency for cycle detection.
         var adjacency = new Dictionary<int, List<int>>();
-        // direction=both walks callees AND callers, so the same (from,to) edge is reached
-        // from both ends; dedup so each edge is emitted once.
+        // The same (from, to) pair can be reached from both walks; each edge is emitted once.
         var seenEdges = new HashSet<(int from, int to)>();
-        var cyclesDetected = new HashSet<string>(StringComparer.Ordinal);
-        var truncatedByDepth = false;
+        var cyclesDetected = new List<string>();
+        var cycleSet = new HashSet<string>(StringComparer.Ordinal);
         var truncatedByNodes = false;
 
         int RegisterNode(IMethodSymbol sym, int depth)
         {
-            if (nodeIds.TryGetValue(sym, out var existing)) return existing;
             var id = nodes.Count;
             nodeIds[sym] = id;
+            nodeSymbols.Add(sym);
             nodes.Add(new
             {
                 id,
@@ -325,97 +391,83 @@ public partial class RoslynService
             return id;
         }
 
-        int rootId = RegisterNode(rootSymbol, 0);
-
-        var queue = new Queue<(IMethodSymbol sym, int depth)>();
-        queue.Enqueue((rootSymbol, 0));
-        // nodeIds is the registry of nodes in the graph: a method is registered
-        // exactly once and enqueued only on first registration.
-
-        while (queue.Count > 0)
+        void Connect(int from, int to, CallEdgeKind kind, bool viaDispatch)
         {
-            var (current, depth) = queue.Dequeue();
-            if (depth >= maxDepth)
+            if (!seenEdges.Add((from, to))) return;
+            // A cycle only if this edge closes a loop: `to` can already reach `from`. Tested
+            // BEFORE adding the edge, which would otherwise itself be the path that makes `to`
+            // reach `from`, reading every join of a DAG as a false cycle.
+            if (from == to || IsAncestor(from, to, adjacency))
             {
-                // Only flag truncation if this node actually has neighbors we declined
-                // to expand; a leaf at the boundary loses nothing by not being walked.
-                if (await HasBoundaryNeighborsAsync(current, dir, cancellationToken))
-                    truncatedByDepth = true;
-                continue;
+                var cycle = $"{nodeSymbols[from].ToDisplayString()} -> {nodeSymbols[to].ToDisplayString()}";
+                if (cycleSet.Add(cycle)) cyclesDetected.Add(cycle);
             }
+            edges.Add(new { from, to, kind = CallKindName(kind), viaDispatch });
+            if (!adjacency.TryGetValue(from, out var neighbours)) adjacency[from] = neighbours = new List<int>();
+            neighbours.Add(to);
+        }
 
-            var currentId = nodeIds[current];
-
-            // Callees: walk the method body for invocations.
-            if (dir == "callees" || dir == "both")
+        // One walk level: every (from, to) link the frontier produces, the new members
+        // registered in canonical order within the cap, then the links drawn. Returns the
+        // newly registered members, the next level's frontier.
+        async Task<List<IMethodSymbol>> ExpandAsync(
+            List<IMethodSymbol> frontier, bool callees, int depth)
+        {
+            var links = new List<(IMethodSymbol from, IMethodSymbol to, CallEdgeKind kind, bool viaDispatch)>();
+            foreach (var node in frontier)
             {
-                foreach (var callee in await CollectCalleesAsync(current, cancellationToken))
+                foreach (var (neighbour, kind, viaDispatch) in await NeighboursAsync(session, node, callees, cancellationToken))
                 {
-                    // Already a node: draw the edge (back-edges and cycles included)
-                    // regardless of the node cap.
-                    if (nodeIds.TryGetValue(callee, out var existingId))
-                    {
-                        // A cycle only if this edge closes a loop — the callee can
-                        // already reach `current`. Test BEFORE adding the edge: the edge
-                        // we add here (current -> callee) is otherwise itself the path
-                        // that makes the callee reach current, so every revisit to a
-                        // shared node on a DAG (a join) would read as a false cycle.
-                        if (SymbolEqualityComparer.Default.Equals(callee, current) ||
-                            IsAncestor(currentId, existingId, adjacency))
-                        {
-                            cyclesDetected.Add($"{current.ToDisplayString()} -> {callee.ToDisplayString()}");
-                        }
-                        AddEdge(edges, adjacency, seenEdges,currentId, existingId);
-                        continue;
-                    }
-                    // New node: register only within the cap; at the cap, flag
-                    // truncation and skip.
-                    if (nodes.Count >= maxNodes) { truncatedByNodes = true; continue; }
-                    var calleeId = RegisterNode(callee, depth + 1);
-                    AddEdge(edges, adjacency, seenEdges,currentId, calleeId);
-                    queue.Enqueue((callee, depth + 1));
+                    links.Add(callees ? (node, neighbour, kind, viaDispatch) : (neighbour, node, kind, viaDispatch));
                 }
             }
 
-            // Callers: SymbolFinder gives us call sites; map each to the calling method.
-            if (dir == "callers" || dir == "both")
+            var discovered = links
+                .Select(link => callees ? link.to : link.from)
+                .Where(member => !nodeIds.ContainsKey(member))
+                .Distinct(CrossCompilationSymbolComparer.Instance)
+                .Cast<IMethodSymbol>();
+            var registered = new List<IMethodSymbol>();
+            foreach (var member in CanonicalOrder.BySymbol(discovered, m => m))
             {
-                var callers = await SymbolFinder.FindCallersAsync(current, _solution!, cancellationToken);
-                foreach (var callerInfo in callers)
+                if (nodes.Count >= maxNodes)
                 {
-                    if (callerInfo.CallingSymbol is not IMethodSymbol callerMethod) continue;
-                    if (nodeIds.TryGetValue(callerMethod, out var existingId))
-                    {
-                        AddEdge(edges, adjacency, seenEdges,existingId, currentId);
-                        if (SymbolEqualityComparer.Default.Equals(callerMethod, current) ||
-                            IsAncestor(existingId, currentId, adjacency))
-                        {
-                            cyclesDetected.Add($"{callerMethod.ToDisplayString()} -> {current.ToDisplayString()}");
-                        }
-                        continue;
-                    }
-                    if (nodes.Count >= maxNodes) { truncatedByNodes = true; continue; }
-                    var callerId = RegisterNode(callerMethod, depth + 1);
-                    AddEdge(edges, adjacency, seenEdges,callerId, currentId);
-                    queue.Enqueue((callerMethod, depth + 1));
+                    truncatedByNodes = true;
+                    break;
                 }
+                RegisterNode(member, depth + 1);
+                registered.Add(member);
+            }
 
-                // Callers inside generator output (invisible to SymbolFinder), the same
-                // hits find_callers surfaces. Added as leaf nodes — generator internals
-                // are not expanded further.
-                foreach (var hit in await ScanGeneratedReferencesAsync(current, cancellationToken))
+            foreach (var (from, to, kind, viaDispatch) in links)
+            {
+                if (nodeIds.TryGetValue(from, out var fromId) && nodeIds.TryGetValue(to, out var toId))
                 {
-                    if (hit.Kind is not ("invocation" or "read" or "write")) continue;
-                    if (hit.EnclosingSymbol is not IMethodSymbol genCaller) continue;
-                    if (nodeIds.TryGetValue(genCaller, out var existingGenId))
-                    {
-                        AddEdge(edges, adjacency, seenEdges,existingGenId, currentId);
-                        continue;
-                    }
-                    if (nodes.Count >= maxNodes) { truncatedByNodes = true; continue; }
-                    var genCallerId = RegisterNode(genCaller, depth + 1);
-                    AddEdge(edges, adjacency, seenEdges,genCallerId, currentId);
+                    Connect(fromId, toId, kind, viaDispatch);
                 }
+            }
+            return registered;
+        }
+
+        var rootId = RegisterNode(rootSymbol, 0);
+        var calleeFrontier = dir is "callees" or "both" ? new List<IMethodSymbol> { rootSymbol } : new List<IMethodSymbol>();
+        var callerFrontier = dir is "callers" or "both" ? new List<IMethodSymbol> { rootSymbol } : new List<IMethodSymbol>();
+        for (var depth = 0; depth < maxDepth && (calleeFrontier.Count > 0 || callerFrontier.Count > 0); depth++)
+        {
+            var nextCallees = await ExpandAsync(calleeFrontier, callees: true, depth);
+            var nextCallers = await ExpandAsync(callerFrontier, callees: false, depth);
+            calleeFrontier = nextCallees;
+            callerFrontier = nextCallers;
+        }
+
+        // Depth truncation: a node at the depth boundary that has a neighbour in its walk's
+        // direction (an edge the walk did not draw); a leaf there loses nothing.
+        var truncatedByDepth = false;
+        foreach (var (frontier, callees) in new[] { (calleeFrontier, true), (callerFrontier, false) })
+        {
+            foreach (var node in frontier)
+            {
+                if ((await NeighboursAsync(session, node, callees, cancellationToken)).Count > 0) truncatedByDepth = true;
             }
         }
 
@@ -435,191 +487,36 @@ public partial class RoslynService
                 edges,
                 truncatedByDepth,
                 truncatedByNodes,
-                cyclesDetected = cyclesDetected.ToList()
+                cyclesDetected
             },
+            // The node set is complete only up to the depth and node caps; truncated reflects
+            // either bound (data.truncatedByDepth / truncatedByNodes carry which).
+            ResultCounts.Bounded(nodes.Count, truncatedByDepth || truncatedByNodes),
             suggestedNextTools: new[]
             {
                 "get_outgoing_calls or find_callers for single-hop detail at a specific node",
                 "analyze_change_impact for the impact of changing this method"
-            },
-            totalCount: nodes.Count,
-            returnedCount: nodes.Count,
-            // The node set is complete only up to the depth and node caps; meta.Truncated
-            // reflects either bound (data.truncatedByDepth / truncatedByNodes carry which).
-            truncated: truncatedByDepth || truncatedByNodes);
+            });
     }
 
-    // One method's outgoing reference (a called method or a referenced property),
-    // the single shared notion of "a call" across get_outgoing_calls,
-    // get_call_graph, and analyze_method.
-    internal sealed record OutgoingReference(ISymbol Symbol, bool IsProperty);
-
-    // The canonical "what does this method call" pass, shared so the three
-    // call-flow tools agree. Counts ordinary/local-function invocations and —
-    // when includeProperties is set — property references in BOTH qualified
-    // (`obj.Prop`) and unqualified (`Prop`) form. Dedup is by symbol equality,
-    // not display string, so two distinct symbols that render alike stay
-    // distinct. Operator/conversion/constructor invocations are intentionally
-    // excluded to keep the call set readable.
-    private async Task<List<OutgoingReference>> CollectOutgoingReferencesAsync(
-        IMethodSymbol method, bool includeProperties, CancellationToken cancellationToken = default)
+    // A member's neighbours in one direction, each once: its callees, or the members calling
+    // it. Direct edges come before dispatched ones, each in call-site order, so a neighbour
+    // reached both directly and through dispatch keeps the direct edge.
+    private static async Task<List<(IMethodSymbol neighbour, CallEdgeKind kind, bool viaDispatch)>> NeighboursAsync(
+        CallGraphSession session, IMethodSymbol member, bool callees, CancellationToken cancellationToken)
     {
-        var result = new List<OutgoingReference>();
-        var seen = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
-
-        foreach (var declRef in method.DeclaringSyntaxReferences)
-        {
-            var syntax = await declRef.GetSyntaxAsync(cancellationToken);
-            var document = _solution!.GetDocument(declRef.SyntaxTree);
-            if (document == null) continue;
-            var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
-            if (semanticModel == null) continue;
-
-            foreach (var node in syntax.DescendantNodes())
-            {
-                switch (node)
-                {
-                    case InvocationExpressionSyntax invocation:
-                        if (semanticModel.GetSymbolInfo(invocation, cancellationToken).Symbol is IMethodSymbol called
-                            && called.MethodKind is MethodKind.Ordinary or MethodKind.LocalFunction
-                            && seen.Add(called))
-                        {
-                            result.Add(new OutgoingReference(called, IsProperty: false));
-                        }
-                        break;
-                    // Qualified property reference; the inner name is skipped below.
-                    case MemberAccessExpressionSyntax memberAccess when includeProperties:
-                        if (!IsInNameofOrAttributeArgument(memberAccess)
-                            && semanticModel.GetSymbolInfo(memberAccess, cancellationToken).Symbol is IPropertySymbol qualified
-                            && seen.Add(qualified))
-                        {
-                            result.Add(new OutgoingReference(qualified, IsProperty: true));
-                        }
-                        break;
-                    // Unqualified property reference (`Prop`, not the name part of `obj.Prop`).
-                    case IdentifierNameSyntax identifier when includeProperties
-                        && (identifier.Parent is not MemberAccessExpressionSyntax parentAccess
-                            || parentAccess.Name != identifier):
-                        if (!IsInNameofOrAttributeArgument(identifier)
-                            && semanticModel.GetSymbolInfo(identifier, cancellationToken).Symbol is IPropertySymbol unqualified
-                            && seen.Add(unqualified))
-                        {
-                            result.Add(new OutgoingReference(unqualified, IsProperty: true));
-                        }
-                        break;
-                }
-            }
-        }
-        return result;
-    }
-
-    // The single outgoing-call projection shared by get_outgoing_calls and
-    // analyze_method, so the two never drift. depth is the BFS hop for get_outgoing_calls
-    // and null for analyze_method's single-hop list.
-    private object BuildOutgoingCall(OutgoingReference reference, int? depth)
-    {
-        var symbol = reference.Symbol;
-        var location = symbol.Locations.FirstOrDefault(l => l.IsInSource);
-        var lineSpan = location?.GetLineSpan();
-        object? locationObject = lineSpan != null ? new
-        {
-            filePath = FormatPath(lineSpan.Value.Path),
-            line = lineSpan.Value.StartLinePosition.Line,
-            column = lineSpan.Value.StartLinePosition.Character
-        } : null;
-
-        if (reference.IsProperty)
-        {
-            var prop = (IPropertySymbol)symbol;
-            return new
-            {
-                method = prop.ToDisplayString(),
-                shortName = $"{prop.ContainingType?.Name}.{prop.Name}",
-                returnType = prop.Type.ToDisplayString(),
-                isAsync = false,
-                isProperty = true,
-                isExternal = location == null,
-                depth,
-                location = locationObject
-            };
-        }
-        var calledMethod = (IMethodSymbol)symbol;
-        return new
-        {
-            method = calledMethod.ToDisplayString(),
-            shortName = $"{calledMethod.ContainingType?.Name}.{calledMethod.Name}",
-            returnType = calledMethod.ReturnType.ToDisplayString(),
-            isAsync = calledMethod.IsAsync,
-            isExternal = location == null,
-            depth,
-            location = locationObject
-        };
-    }
-
-    // A property/identifier inside nameof(...) or an attribute argument is a
-    // compile-time reference, not a runtime read — following it as an outgoing call
-    // or an exception source is a false positive. Shared by CollectOutgoingReferencesAsync
-    // and the get_exception_flow walker so both exclude these contexts identically.
-    internal static bool IsInNameofOrAttributeArgument(SyntaxNode node)
-    {
-        for (var current = node.Parent; current != null; current = current.Parent)
-        {
-            switch (current)
-            {
-                case AttributeSyntax:
-                    return true;
-                case InvocationExpressionSyntax { Expression: IdentifierNameSyntax { Identifier.Text: "nameof" } }:
-                    return true;
-                // Reached the enclosing statement/body/member without hitting nameof or
-                // an attribute: this is an ordinary runtime reference. (Attributes are
-                // children of the member declaration, so they are matched above first.)
-                case StatementSyntax:
-                case MemberDeclarationSyntax:
-                    return false;
-            }
-        }
-        return false;
-    }
-
-    // The call-graph's traversable callees: methods only, from the shared pass.
-    private async Task<List<IMethodSymbol>> CollectCalleesAsync(
-        IMethodSymbol method, CancellationToken cancellationToken = default) =>
-        (await CollectOutgoingReferencesAsync(method, includeProperties: false, cancellationToken))
-            .Select(r => (IMethodSymbol)r.Symbol)
+        var edges = callees
+            ? (await session.BodyAsync(member, cancellationToken)).Callees.Select(e => (neighbour: e.Target, edge: e))
+            : (await session.CallersAsync(member, cancellationToken)).Select(s => (neighbour: s.Caller, edge: s.Edge));
+        var ordered = edges
+            .OrderBy(e => e.edge.ViaDispatch)
+            .ThenBy(e => ResultLocation.From(e.edge.Site) ?? new ResultLocation("", 0, 0), ResultLocationComparer.Instance)
             .ToList();
-
-    // Whether a node at the depth boundary has any neighbor (in the active
-    // direction) that would have been expanded with more budget. A true leaf
-    // returns false, so the call graph does not over-report depth truncation.
-    private async Task<bool> HasBoundaryNeighborsAsync(
-        IMethodSymbol method, string direction, CancellationToken cancellationToken)
-    {
-        if (direction is "callees" or "both"
-            && (await CollectCalleesAsync(method, cancellationToken)).Count > 0)
-        {
-            return true;
-        }
-        if (direction is "callers" or "both")
-        {
-            var callers = await SymbolFinder.FindCallersAsync(method, _solution!, cancellationToken);
-            if (callers.Any(c => c.CallingSymbol is IMethodSymbol)) return true;
-        }
-        return false;
-    }
-
-    // Records the edge in both the wire-format list (for output) and the typed adjacency
-    // map (for in-flight cycle detection). Kept in sync at every edge addition.
-    private static void AddEdge(List<object> edges, Dictionary<int, List<int>> adjacency,
-        HashSet<(int from, int to)> seen, int from, int to)
-    {
-        if (!seen.Add((from, to))) return; // already drawn (e.g. reached from both walks)
-        edges.Add(new { from, to, kind = "calls" });
-        if (!adjacency.TryGetValue(from, out var neighbors))
-        {
-            neighbors = new List<int>();
-            adjacency[from] = neighbors;
-        }
-        neighbors.Add(to);
+        var seen = new HashSet<ISymbol>(CrossCompilationSymbolComparer.Instance);
+        return ordered
+            .Where(e => seen.Add(e.neighbour))
+            .Select(e => (e.neighbour, e.edge.Kind, e.edge.ViaDispatch))
+            .ToList();
     }
 
     // Detects whether `candidateId` is reachable from `targetId` via existing edges

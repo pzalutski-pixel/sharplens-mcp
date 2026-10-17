@@ -5,12 +5,10 @@ using Xunit;
 namespace SharpLensMcp.Tests;
 
 // In-memory tests for get_di_registrations covering the actual registration
-// detection. The impl matches by
-//   (a) method name starts with one of the DI patterns
-//   (b) containing-type display string Contains "ServiceCollection"
-// so the fixture's fake extension class is named "...ServiceCollection..."
-// to clear gate (b) without taking a real Microsoft.Extensions.DependencyInjection
-// dependency.
+// detection. The impl recognizes the registration API by its declaring types
+// (Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions and
+// friends) and its exact method names, so the fixtures declare stubs of those types
+// in their real namespaces instead of taking a package dependency.
 public class GetDiRegistrationsDetectionTests
 {
     private const string Code = @"
@@ -21,7 +19,7 @@ namespace App.Abstractions
     public class Bar { }
 }
 
-namespace Microsoft.Extensions.DependencyInjection.Stub
+namespace Microsoft.Extensions.DependencyInjection
 {
     public interface IServiceCollection { }
 
@@ -35,7 +33,7 @@ namespace Microsoft.Extensions.DependencyInjection.Stub
 
 namespace App.Composition
 {
-    using Microsoft.Extensions.DependencyInjection.Stub;
+    using Microsoft.Extensions.DependencyInjection;
     using App.Abstractions;
 
     public class Composition
@@ -103,19 +101,19 @@ namespace App.Composition
 
     private const string NonGenericCode = @"
 using System;
-namespace Microsoft.Extensions.DependencyInjection.Stub2
+namespace Microsoft.Extensions.DependencyInjection
 {
     public interface IServiceCollection { }
     public static class ServiceCollectionServiceExtensions
     {
         public static IServiceCollection AddSingleton(this IServiceCollection svc, Type service, Type impl) => svc;
-        public static IServiceCollection AddSingleton(this IServiceCollection svc, Type service, Func<IServiceCollection, object> factory) => svc;
+        public static IServiceCollection AddSingleton(this IServiceCollection svc, Type service, Func<IServiceProvider, object> factory) => svc;
         public static IServiceCollection AddSingletonCache(this IServiceCollection svc) => svc;
     }
 }
 namespace App2
 {
-    using Microsoft.Extensions.DependencyInjection.Stub2;
+    using Microsoft.Extensions.DependencyInjection;
     public interface IService { }
     public class Service : IService { }
     public class Host
@@ -148,18 +146,21 @@ namespace App2
 
     private const string HostedAndFactoryCode = @"
 using System;
-namespace Microsoft.Extensions.DependencyInjection.Stub3
+namespace Microsoft.Extensions.DependencyInjection
 {
     public interface IServiceCollection { }
-    public static class ServiceCollectionHostedExtensions
+    public static class ServiceCollectionHostedServiceExtensions
     {
         public static IServiceCollection AddHostedService<THosted>(this IServiceCollection svc) where THosted : class => svc;
-        public static IServiceCollection AddSingleton(this IServiceCollection svc, Type service, Func<IServiceCollection, object> factory) => svc;
+    }
+    public static class ServiceCollectionServiceExtensions
+    {
+        public static IServiceCollection AddSingleton(this IServiceCollection svc, Type service, Func<IServiceProvider, object> factory) => svc;
     }
 }
 namespace App3
 {
-    using Microsoft.Extensions.DependencyInjection.Stub3;
+    using Microsoft.Extensions.DependencyInjection;
     public interface IWidget { }
     public class Widget : IWidget { }
     public class Worker { }

@@ -13,7 +13,8 @@ public class GeneratedReferencesTests : RoslynServiceTestBase
 {
     private async Task<JToken> SymbolLocation(string name)
     {
-        var search = await Service.SearchSymbolsAsync(name, kind: null, maxResults: 20);
+        // The record itself, not the generator's same-named JsonTypeInfo property.
+        var search = await Service.SearchSymbolsAsync(name, kind: "Record", maxResults: 20);
         var results = GetData(search)["results"] as JArray;
         results.Should().NotBeNullOrEmpty($"{name} must be findable");
         return results!.First(r => r["name"]!.Value<string>() == name)["location"]!;

@@ -16,6 +16,9 @@ public static class ErrorCodes
     public const string InvalidParameter = "INVALID_PARAMETER";
     public const string AmbiguousMatch = "AMBIGUOUS_MATCH";
     public const string AmbiguousType = "AMBIGUOUS_TYPE";
+    // An apply's target file changed on disk since the edit was computed from it; the
+    // whole apply is refused so the disk edit is never overwritten.
+    public const string StaleDocument = "STALE_DOCUMENT";
     public const string InternalError = "INTERNAL_ERROR";
     public const string Timeout = "TIMEOUT";
 }

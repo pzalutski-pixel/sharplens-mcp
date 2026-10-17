@@ -4,11 +4,10 @@ using Xunit;
 
 namespace SharpLensMcp.Tests;
 
-// In-memory test for find_attribute_usages covering the type-level attribute
-// branch. The impl loops type.GetAttributes() before
-// member.GetAttributes(), so a class-level attribute must surface with
-// symbolKind="Type" (not "Method"), and a method-level attribute with the
-// same simple name must surface separately with symbolKind="Method".
+// In-memory test for find_attribute_usages covering type-level attributes: a
+// class-level attribute surfaces with target "type" and symbolKind "Class" (the
+// symbol-kind vocabulary), and a method-level attribute with the same simple name
+// surfaces separately with target "method" and symbolKind "Method".
 public class FindAttributeUsagesTypeTests
 {
     private const string Code = @"
@@ -47,8 +46,9 @@ namespace Production
         json["success"].Should().NotBeNull();
         json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
         var usages = (json["data"]!["usages"] as JArray)!;
-        var typeUsage = usages.FirstOrDefault(u => u["symbolKind"]!.Value<string>() == "Type");
-        typeUsage.Should().NotBeNull("the impl must emit a Type-kinded entry for the class-level [Tagged] attribute");
+        var typeUsage = usages.FirstOrDefault(u => u["symbolKind"]!.Value<string>() == "Class");
+        typeUsage.Should().NotBeNull("the impl must emit a Class-kinded entry for the class-level [Tagged] attribute");
+        typeUsage!["target"]!.Value<string>().Should().Be("type");
         typeUsage!["symbolName"]!.Value<string>()!.Should().Contain("DecoratedClass",
             "the Type entry must name the decorated class");
         typeUsage["attributeName"]!.Value<string>().Should().Be("TaggedAttribute");
@@ -105,7 +105,7 @@ namespace Production
         var innerHits = usages.Where(u => u["symbolName"]!.Value<string>()!.Contains("Inner")).ToList();
         innerHits.Should().HaveCount(1,
             "a nested type's own attribute is visited via the type walk; it must NOT also be reported as a member of its container");
-        innerHits[0]["symbolKind"]!.Value<string>().Should().Be("Type");
+        innerHits[0]["symbolKind"]!.Value<string>().Should().Be("Class");
         json["meta"]!["TotalCount"]!.Value<int>().Should().Be(1,
             "exactly one [Tagged] usage exists — the nested type must not be double-counted");
     }

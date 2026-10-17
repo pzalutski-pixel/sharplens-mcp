@@ -6,7 +6,7 @@ namespace SharpLensMcp.Tests;
 
 // The shared apply path surfaces compile errors an edit introduces (R4): a tool must
 // not report clean success when its edit left code that does not compile. Verified
-// through change_signature, whose rename does not update body usages.
+// through change_signature removing a parameter its method body still uses.
 public class ApplyPathPostApplyErrorsTests
 {
     private const string Code = @"
@@ -31,10 +31,10 @@ namespace Demo
     {
         var service = Loaded();
 
-        // Renaming a body-used parameter leaves the body referencing the old name.
+        // Removing a body-used parameter leaves the body referencing it.
         var result = await service.ChangeSignatureAsync(
             filePath: null, line: null, column: null,
-            new List<SignatureChange> { new() { Action = "rename", Name = "amount", NewName = "value" } },
+            new List<SignatureChange> { new() { Action = "remove", Name = "amount" } },
             preview: false, typeName: "C", memberName: "Add");
         var root = JObject.FromObject(result);
 
@@ -48,8 +48,9 @@ namespace Demo
 
         var errors = data["postApplyErrors"] as JArray;
         errors.Should().NotBeNull("the edit introduced a compile error and must not report clean success");
-        errors!.Select(e => e.Value<string>()).Should().Contain(s => s!.Contains("CS0103"),
-            "the body still references the old parameter name 'amount'");
+        errors!.Select(e => e.Value<string>()).Should().ContainSingle(s => s!.EndsWith(
+                " (line 5) CS0103: The name 'amount' does not exist in the current context"),
+            "the body still references the removed parameter 'amount'");
     }
 
     [Fact]

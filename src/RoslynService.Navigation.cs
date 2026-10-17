@@ -2,12 +2,16 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FindSymbols;
-using Microsoft.CodeAnalysis.Text;
 
 namespace SharpLensMcp;
 
 public partial class RoslynService
 {
+    // The reference kinds find_references classifies (ClassifyReferenceKind) and its kind
+    // filter accepts.
+    private static readonly IReadOnlyList<string> ReferenceKinds =
+        new[] { "write", "invocation", "cast", "typeof", "nameof", "attribute", "read" };
+
     public async Task<object> GetSymbolInfoAsync(
         string filePath, int line, int column, CancellationToken cancellationToken = default)
     {
@@ -29,129 +33,62 @@ public partial class RoslynService
         );
     }
 
+    // Every reference to the symbol at a position, once per site (FindReferenceSitesAsync),
+    // in the canonical location order, optionally filtered by reference kind and capped at
+    // maxResults.
     public async Task<object> FindReferencesAsync(
         string filePath, int line, int column, int? maxResults = null, string? kindFilter = null,
         CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var maxResultsToReturn = maxResults ?? 100;
-        var filterKind = string.IsNullOrWhiteSpace(kindFilter) ? null : kindFilter!.ToLowerInvariant();
+        if (ParameterValidation.Limit("maxResults", maxResults, MaxListLimit) is { } invalidLimit)
+            return CreateErrorResponse(invalidLimit);
+        if (ParameterValidation.Choice("kind", kindFilter, ReferenceKinds, out var filterKind) is { } invalidKind)
+            return CreateErrorResponse(invalidKind);
 
         var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
         if (symbol == null) return error!;
 
-        var references = await SymbolFinder.FindReferencesAsync(symbol, _solution!, cancellationToken);
-        var allLocations = references
-            .SelectMany(r => r.Locations)
-            .Where(loc => loc.Location.IsInSource)
-            .ToList();
+        var sites = await FindReferenceSitesAsync(symbol, cancellationToken);
+        var matching = filterKind == null ? sites : sites.Where(s => s.Item.Kind == filterKind).ToList();
+        var references = matching.Take(maxResults ?? 100).Select(FormatReferenceSite).ToList();
 
-        // The generated scan is authoritative for references inside generator output:
-        // SymbolFinder now also returns them (the workspace compilation carries generated
-        // trees), so the SymbolFinder loop is deduped against the scan by (file, line,
-        // column) and the scan supplies the flagged entries — each generated reference once.
-        var generatedHits = await ScanGeneratedReferencesAsync(symbol, cancellationToken);
-        var generatedSites = new HashSet<(string?, int, int)>(
-            generatedHits.Select(h => ((string?)h.HintPath, h.Line, h.Column)));
-
-        var totalReferences = 0;
-        var totalAfterFilter = 0;
-        var referenceList = new List<object>();
-
-        foreach (var loc in allLocations)
-        {
-            var refTree = loc.Location.SourceTree;
-            if (refTree == null) continue;
-
-            var refSpan = loc.Location.SourceSpan;
-            var lineSpan = refTree.GetLineSpan(refSpan, cancellationToken);
-            if (generatedSites.Contains((refTree.FilePath,
-                lineSpan.StartLinePosition.Line, lineSpan.StartLinePosition.Character)))
-                continue;
-
-            var refDocument = _solution!.GetDocument(loc.Document.Id);
-            if (refDocument == null) continue;
-
-            var text = refTree.GetText(cancellationToken);
-            var lineText = text.Lines[lineSpan.StartLinePosition.Line].ToString().Trim();
-
-            var refRoot = await refTree.GetRootAsync(cancellationToken);
-            var refNode = refRoot.FindNode(refSpan);
-            var kind = ClassifyReferenceKind(refNode);
-
-            totalReferences++;
-
-            // Apply kind filter (case-insensitive); count distinct filtered-but-not-paginated total.
-            if (filterKind != null && !string.Equals(kind, filterKind, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            totalAfterFilter++;
-            if (referenceList.Count >= maxResultsToReturn)
-                continue;
-
-            referenceList.Add(new
-            {
-                filePath = FormatPath(refDocument.FilePath),
-                line = lineSpan.StartLinePosition.Line,
-                column = lineSpan.StartLinePosition.Character,
-                lineText,
-                kind
-            });
-        }
-
-        // References inside generator output, surfaced once (deduped against above).
-        foreach (var hit in generatedHits)
-        {
-            totalReferences++;
-            if (filterKind != null && !string.Equals(hit.Kind, filterKind, StringComparison.OrdinalIgnoreCase))
-                continue;
-            totalAfterFilter++;
-            if (referenceList.Count >= maxResultsToReturn) continue;
-            referenceList.Add(new
-            {
-                filePath = FormatPath(hit.HintPath),
-                line = hit.Line,
-                column = hit.Column,
-                lineText = hit.LineText,
-                kind = hit.Kind,
-                inGeneratedCode = true
-            });
-        }
-
-        // When no filter is set, totalAfterFilter equals totalReferences; we omit it from the
-        // response to avoid noise. When set, the caller gets both numbers.
+        // totalReferencesAfterFilter is reported only when a filter is set; without one it
+        // equals totalReferences.
         object data = filterKind != null
             ? new
             {
                 symbolName = symbol.Name,
                 symbolKind = symbol.Kind.ToString(),
                 kindFilter = filterKind,
-                totalReferences,
-                totalReferencesAfterFilter = totalAfterFilter,
-                references = referenceList
+                totalReferences = sites.Count,
+                totalReferencesAfterFilter = matching.Count,
+                references
             }
             : new
             {
                 symbolName = symbol.Name,
                 symbolKind = symbol.Kind.ToString(),
-                totalReferences,
-                references = referenceList
+                totalReferences = sites.Count,
+                references
             };
 
         return CreateSuccessResponse(
-            data: data,
+            data,
+            ResultCounts.Capped(matching.Count, references.Count),
             suggestedNextTools: new[]
             {
                 $"get_symbol_info to get details about {symbol.Name}",
                 $"find_callers to see methods that call {symbol.Name}",
                 symbol is INamedTypeSymbol ? $"get_type_members for {symbol.Name}" : null
-            }.Where(s => s != null).ToArray()!,
-            totalCount: filterKind != null ? totalAfterFilter : totalReferences,
-            returnedCount: referenceList.Count
+            }.Where(s => s != null).ToArray()!
         );
     }
 
+    // The definition of the symbol at a position: definition is the part that carries the
+    // body of a partial member (else its earliest part), and locations every declaring part
+    // in path order, each with its start and end.
     public async Task<object> GoToDefinitionAsync(
         string filePath, int line, int column, CancellationToken cancellationToken = default)
     {
@@ -160,8 +97,7 @@ public partial class RoslynService
         var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
         if (symbol == null) return error!;
 
-        var definitionLocation = symbol.Locations.FirstOrDefault(loc => loc.IsInSource);
-
+        var definitionLocation = SymbolDisplayLocation(symbol);
         if (definitionLocation == null)
         {
             return CreateErrorResponse(
@@ -171,8 +107,6 @@ public partial class RoslynService
                 context: new { symbolName = symbol.Name, symbolKind = symbol.Kind.ToString(), fullyQualifiedName = symbol.ToDisplayString() }
             );
         }
-
-        var defLineSpan = definitionLocation.GetLineSpan();
 
         return CreateSuccessResponse(
             data: new
@@ -185,14 +119,8 @@ public partial class RoslynService
                     containingType = symbol.ContainingType?.ToDisplayString(),
                     containingNamespace = symbol.ContainingNamespace?.ToDisplayString()
                 },
-                definition = new
-                {
-                    filePath = FormatPath(defLineSpan.Path),
-                    line = defLineSpan.StartLinePosition.Line,
-                    column = defLineSpan.StartLinePosition.Character,
-                    endLine = defLineSpan.EndLinePosition.Line,
-                    endColumn = defLineSpan.EndLinePosition.Character
-                }
+                definition = FormatDefinitionLocation(definitionLocation),
+                locations = SymbolParts.SourceLocations(symbol).Select(FormatDefinitionLocation).ToList()
             },
             suggestedNextTools: new[]
             {
@@ -203,12 +131,31 @@ public partial class RoslynService
         );
     }
 
+    private object FormatDefinitionLocation(Location location)
+    {
+        var lineSpan = location.GetLineSpan();
+        return new
+        {
+            filePath = FormatPath(lineSpan.Path),
+            line = lineSpan.StartLinePosition.Line,
+            column = lineSpan.StartLinePosition.Character,
+            endLine = lineSpan.EndLinePosition.Line,
+            endColumn = lineSpan.EndLinePosition.Character
+        };
+    }
+
+    // The implementations of the type at a position (FindImplementingTypesAsync): for an
+    // interface every class and struct implementing it, for a class every class deriving
+    // from it, each once, in canonical order, plus implementers declared only in generator
+    // output.
     public async Task<object> FindImplementationsAsync(
         string filePath, int line, int column, int? maxResults = null,
         CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
+        if (ParameterValidation.Limit("maxResults", maxResults, MaxListLimit) is { } invalidLimit)
+            return CreateErrorResponse(invalidLimit);
         var maxResultsToReturn = maxResults ?? 50;
 
         var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
@@ -224,101 +171,73 @@ public partial class RoslynService
             );
         }
 
-        var implementations = await SymbolFinder.FindImplementationsAsync(
-            typeSymbol, _solution!, cancellationToken: cancellationToken);
-        var allImplementations = implementations.ToList();
-        var totalImplementations = allImplementations.Count;
+        var implementations = await FindImplementingTypesAsync(typeSymbol, cancellationToken);
 
-        // The generated scan is authoritative for implementers declared in generator output.
-        // SymbolFinder now also returns them, so flag the SymbolFinder entry whose name the
-        // scan reports as generated; the scan then only adds implementers SymbolFinder missed.
+        // The generated scan is authoritative for implementers declared in generator output:
+        // a SymbolFinder implementer the scan reports is flagged, and the scan adds the ones
+        // SymbolFinder did not return.
         var generatedImpls = await ScanGeneratedImplementationsAsync(typeSymbol, cancellationToken);
-        var generatedImplNames = new HashSet<string>(generatedImpls.Select(h => h.Name), StringComparer.Ordinal);
-
-        var implementationList = new List<object>();
-        foreach (var impl in allImplementations)
+        var generatedNames = new HashSet<string>(generatedImpls.Select(h => h.Name), StringComparer.Ordinal);
+        var entries = implementations.Select(m =>
         {
-            if (implementationList.Count >= maxResultsToReturn)
-                break;
+            var impl = m.Item;
+            var entry = new Dictionary<string, object?>
+            {
+                ["name"] = impl.ToDisplayString(),
+                ["kind"] = GetTypeKindString(impl),
+                ["isAbstract"] = impl.IsAbstract,
+                ["containingNamespace"] = impl.ContainingNamespace?.ToDisplayString(),
+                ["locations"] = SymbolParts.SourceLocations(impl).Select(FormatLocation).ToList()
+            };
+            if (generatedNames.Contains(impl.ToDisplayString())) entry["inGeneratedCode"] = true;
+            return (Name: impl.ToDisplayString(), Entry: WithTargetFrameworks(entry, m.TargetFrameworks));
+        }).ToList();
 
-            var locations = impl.Locations
-                .Where(loc => loc.IsInSource)
-                .Select(loc =>
-                {
-                    var lineSpan = loc.GetLineSpan();
-                    return new
-                    {
-                        filePath = FormatPath(lineSpan.Path),
-                        line = lineSpan.StartLinePosition.Line,
-                        column = lineSpan.StartLinePosition.Character
-                    };
-                })
-                .ToList();
-
-            // Flag a SymbolFinder implementer the scan reports as generated, matching
-            // find_references/find_callers; the scan below then adds only the rest.
-            if (generatedImplNames.Contains(impl.ToDisplayString()))
-                implementationList.Add(new
-                {
-                    name = impl.ToDisplayString(),
-                    kind = GetTypeKindString(impl),
-                    containingNamespace = impl.ContainingNamespace?.ToDisplayString(),
-                    locations,
-                    inGeneratedCode = true
-                });
-            else
-                implementationList.Add(new
-                {
-                    name = impl.ToDisplayString(),
-                    kind = GetTypeKindString(impl),
-                    containingNamespace = impl.ContainingNamespace?.ToDisplayString(),
-                    locations
-                });
-        }
-
-        // Implementers declared in generator output that SymbolFinder did NOT return,
-        // deduped by name against the SymbolFinder results above.
-        var seenImplementations = new HashSet<string>(
-            allImplementations.Select(i => i.ToDisplayString()), StringComparer.Ordinal);
+        var seen = new HashSet<string>(entries.Select(e => e.Name), StringComparer.Ordinal);
         foreach (var hit in generatedImpls)
         {
-            if (!seenImplementations.Add(hit.Name)) continue;
-            totalImplementations++;
-            if (implementationList.Count >= maxResultsToReturn) continue;
-            implementationList.Add(new
+            if (!seen.Add(hit.Name)) continue;
+            entries.Add((hit.Name, new Dictionary<string, object?>
             {
-                name = hit.Name,
-                kind = hit.Kind,
-                containingNamespace = hit.ContainingNamespace,
-                locations = new[] { new { filePath = FormatPath(hit.HintPath), line = hit.Line, column = hit.Column } }.Cast<object>().ToList(),
-                inGeneratedCode = true
-            });
+                ["name"] = hit.Name,
+                ["kind"] = hit.Kind,
+                ["containingNamespace"] = hit.ContainingNamespace,
+                ["locations"] = new[] { new { filePath = FormatPath(hit.HintPath), line = hit.Line, column = hit.Column } },
+                ["inGeneratedCode"] = true
+            }));
         }
+        var ordered = entries.OrderBy(e => e.Name, StringComparer.Ordinal).Select(e => e.Entry).ToList();
+        var page = ordered.Take(maxResultsToReturn).ToList();
 
         return CreateSuccessResponse(
             data: new
             {
                 baseType = typeSymbol.ToDisplayString(),
-                totalImplementations,
-                implementations = implementationList
+                totalImplementations = ordered.Count,
+                implementations = page
             },
+            ResultCounts.Capped(ordered.Count, page.Count),
             suggestedNextTools: new[]
             {
                 $"get_type_members for each implementation to see their members",
                 $"get_type_hierarchy for {typeSymbol.Name} to see full inheritance tree"
-            },
-            totalCount: totalImplementations,
-            returnedCount: implementationList.Count
+            }
         );
     }
 
+    // The hierarchy of the type at a position: its base classes (System.Object omitted), all
+    // its interfaces, and the types directly below it (FindDerivedTypesAsync, not
+    // transitive). maxDerivedTypes caps derivedTypes alone, and the counts describe
+    // derivedTypes; baseTypes and interfaces are always complete.
     public async Task<object> GetTypeHierarchyAsync(
         string filePath, int line, int column, int? maxDerivedTypes = null,
         CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var maxDerivedToReturn = maxDerivedTypes ?? 50; // Default to 50
+        if (ParameterValidation.Limit("maxDerivedTypes", maxDerivedTypes, MaxListLimit) is { } invalidLimit)
+            return CreateErrorResponse(invalidLimit);
+        var maxDerivedToReturn = maxDerivedTypes ?? 50;
 
         var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
         if (symbol == null) return error!;
@@ -333,32 +252,17 @@ public partial class RoslynService
             );
         }
 
-        // Get base types
         var baseTypes = new List<object>();
-        var currentBase = typeSymbol.BaseType;
-        while (currentBase != null && currentBase.SpecialType != SpecialType.System_Object)
+        for (var currentBase = typeSymbol.BaseType;
+             currentBase != null && currentBase.SpecialType != SpecialType.System_Object;
+             currentBase = currentBase.BaseType)
         {
             baseTypes.Add(FormatTypeInfo(currentBase));
-            currentBase = currentBase.BaseType;
         }
 
-        // Get interfaces (capped like derivedTypes, with the true total reported).
-        var allInterfaces = typeSymbol.AllInterfaces;
-        var interfaces = allInterfaces
-            .Take(maxDerivedToReturn)
-            .Select(i => FormatTypeInfo(i))
-            .ToList();
-
-        // Get derived types
-        var derivedTypes = await SymbolFinder.FindDerivedClassesAsync(
-            typeSymbol, _solution!, transitive: false, cancellationToken: cancellationToken);
-        var allDerived = derivedTypes.ToList();
-        var totalDerived = allDerived.Count;
-
-        var derivedList = allDerived
-            .Take(maxDerivedToReturn)
-            .Select(d => FormatTypeInfo(d))
-            .ToList();
+        var interfaces = typeSymbol.AllInterfaces.Select(i => FormatTypeInfo(i)).ToList();
+        var derived = await FindDerivedTypesAsync(typeSymbol, transitive: false, cancellationToken);
+        var derivedList = derived.Take(maxDerivedToReturn).Select(d => FormatTypeInfo(d.Item, d.TargetFrameworks)).ToList();
 
         return CreateSuccessResponse(
             data: new
@@ -366,21 +270,24 @@ public partial class RoslynService
                 typeName = typeSymbol.ToDisplayString(),
                 baseTypes,
                 interfaces,
-                totalInterfaces = allInterfaces.Length,
+                totalInterfaces = interfaces.Count,
                 derivedTypes = derivedList,
-                totalDerivedTypes = totalDerived
+                totalDerivedTypes = derived.Count
             },
+            ResultCounts.Capped(derived.Count, derivedList.Count),
             suggestedNextTools: new[]
             {
                 $"get_type_members for {typeSymbol.Name} to see all members",
                 "get_derived_types by name for transitive derived types",
                 "find_implementations for interface implementations"
-            },
-            totalCount: totalDerived,
-            returnedCount: derivedList.Count
+            }
         );
     }
 
+    // Symbols whose name matches the query, labeled and filtered by the symbol-kind
+    // vocabulary (SymbolKindVocabulary), each once — a multi-targeted declaration with the
+    // target frameworks it occurred in, a namespace once however many projects declare it —
+    // in the canonical symbol order, paged by offset and maxResults.
     public async Task<object> SearchSymbolsAsync(
         string query, string? kind, int maxResults, string? namespaceFilter = null, int offset = 0,
         string matchMode = "glob",
@@ -388,28 +295,24 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
-        var mode = matchMode?.ToLowerInvariant() ?? "glob";
-        if (mode is not ("glob" or "fuzzy"))
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"matchMode must be 'glob' or 'fuzzy' (got '{matchMode}')",
-                context: new { matchMode });
-        }
+        if (ParameterValidation.Choice("matchMode", matchMode, new[] { "glob", "fuzzy" }, out var mode) is { } invalidMode)
+            return CreateErrorResponse(invalidMode);
+        if (ParameterValidation.Choice("kind", kind, SymbolKindVocabulary.AllKinds, out var kindFilter) is { } invalidKind)
+            return CreateErrorResponse(invalidKind);
+        if (ParameterValidation.Limit("maxResults", maxResults, MaxListLimit) is { } invalidLimit)
+            return CreateErrorResponse(invalidLimit);
+        if (ParameterValidation.Offset("offset", offset) is { } invalidOffset)
+            return CreateErrorResponse(invalidOffset);
 
-        var allResults = new List<object>();
-
-        // Check if query contains glob patterns
-        bool isGlobPattern = query.Contains('*') || query.Contains('?');
-
-        foreach (var project in _solution!.Projects)
+        var isGlobPattern = query.Contains('*') || query.Contains('?');
+        var found = new List<(ISymbol Symbol, string Kind, string? TargetFramework)>();
+        foreach (var project in GetLogicalProjects().Projects.SelectMany(p => p.Projects))
         {
             IEnumerable<ISymbol> symbols;
             if (mode == "fuzzy")
             {
-                // Roslyn's IDE pattern matcher: camel-hump ("RSvc" finds
-                // RoslynService), substring, and fuzzy matching — the search
-                // shape agents actually attempt.
+                // Roslyn's IDE pattern matcher: camel-hump ("RSvc" finds RoslynService),
+                // substring, and fuzzy matching — the search shape agents actually attempt.
                 symbols = await SymbolFinder.FindSourceDeclarationsWithPatternAsync(
                     project, query, SymbolFilter.All, cancellationToken);
             }
@@ -423,65 +326,43 @@ public partial class RoslynService
                     cancellationToken);
             }
 
+            var targetFramework = LogicalProject.TargetFrameworkOf(project);
             foreach (var symbol in symbols)
             {
-                // Filter by kind
-                if (!string.IsNullOrEmpty(kind))
-                {
-                    bool matches = false;
-
-                    // For type symbols (Class, Interface, Struct, Enum), check TypeKind
-                    if (symbol is INamedTypeSymbol namedType)
-                    {
-                        matches = GetTypeKindString(namedType).Equals(kind, StringComparison.OrdinalIgnoreCase);
-                    }
-                    else
-                    {
-                        // For other symbols (Method, Property, Field, etc.), check SymbolKind
-                        matches = symbol.Kind.ToString().Equals(kind, StringComparison.OrdinalIgnoreCase);
-                    }
-
-                    if (!matches)
-                        continue;
-                }
-
-                // Filter by namespace
-                if (!string.IsNullOrEmpty(namespaceFilter))
-                {
-                    var symbolNamespace = symbol.ContainingNamespace?.ToDisplayString() ?? "";
-                    bool namespaceMatches = MatchesGlobPattern(symbolNamespace, namespaceFilter);
-
-                    if (!namespaceMatches)
-                        continue;
-                }
-
-                var location = symbol.Locations.FirstOrDefault(loc => loc.IsInSource);
-                if (location == null) continue;
-
-                var lineSpan = location.GetLineSpan();
-
-                allResults.Add(new
-                {
-                    name = symbol.Name,
-                    fullyQualifiedName = symbol.ToDisplayString(),
-                    kind = symbol.Kind.ToString(),
-                    containingType = symbol.ContainingType?.ToDisplayString(),
-                    containingNamespace = symbol.ContainingNamespace?.ToDisplayString(),
-                    location = new
-                    {
-                        filePath = FormatPath(lineSpan.Path),
-                        line = lineSpan.StartLinePosition.Line,
-                        column = lineSpan.StartLinePosition.Character
-                    }
-                });
+                if (symbol is INamespaceSymbol { IsGlobalNamespace: true }) continue;
+                if (SymbolKindVocabulary.Label(symbol) is not { } label) continue;
+                if (kindFilter != null && !SymbolKindVocabulary.Selects(kindFilter, label)) continue;
+                if (!string.IsNullOrEmpty(namespaceFilter)
+                    && !MatchesGlobPattern(symbol.ContainingNamespace?.ToDisplayString() ?? "", namespaceFilter)) continue;
+                if (!symbol.Locations.Any(loc => loc.IsInSource)) continue;
+                found.Add((symbol, label, targetFramework));
             }
         }
 
-        // Apply pagination. totalCount is the true unbounded match count;
-        // hasMore is derived from offset + page size.
-        var totalCount = allResults.Count;
-        var paginatedResults = allResults.Skip(offset).Take(maxResults).ToList();
-        var hasMore = offset + paginatedResults.Count < totalCount;
+        // A namespace is one result however many projects declare it; every other symbol
+        // merges by the solution's identity rule.
+        var merged = TargetFrameworkDeduplication.By(
+            found,
+            f => f.Symbol is INamespaceSymbol ns
+                ? $"N:{ns.ToDisplayString()}"
+                : CrossCompilationSymbol.SolutionKey(f.Symbol) ?? $"{f.Symbol.ToDisplayString()}@{ReportedLocation(f.Symbol.Locations.FirstOrDefault(l => l.IsInSource))}",
+            StringComparer.Ordinal,
+            f => f.TargetFramework);
+        var ordered = CanonicalOrder.BySymbol(merged, m => m.Item.Symbol);
+        var page = Paging.Slice(ordered, offset, maxResults);
+        var results = page.Items.Select(m =>
+        {
+            var symbol = m.Item.Symbol;
+            return WithTargetFrameworks(new Dictionary<string, object?>
+            {
+                ["name"] = symbol.Name,
+                ["fullyQualifiedName"] = symbol.ToDisplayString(),
+                ["kind"] = m.Item.Kind,
+                ["containingType"] = symbol.ContainingType?.ToDisplayString(),
+                ["containingNamespace"] = symbol.ContainingNamespace?.ToDisplayString(),
+                ["location"] = GetSymbolLocation(symbol)
+            }, m.TargetFrameworks);
+        }).ToList();
 
         return CreateSuccessResponse(
             data: new
@@ -489,28 +370,31 @@ public partial class RoslynService
                 query,
                 matchMode = mode,
                 offset,
-                hasMore,
-                results = paginatedResults,
+                hasMore = page.HasMore,
+                results,
                 pagination = new
                 {
-                    nextOffset = hasMore ? offset + paginatedResults.Count : (int?)null
+                    nextOffset = page.NextOffset
                 }
             },
+            ResultCounts.Page(page),
             suggestedNextTools: new[]
             {
                 "get_symbol_info at a result location for detailed info",
                 "get_type_members for type results",
                 "find_references to see all usages"
-            },
-            totalCount: totalCount,
-            returnedCount: paginatedResults.Count
+            }
         );
     }
 
     // Maps a reference node to one of: write, invocation, cast, typeof, nameof, attribute, read.
+    // A reference's span can be shared by the argument holding it (FindNode returns the
+    // outermost node of a span, so `M(x)` and `(x, y)` yield the argument); the reference
+    // is the argument's expression.
     private static string ClassifyReferenceKind(SyntaxNode? node)
     {
         if (node == null) return "read";
+        if (node is ArgumentSyntax argument) node = argument.Expression;
 
         if (IsWriteContext(node)) return "write";
 
@@ -533,11 +417,13 @@ public partial class RoslynService
                     if (inv.Expression is IdentifierNameSyntax id && id.Identifier.Text == "nameof")
                         return "nameof";
                     // "invocation" only when this node IS the invoked target — the whole
-                    // call expression, or the member name of `receiver.Member(...)`. The
-                    // receiver of a call (a read of it) and argument sub-expressions are not
-                    // invocations, even though they sit spatially inside the call.
+                    // call expression, or the member name of `receiver.Member(...)` or of a
+                    // null-conditional `receiver?.Member(...)`. The receiver of a call (a read
+                    // of it) and argument sub-expressions are not invocations, even though
+                    // they sit spatially inside the call.
                     return inv.Expression == node
                         || (inv.Expression is MemberAccessExpressionSyntax ma && ma.Name == node)
+                        || (inv.Expression is MemberBindingExpressionSyntax mb && mb.Name == node)
                         ? "invocation"
                         : "read";
             }
@@ -546,22 +432,38 @@ public partial class RoslynService
         return "read";
     }
 
-    // True when `node` is the target of an assignment, ++/-- operator, or out/ref argument.
+    // True when `node` is assigned to: the target of an assignment (simple, compound,
+    // null-conditional), an element of a deconstruction's left-hand tuple or of a foreach
+    // deconstruction, the operand of ++/--, or a ref/out argument. An indexer reference (its
+    // bracketed argument list) is written when its element access is. The receiver of an
+    // element access (`arr` in `arr[0] = x`) is only read.
     private static bool IsWriteContext(SyntaxNode node)
     {
-        // Walk up across MemberAccess / ElementAccess / parens so `obj.Field = x` still
-        // classifies `Field` as a write.
         var current = node;
+        if (current is BracketedArgumentListSyntax { Parent: ElementAccessExpressionSyntax indexed })
+        {
+            current = indexed;
+        }
+
+        // The member a qualified (`obj.Field`), null-conditional (`obj?.Field`) or
+        // parenthesized expression ends in is what that expression writes.
         while (current.Parent is MemberAccessExpressionSyntax mae && mae.Name == current
-            || current.Parent is ElementAccessExpressionSyntax eae && eae.Expression == current
+            || current.Parent is MemberBindingExpressionSyntax mbe && mbe.Name == current
             || current.Parent is ParenthesizedExpressionSyntax)
         {
             current = current.Parent;
         }
 
+        // A tuple element, at any nesting depth, is written when its tuple is.
+        while (current.Parent is ArgumentSyntax { Parent: TupleExpressionSyntax tuple })
+        {
+            current = tuple;
+        }
+
         return current.Parent switch
         {
             AssignmentExpressionSyntax assign when assign.Left == current => true,
+            ForEachVariableStatementSyntax forEach when forEach.Variable == current => true,
             PrefixUnaryExpressionSyntax pre when
                 pre.IsKind(SyntaxKind.PreIncrementExpression) ||
                 pre.IsKind(SyntaxKind.PreDecrementExpression) => true,
@@ -574,5 +476,4 @@ public partial class RoslynService
             _ => false
         };
     }
-
 }

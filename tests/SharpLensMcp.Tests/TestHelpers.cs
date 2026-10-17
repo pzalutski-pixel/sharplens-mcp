@@ -19,6 +19,9 @@ public static class TestHelpers
             .First(a => a.GetName().Name == "System.Runtime").Location)
     };
 
+    // The framework references every in-memory test project compiles against.
+    internal static IReadOnlyList<MetadataReference> CoreReferenceSet => CoreReferences;
+
     /// <summary>
     /// Creates an AdhocWorkspace with a single document containing the provided code.
     /// </summary>

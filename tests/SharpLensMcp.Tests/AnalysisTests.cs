@@ -192,9 +192,11 @@ public class AnalysisTests : RoslynServiceTestBase
         source.Should().Contain("CreateSuccessResponse",
             "the body uses CreateSuccessResponse for the health_check envelope");
         // lineCount is the method declaration's own line span — consistent with the
-        // reported start/end and free of the leading-trivia lines fullSource carries.
-        var startLine = data["location"]!["startLine"]!.Value<int>();
-        var endLine = data["location"]!["endLine"]!.Value<int>();
+        // reported span and free of the leading-trivia lines fullSource carries.
+        var startLine = data["span"]!["startLine"]!.Value<int>();
+        var endLine = data["span"]!["endLine"]!.Value<int>();
+        data["location"]!["line"]!.Value<int>().Should().Be(startLine,
+            "the name of GetHealthCheckAsync is on the declaration's first line");
         endLine.Should().BeGreaterThan(startLine, "GetHealthCheckAsync spans multiple lines");
         data["lineCount"].Should().NotBeNull();
         data["lineCount"]!.Value<int>().Should().Be(
@@ -595,30 +597,18 @@ public class AnalysisTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task AnalyzeChangeImpact_UnknownChangeType_FallsThroughToInfoSeverity()
+    public async Task AnalyzeChangeImpact_UnknownChangeType_IsInvalidParameter()
     {
+        // An unknown change type is a caller error, never a "safe to proceed" verdict.
         var (file, line, col) = await LocateCreateSuccessResponseAsync();
         var result = await Service.AnalyzeChangeImpactAsync(
             file, line, col, changeType: "made_up_change_type_xyz");
 
-        AssertSuccess(result);
-        var data = GetData(result);
-        // Default branch: unknown change → info severity, no counters.
-        data["breakingChanges"].Should().NotBeNull();
-        data["breakingChanges"]!.Value<int>().Should().Be(0);
-        data["warnings"].Should().NotBeNull();
-        data["warnings"]!.Value<int>().Should().Be(0);
-        data["safe"].Should().NotBeNull();
-        data["safe"]!.Value<bool>().Should().BeTrue();
-        var locations = data["impactedLocations"] as JArray;
-        locations.Should().NotBeNullOrEmpty();
-        foreach (var l in locations!)
-        {
-            l["severity"].Should().NotBeNull();
-            l["severity"]!.Value<string>().Should().Be("info");
-            l["impact"].Should().NotBeNull();
-            l["impact"]!.Value<string>().Should().Be("Unknown impact");
-        }
+        AssertError(result, ErrorCodes.InvalidParameter);
+        var error = JObject.FromObject(result)["error"]!;
+        error["Context"]!["parameter"]!.Value<string>().Should().Be("changeType");
+        error["Context"]!["allowedValues"]!.Values<string>().Should().Equal(
+            "rename", "changeType", "addParameter", "removeParameter", "changeAccessibility", "delete");
     }
 
     [Fact]

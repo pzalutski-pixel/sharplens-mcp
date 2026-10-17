@@ -69,7 +69,7 @@ public class Chain
 
         var pair = FirstPair(json);
         pair["reachable"]!.Value<bool>().Should().BeTrue();
-        pair["hopCount"]!.Value<int>().Should().Be(3, "A -> B -> C is three nodes");
+        pair["hopCount"]!.Value<int>().Should().Be(2, "A -> B -> C is two edges, the unit maxHops bounds");
 
         var hops = ((JArray)pair["hops"]!).Select(h => h["symbol"]!.Value<string>()!).ToList();
         hops.Should().HaveCount(3);

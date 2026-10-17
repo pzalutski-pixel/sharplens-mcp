@@ -37,14 +37,38 @@ public class RequestIdTests
     public void Deserialize_BooleanId_ThrowsJsonException()
     {
         var act = () => JsonSerializer.Deserialize<RequestId>("true", Options);
-        act.Should().Throw<JsonException>().WithMessage("*string or integer*");
+        act.Should().Throw<JsonException>().WithMessage("*string or number*");
     }
 
     [Fact]
     public void Deserialize_ObjectId_ThrowsJsonException()
     {
         var act = () => JsonSerializer.Deserialize<RequestId>("{}", Options);
-        act.Should().Throw<JsonException>().WithMessage("*string or integer*");
+        act.Should().Throw<JsonException>().WithMessage("*string or number*");
+    }
+
+    // JSON-RPC 2.0 §4 allows any JSON number as an id, and §5 requires the response to
+    // carry the same id. A number that is not a long (fraction, exponent, beyond 64 bits)
+    // must be accepted and echoed with its exact JSON text.
+    [Theory]
+    [InlineData("1.5")]
+    [InlineData("1e3")]
+    [InlineData("12345678901234567890")]
+    [InlineData("-0.25E-2")]
+    public void RoundTrip_NonInt64NumberId_EchoesExactJsonText(string jsonNumber)
+    {
+        var id = JsonSerializer.Deserialize<RequestId>(jsonNumber, Options);
+        JsonSerializer.Serialize(id, Options).Should().Be(jsonNumber);
+        id.ToString().Should().Be(jsonNumber);
+    }
+
+    [Fact]
+    public void Deserialize_NonInt64NumberId_IsNotEqualToTheSameTextAsAString()
+    {
+        var number = JsonSerializer.Deserialize<RequestId>("1.5", Options);
+        var text = JsonSerializer.Deserialize<RequestId>("\"1.5\"", Options);
+        (number == text).Should().BeFalse("number 1.5 and string \"1.5\" are distinct ids");
+        number.Should().Be(JsonSerializer.Deserialize<RequestId>("1.5", Options));
     }
 
     [Fact]
@@ -125,14 +149,14 @@ public class RequestIdTests
         // The converter's switch only accepts String + Number.
         // Arrays must fall into the default branch with the canonical message.
         var act = () => JsonSerializer.Deserialize<RequestId>("[1,2,3]", Options);
-        act.Should().Throw<JsonException>().WithMessage("*string or integer*");
+        act.Should().Throw<JsonException>().WithMessage("*string or number*");
     }
 
     [Fact]
     public void Deserialize_NullId_ThrowsJsonException()
     {
         var act = () => JsonSerializer.Deserialize<RequestId>("null", Options);
-        act.Should().Throw<JsonException>().WithMessage("*string or integer*");
+        act.Should().Throw<JsonException>().WithMessage("*string or number*");
     }
 
     [Fact]

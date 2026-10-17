@@ -162,12 +162,13 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         var data = GetData(result);
         data["level"].Should().NotBeNull();
         data["level"]!.Value<string>().Should().Be("project");
-        // Graph is keyed by project name; SharpLensMcp.Tests references SharpLensMcp.
-        var graph = data["graph"] as JObject;
-        graph.Should().NotBeNull();
-        var testDeps = graph!["SharpLensMcp.Tests"] as JArray;
-        testDeps.Should().NotBeNull();
-        testDeps!.Select(t => t.Value<string>()).Should().Contain("SharpLensMcp");
+        // The graph is nodes (one per project) and edges by node id; SharpLensMcp.Tests
+        // references SharpLensMcp.
+        var nameById = ((JArray)data["nodes"]!).ToDictionary(n => n["id"]!.Value<string>()!, n => n["name"]!.Value<string>()!);
+        nameById.Values.Should().Contain(new[] { "SharpLensMcp", "SharpLensMcp.Tests" });
+        ((JArray)data["edges"]!)
+            .Select(e => $"{nameById[e["from"]!.Value<string>()!]}>{nameById[e["to"]!.Value<string>()!]}")
+            .Should().Contain("SharpLensMcp.Tests>SharpLensMcp");
     }
 
     [Fact]
@@ -182,12 +183,10 @@ public class DiscoveryToolTests : RoslynServiceTestBase
         // SharpLensMcp.Tests.Mcp, SharpLensMcp.Tests.Fixtures, SharpLensMcp.Tests.TestAnalyzers.
         data["namespaceCount"].Should().NotBeNull();
         data["namespaceCount"]!.Value<int>().Should().BeGreaterOrEqualTo(5);
-        // The graph keys must include the well-known namespaces.
-        var graph = data["graph"] as JObject;
-        graph.Should().NotBeNull();
-        graph!.ContainsKey("SharpLensMcp").Should().BeTrue();
-        graph.ContainsKey("SharpLensMcp.Tests").Should().BeTrue();
-        graph.ContainsKey("SharpLensMcp.Tests.Fixtures").Should().BeTrue();
+        // The nodes must include the well-known namespaces, and namespaceCount counts them.
+        var nodes = ((JArray)data["nodes"]!).Select(n => n["id"]!.Value<string>()).ToList();
+        nodes.Should().Contain(new[] { "SharpLensMcp", "SharpLensMcp.Tests", "SharpLensMcp.Tests.Fixtures" });
+        data["namespaceCount"]!.Value<int>().Should().Be(nodes.Count);
     }
 
     [Fact]

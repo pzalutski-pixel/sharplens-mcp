@@ -1,5 +1,4 @@
 using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.FindSymbols;
 
 namespace SharpLensMcp;
 
@@ -9,22 +8,32 @@ namespace SharpLensMcp;
 // don't. The tool is a neutral mechanism: the caller names both endpoints and any
 // barriers; it has no built-in notion of what matters.
 //
-// Over-approximate CONTROL reachability, not data flow: virtual/interface dispatch is
-// followed (a reported path is "could reach", not "will"), and it is blind to
-// reflection, delegates dispatched through fields, and DI-by-string, and stops at the
-// metadata boundary (a path TO a BCL/NuGet member means the app calls it).
+// The graph is the one every call tool reads (CallGraphSession): forward edges are a
+// member's callees, backward edges its callers, a lambda or local function is part of its
+// containing member, and interface or virtual calls reach the implementations the
+// receiver type can run. It is over-approximate CONTROL reachability, not data flow (a
+// reported path is "could reach", not "will"), blind to reflection, delegates
+// dispatched through fields, and DI-by-string, and stops at the metadata boundary (a path
+// TO a BCL/NuGet member means the app calls it). Members are keyed by the solution's
+// cross-compilation identity, and every frontier is expanded in canonical symbol order, so
+// the path reported among equally short ones is the same on every run. maxHops counts
+// edges, the unit hopCount reports; with mustPassThrough, maxHops and maxNodes bound the
+// whole spliced path.
 public partial class RoslynService
 {
+    private const int MaxPathHops = 12;
+    private const int MaxPathNodes = 10000;
+
     // One resolved endpoint: the (possibly overloaded) methods a MemberRef names.
     private sealed record EndpointSet(string Display, List<IMethodSymbol> Methods);
 
-    // A visited node's link toward its seed: parent (forward, toward a source) or
+    // A visited node's link toward its seed: the parent (forward, toward a source) or the
     // child (backward, toward a target). Null at a seed.
-    private sealed record PathNode(IMethodSymbol Symbol, string? LinkDocId);
+    private sealed record PathNode(IMethodSymbol Symbol, IMethodSymbol? Link);
 
     private sealed record SearchResult(
         bool Reachable, List<IMethodSymbol> Path, bool HitBounds,
-        int SourceFrontierSize, int TargetFrontierSize);
+        int SourceFrontierSize, int TargetFrontierSize, string? FailedLeg = null);
 
     public async Task<object> FindPathBetweenAsync(
         List<MemberRef> sources,
@@ -45,14 +54,8 @@ public partial class RoslynService
                 hint: "Provide at least one source and one target, each as { typeName, memberName }.");
         }
 
-        if (maxHops < 1 || maxHops > 12)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"maxHops must be between 1 and 12 (got {maxHops})",
-                hint: "Deep reachability searches explode; drill with smaller bounds.",
-                context: new { maxHops });
-        }
+        if (ParameterValidation.Limit("maxHops", maxHops, MaxPathHops) is { } invalidHops) return CreateErrorResponse(invalidHops);
+        if (ParameterValidation.Limit("maxNodes", maxNodes, MaxPathNodes) is { } invalidNodes) return CreateErrorResponse(invalidNodes);
 
         const int maxPairs = 50;
         if ((long)sources.Count * targets.Count > maxPairs)
@@ -71,29 +74,29 @@ public partial class RoslynService
                 hint: "Routing a path through several required nodes is not supported; check one checkpoint, or compose two calls.");
         }
 
-        var (sourceSets, sErr) = await ResolveEndpointsAsync(sources, cancellationToken);
+        var notices = new List<string>();
+        var (sourceSets, sErr) = await ResolveEndpointsAsync(sources, notices, cancellationToken);
         if (sErr != null) return sErr;
-        var (targetSets, tErr) = await ResolveEndpointsAsync(targets, cancellationToken);
+        var (targetSets, tErr) = await ResolveEndpointsAsync(targets, notices, cancellationToken);
         if (tErr != null) return tErr;
 
-        var barrierIds = new HashSet<string>(StringComparer.Ordinal);
+        var barriers = new HashSet<ISymbol>(CrossCompilationSymbolComparer.Instance);
         if (avoidThrough is { Count: > 0 })
         {
-            var (barrierSets, bErr) = await ResolveEndpointsAsync(avoidThrough, cancellationToken);
+            var (barrierSets, bErr) = await ResolveEndpointsAsync(avoidThrough, notices, cancellationToken);
             if (bErr != null) return bErr;
-            foreach (var set in barrierSets)
-                foreach (var m in set.Methods)
-                    barrierIds.Add(DocId(m));
+            foreach (var set in barrierSets) barriers.UnionWith(set.Methods);
         }
 
         EndpointSet? checkpoint = null;
         if (mustPassThrough is { Count: 1 })
         {
-            var (checkpointSets, cErr) = await ResolveEndpointsAsync(mustPassThrough, cancellationToken);
+            var (checkpointSets, cErr) = await ResolveEndpointsAsync(mustPassThrough, notices, cancellationToken);
             if (cErr != null) return cErr;
             checkpoint = checkpointSets[0];
         }
 
+        var session = CreateCallGraphSession();
         var pairs = new List<object>();
         var anyBounded = false;
         var reachableCount = 0;
@@ -106,17 +109,28 @@ public partial class RoslynService
             SearchResult result;
             if (checkpoint == null)
             {
-                result = await BidirectionalSearchAsync(src.Methods, tgt.Methods, barrierIds, maxHops, maxNodes, cancellationToken);
+                result = await BidirectionalSearchAsync(session, src.Methods, tgt.Methods, barriers, maxHops, maxNodes, cancellationToken);
             }
             else
             {
-                // source ⇝ checkpoint ⇝ target: both legs must connect, and the checkpoint
-                // itself must not be a barrier. Splice the two shortest legs.
-                var leg1 = await BidirectionalSearchAsync(src.Methods, checkpoint.Methods, barrierIds, maxHops, maxNodes, cancellationToken);
-                var leg2 = leg1.Reachable
-                    ? await BidirectionalSearchAsync(checkpoint.Methods, tgt.Methods, barrierIds, maxHops, maxNodes, cancellationToken)
-                    : new SearchResult(false, new List<IMethodSymbol>(), leg1.HitBounds, leg1.SourceFrontierSize, 0);
-                result = SpliceLegs(leg1, leg2);
+                // source ⇝ checkpoint ⇝ target: both legs must connect, and the spliced path
+                // stays within maxHops edges and maxNodes visited nodes in total. The first
+                // leg is a shortest one, so the second leg gets the most budget any path
+                // through the checkpoint could leave it.
+                var leg1 = await BidirectionalSearchAsync(session, src.Methods, checkpoint.Methods, barriers, maxHops, maxNodes, cancellationToken);
+                if (!leg1.Reachable)
+                {
+                    result = leg1 with { FailedLeg = "sourceToCheckpoint" };
+                }
+                else
+                {
+                    var leg2 = await BidirectionalSearchAsync(session, checkpoint.Methods, tgt.Methods, barriers,
+                        maxHops - (leg1.Path.Count - 1), maxNodes - (leg1.SourceFrontierSize + leg1.TargetFrontierSize), cancellationToken);
+                    result = leg2.Reachable
+                        ? new SearchResult(true, leg1.Path.Concat(leg2.Path.Skip(1)).ToList(), leg1.HitBounds || leg2.HitBounds,
+                            leg1.SourceFrontierSize, leg2.TargetFrontierSize)
+                        : leg2 with { FailedLeg = "checkpointToTarget" };
+                }
             }
 
             if (result.HitBounds) anyBounded = true;
@@ -130,41 +144,26 @@ public partial class RoslynService
             {
                 pairs,
                 reachableCount,
-                pairCount = pairs.Count
+                pairCount = pairs.Count,
+                notice = notices.Count > 0 ? string.Join(" ", notices) : null
             },
+            ResultCounts.Explicit(pairs.Count, pairs.Count, anyBounded),
             suggestedNextTools: reachableCount > 0
                 ? new[] { "get_call_graph or get_outgoing_calls to expand a hop on the path" }
-                : new[] { "Raise maxHops if hitHopLimit is true, or confirm the endpoints with search_symbols" },
-            totalCount: pairs.Count,
-            returnedCount: pairs.Count,
-            truncated: anyBounded);
+                : new[] { "Raise maxHops if hitHopLimit is true, or confirm the endpoints with search_symbols" });
     }
 
     // Bounded bidirectional BFS between two seed sets. Expands the shallower side each
-    // step (callees + dispatch forward, callers + reverse dispatch backward) until the
-    // frontiers meet, the hop budget is spent, the node cap is hit, or both frontiers
-    // are exhausted.
-    private async Task<SearchResult> BidirectionalSearchAsync(
-        List<IMethodSymbol> sourceSeeds, List<IMethodSymbol> targetSeeds,
-        HashSet<string> barrierIds, int maxHops, int maxNodes, CancellationToken ct)
+    // step (callees forward, callers backward) until the frontiers meet, the hop budget
+    // (in edges) is spent, the node cap is hit, or both frontiers are exhausted.
+    private static async Task<SearchResult> BidirectionalSearchAsync(
+        CallGraphSession session, List<IMethodSymbol> sourceSeeds, List<IMethodSymbol> targetSeeds,
+        HashSet<ISymbol> barriers, int maxHops, int maxNodes, CancellationToken ct)
     {
-        var fwd = new Dictionary<string, PathNode>(StringComparer.Ordinal);
-        var bwd = new Dictionary<string, PathNode>(StringComparer.Ordinal);
-        var fwdFrontier = new List<IMethodSymbol>();
-        var bwdFrontier = new List<IMethodSymbol>();
-
-        foreach (var m in sourceSeeds)
-        {
-            var id = DocId(m);
-            if (barrierIds.Contains(id)) continue;
-            if (fwd.TryAdd(id, new PathNode(m, null))) fwdFrontier.Add(m);
-        }
-        foreach (var m in targetSeeds)
-        {
-            var id = DocId(m);
-            if (barrierIds.Contains(id)) continue;
-            if (bwd.TryAdd(id, new PathNode(m, null))) bwdFrontier.Add(m);
-        }
+        var fwd = new Dictionary<ISymbol, PathNode>(CrossCompilationSymbolComparer.Instance);
+        var bwd = new Dictionary<ISymbol, PathNode>(CrossCompilationSymbolComparer.Instance);
+        var fwdFrontier = Seed(sourceSeeds, fwd, barriers);
+        var bwdFrontier = Seed(targetSeeds, bwd, barriers);
 
         int Total() => fwd.Count + bwd.Count;
 
@@ -180,12 +179,12 @@ public partial class RoslynService
             var expandForward = fwdFrontier.Count > 0 && (bwdFrontier.Count == 0 || fwdDepth <= bwdDepth);
             if (expandForward)
             {
-                fwdFrontier = await ExpandFrontierAsync(fwdFrontier, fwd, barrierIds, maxNodes, Total, forward: true, ct);
+                fwdFrontier = await ExpandFrontierAsync(session, fwdFrontier, fwd, barriers, maxNodes, Total, forward: true, ct);
                 fwdDepth++;
             }
             else
             {
-                bwdFrontier = await ExpandFrontierAsync(bwdFrontier, bwd, barrierIds, maxNodes, Total, forward: false, ct);
+                bwdFrontier = await ExpandFrontierAsync(session, bwdFrontier, bwd, barriers, maxNodes, Total, forward: false, ct);
                 bwdDepth++;
             }
             meet = FindMeet(fwd, bwd);
@@ -202,166 +201,65 @@ public partial class RoslynService
         return new SearchResult(false, new List<IMethodSymbol>(), hitBounds || moreToExplore, fwd.Count, bwd.Count);
     }
 
+    private static List<IMethodSymbol> Seed(List<IMethodSymbol> seeds, Dictionary<ISymbol, PathNode> visited, HashSet<ISymbol> barriers)
+    {
+        var frontier = new List<IMethodSymbol>();
+        foreach (var seed in CanonicalOrder.BySymbol(seeds, s => s))
+        {
+            if (barriers.Contains(seed)) continue;
+            if (visited.TryAdd(seed, new PathNode(seed, null))) frontier.Add(seed);
+        }
+        return frontier;
+    }
+
     // Expands one frontier one level, registering newly-seen non-barrier neighbours with a
     // link back toward their seed. Stops adding once the combined node cap is reached.
-    private async Task<List<IMethodSymbol>> ExpandFrontierAsync(
-        List<IMethodSymbol> frontier, Dictionary<string, PathNode> parent,
-        HashSet<string> barrierIds, int maxNodes, Func<int> total, bool forward, CancellationToken ct)
+    private static async Task<List<IMethodSymbol>> ExpandFrontierAsync(
+        CallGraphSession session, List<IMethodSymbol> frontier, Dictionary<ISymbol, PathNode> visited,
+        HashSet<ISymbol> barriers, int maxNodes, Func<int> total, bool forward, CancellationToken ct)
     {
         var next = new List<IMethodSymbol>();
         foreach (var node in frontier)
         {
             ct.ThrowIfCancellationRequested();
             var neighbours = forward
-                ? await ExpandCalleesWithDispatchAsync(node, ct)
-                : await ExpandCallersWithDispatchAsync(node, ct);
+                ? (await session.BodyAsync(node, ct)).Callees.Select(edge => edge.Target)
+                : (await session.CallersAsync(node, ct)).Select(site => site.Caller);
 
-            foreach (var neighbour in neighbours)
+            foreach (var neighbour in CanonicalOrder.BySymbol(neighbours.Distinct(CrossCompilationSymbolComparer.Instance), s => s))
             {
-                var id = DocId(neighbour);
-                if (barrierIds.Contains(id)) continue;
-                if (parent.ContainsKey(id)) continue;
+                if (barriers.Contains(neighbour) || visited.ContainsKey(neighbour)) continue;
                 if (total() >= maxNodes) return next;
-                parent[id] = new PathNode(neighbour, DocId(node));
-                next.Add(neighbour);
+                visited[neighbour] = new PathNode((IMethodSymbol)neighbour, node);
+                next.Add((IMethodSymbol)neighbour);
             }
         }
         return next;
     }
 
-    // Forward edges: the method's callees, plus — when a callee is dispatched through an
-    // interface/virtual member — its implementations/overrides (over-approximate).
-    private async Task<List<IMethodSymbol>> ExpandCalleesWithDispatchAsync(IMethodSymbol method, CancellationToken ct)
-    {
-        var result = new List<IMethodSymbol>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var callee in await CollectCalleesAsync(method, ct))
-        {
-            if (seen.Add(DocId(callee))) result.Add(callee);
-            foreach (var impl in await FindDispatchTargetsAsync(callee, ct))
-                if (seen.Add(DocId(impl))) result.Add(impl);
-        }
-        return result;
-    }
-
-    // Backward edges: the method's callers (resolved via FindReferencesAsync — solution-wide,
-    // so cross-project callers are not lost the way SymbolFinder.FindCallersAsync loses them,
-    // Roslyn issue #41616). Also searches callers of any interface/base member this method
-    // satisfies, so a call through the interface reaches this override.
-    private async Task<List<IMethodSymbol>> ExpandCallersWithDispatchAsync(IMethodSymbol method, CancellationToken ct)
-    {
-        var result = new List<IMethodSymbol>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-
-        var searchSymbols = new List<IMethodSymbol> { method };
-        searchSymbols.AddRange(GetSatisfiedMembers(method));
-
-        foreach (var symbol in searchSymbols)
-        {
-            var references = await SymbolFinder.FindReferencesAsync(symbol, _solution!, ct);
-            foreach (var referenced in references)
-            {
-                foreach (var loc in referenced.Locations)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    if (!loc.Location.IsInSource || loc.Location.SourceTree == null) continue;
-
-                    var tree = loc.Location.SourceTree;
-                    var root = await tree.GetRootAsync(ct);
-                    var node = root.FindNode(loc.Location.SourceSpan);
-                    if (ClassifyReferenceKind(node) != "invocation") continue;
-
-                    var document = _solution!.GetDocument(tree);
-                    if (document == null) continue;
-                    var semanticModel = await document.GetSemanticModelAsync(ct);
-                    if (semanticModel == null) continue;
-
-                    var enclosing = semanticModel.GetEnclosingSymbol(loc.Location.SourceSpan.Start, ct);
-                    for (var s = enclosing; s != null; s = s.ContainingSymbol)
-                    {
-                        if (s is IMethodSymbol caller && caller.Locations.Any(l => l.IsInSource))
-                        {
-                            if (seen.Add(DocId(caller))) result.Add(caller);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        return result;
-    }
-
-    // Implementations of an interface member, or overrides of a virtual/abstract method.
-    private async Task<IEnumerable<IMethodSymbol>> FindDispatchTargetsAsync(IMethodSymbol method, CancellationToken ct)
-    {
-        if (method.ContainingType?.TypeKind == TypeKind.Interface)
-            return (await SymbolFinder.FindImplementationsAsync(method, _solution!, cancellationToken: ct)).OfType<IMethodSymbol>();
-        if (method.IsVirtual || method.IsAbstract || method.IsOverride)
-            return (await SymbolFinder.FindOverridesAsync(method, _solution!, cancellationToken: ct)).OfType<IMethodSymbol>();
-        return Array.Empty<IMethodSymbol>();
-    }
-
-    // The interface members and overridden base members this method satisfies — a call
-    // through any of them dispatches to this method.
-    private static IEnumerable<IMethodSymbol> GetSatisfiedMembers(IMethodSymbol method)
-    {
-        for (var b = method.OverriddenMethod; b != null; b = b.OverriddenMethod)
-            yield return b;
-
-        var type = method.ContainingType;
-        if (type == null) yield break;
-        foreach (var iface in type.AllInterfaces)
-        {
-            foreach (var member in iface.GetMembers().OfType<IMethodSymbol>())
-            {
-                if (SymbolEqualityComparer.Default.Equals(type.FindImplementationForInterfaceMember(member), method))
-                    yield return member;
-            }
-        }
-    }
-
-    // The lexicographically smallest node present in both frontiers, for deterministic
-    // path selection when several meeting points exist at the same depth.
-    private static string? FindMeet(Dictionary<string, PathNode> fwd, Dictionary<string, PathNode> bwd)
+    // The canonically smallest node present in both frontiers, for deterministic path
+    // selection when several meeting points exist at the same depth.
+    private static IMethodSymbol? FindMeet(Dictionary<ISymbol, PathNode> fwd, Dictionary<ISymbol, PathNode> bwd)
     {
         var (small, large) = fwd.Count <= bwd.Count ? (fwd, bwd) : (bwd, fwd);
-        string? best = null;
-        foreach (var id in small.Keys)
-        {
-            if (large.ContainsKey(id) && (best == null || string.CompareOrdinal(id, best) < 0))
-                best = id;
-        }
-        return best;
+        return CanonicalOrder.BySymbol(small.Values.Select(n => n.Symbol).Where(s => large.ContainsKey(s)), s => s)
+            .FirstOrDefault();
     }
 
     // Source → meet (from the forward links) spliced with meet → target (from the backward
     // links), meet included once.
     private static List<IMethodSymbol> ReconstructPath(
-        string meet, Dictionary<string, PathNode> fwd, Dictionary<string, PathNode> bwd)
+        IMethodSymbol meet, Dictionary<ISymbol, PathNode> fwd, Dictionary<ISymbol, PathNode> bwd)
     {
         var forwardChain = new List<IMethodSymbol>();
-        for (string? id = meet; id != null; id = fwd[id].LinkDocId)
-            forwardChain.Add(fwd[id].Symbol);
+        for (IMethodSymbol? node = meet; node != null; node = fwd[node].Link)
+            forwardChain.Add(fwd[node].Symbol);
         forwardChain.Reverse(); // source .. meet
 
-        for (string? id = bwd[meet].LinkDocId; id != null; id = bwd[id].LinkDocId)
-            forwardChain.Add(bwd[id].Symbol); // meet-child .. target
+        for (var node = bwd[meet].Link; node != null; node = bwd[node].Link)
+            forwardChain.Add(bwd[node].Symbol); // meet-child .. target
 
         return forwardChain;
-    }
-
-    // Joins source⇝checkpoint and checkpoint⇝target into one result, dropping the duplicate
-    // checkpoint node. Unreachable if either leg failed.
-    private static SearchResult SpliceLegs(SearchResult leg1, SearchResult leg2)
-    {
-        if (!leg1.Reachable || !leg2.Reachable)
-        {
-            return new SearchResult(false, new List<IMethodSymbol>(),
-                leg1.HitBounds || leg2.HitBounds, leg1.SourceFrontierSize, leg2.TargetFrontierSize);
-        }
-        var path = new List<IMethodSymbol>(leg1.Path);
-        path.AddRange(leg2.Path.Skip(1)); // leg2 starts at the checkpoint, already the tail of leg1
-        return new SearchResult(true, path, leg1.HitBounds || leg2.HitBounds, leg1.SourceFrontierSize, leg2.TargetFrontierSize);
     }
 
     private object BuildPairPayload(EndpointSet src, EndpointSet tgt, SearchResult result)
@@ -373,7 +271,8 @@ public partial class RoslynService
                 source = src.Display,
                 target = tgt.Display,
                 reachable = true,
-                hopCount = result.Path.Count,
+                // Edges, the unit maxHops bounds: one fewer than the members on the path.
+                hopCount = result.Path.Count - 1,
                 hops = result.Path.Select(m => new
                 {
                     symbol = m.ToDisplayString(),
@@ -388,14 +287,19 @@ public partial class RoslynService
             reachable = false,
             hitHopLimit = result.HitBounds,
             sourceFrontierSize = result.SourceFrontierSize,
-            targetFrontierSize = result.TargetFrontierSize
+            targetFrontierSize = result.TargetFrontierSize,
+            // With mustPassThrough, the leg that did not connect: "sourceToCheckpoint" or
+            // "checkpointToTarget" (its search's frontier sizes are the ones reported).
+            failedLeg = result.FailedLeg
         };
     }
 
-    // Resolves each MemberRef to its method overloads. Returns a structured error (type not
-    // found / ambiguous / no such member) on the first that fails to resolve.
+    // Resolves each MemberRef to the bodies it names: a method's overloads, a property's or
+    // event's accessors, or the type's constructors (memberName ".ctor" or the type's simple
+    // name). Collects each type resolution's shadow notice. Returns a structured error
+    // (type not found / ambiguous / no such member) on the first that fails to resolve.
     private async Task<(List<EndpointSet> sets, object? error)> ResolveEndpointsAsync(
-        List<MemberRef> refs, CancellationToken ct)
+        List<MemberRef> refs, List<string> notices, CancellationToken ct)
     {
         var sets = new List<EndpointSet>();
         foreach (var reference in refs)
@@ -408,9 +312,9 @@ public partial class RoslynService
                     context: new { reference.TypeName, reference.MemberName }));
             }
 
-            var (type, ambiguous) = await FindTypeByNameAsync(reference.TypeName, ct);
-            if (ambiguous != null) return (sets, ambiguous);
-            if (type == null)
+            var resolution = await ResolveTypeByNameAsync(reference.TypeName, ct);
+            if (resolution.Error != null) return (sets, resolution.Error);
+            if (resolution.Type is not { } type)
             {
                 return (sets, CreateErrorResponse(
                     ErrorCodes.TypeNotFound,
@@ -419,27 +323,30 @@ public partial class RoslynService
                     context: new { reference.TypeName }));
             }
 
-            var methods = type.GetMembers(reference.MemberName)
-                .OfType<IMethodSymbol>()
-                .Where(m => m.MethodKind is MethodKind.Ordinary)
+            var methods = GetMembersByName(type, reference.MemberName, includeInherited: false).Members
+                .SelectMany(member => member switch
+                {
+                    IMethodSymbol method => new[] { method },
+                    IPropertySymbol property => new[] { property.GetMethod, property.SetMethod }.OfType<IMethodSymbol>(),
+                    IEventSymbol @event => new[] { @event.AddMethod, @event.RemoveMethod }.OfType<IMethodSymbol>(),
+                    _ => Enumerable.Empty<IMethodSymbol>()
+                })
+                .Select(method => (IMethodSymbol)CallEdgeCollector.ResolveBodyCarrier(method))
+                .Distinct(CrossCompilationSymbolComparer.Instance)
+                .Cast<IMethodSymbol>()
                 .ToList();
             if (methods.Count == 0)
             {
                 return (sets, CreateErrorResponse(
                     ErrorCodes.SymbolNotFound,
                     $"Method '{reference.MemberName}' not found in type '{reference.TypeName}'",
-                    hint: "Use get_type_members to list available methods.",
+                    hint: "Use get_type_members to list available methods, constructors, properties and events.",
                     context: new { reference.TypeName, reference.MemberName }));
             }
 
+            if (resolution.ShadowNotice is { } notice && !notices.Contains(notice)) notices.Add(notice);
             sets.Add(new EndpointSet($"{type.Name}.{reference.MemberName}", methods));
         }
         return (sets, null);
     }
-
-    // Cross-compilation-stable identity: the documentation-comment id of the original
-    // definition. Robust across the base/augmented(generator) compilation boundary where
-    // SymbolEqualityComparer.Default can diverge; falls back to the display string.
-    private static string DocId(ISymbol symbol) =>
-        symbol.OriginalDefinition.GetDocumentationCommentId() ?? symbol.OriginalDefinition.ToDisplayString();
 }

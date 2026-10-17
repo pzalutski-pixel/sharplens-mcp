@@ -1,0 +1,4 @@
+# Test sources are checked out with LF line endings on every platform: their raw-string
+# fixtures and expected texts are compared byte for byte, so a CRLF checkout would change
+# the fixtures' line endings while the expectations written with "\n" stay LF.
+tests/**/*.cs text eol=lf

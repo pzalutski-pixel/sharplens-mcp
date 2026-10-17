@@ -3,15 +3,21 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
-using System.Text;
 
 namespace SharpLensMcp;
 
-// Read-only analysis/inspection tools. Previously co-located with the actual
-// refactoring tools in RoslynService.Refactoring.cs; the split mirrors the
-// v1.5.0 partial-class organization.
+// Read-only analysis/inspection tools.
 public partial class RoslynService
 {
+    // The changeType values analyze_change_impact documents and accepts.
+    private static readonly IReadOnlyList<string> ChangeTypes =
+        new[] { "rename", "changeType", "addParameter", "removeParameter", "changeAccessibility", "delete" };
+
+    // The overloads of the method at a position: the canonical overload set it belongs to
+    // (GetOverloadSet, inherited overloads after the declared ones), each with the
+    // overloadIndex every by-name tool uses for it. A constructor's set is the type's
+    // constructors, an explicit interface implementation's the set its implemented
+    // member's name denotes, a local function's itself alone.
     public async Task<object> GetMethodOverloadsAsync(
         string filePath, int line, int column, CancellationToken cancellationToken = default)
     {
@@ -20,31 +26,25 @@ public partial class RoslynService
         var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
         if (symbol == null) return error!;
 
-        if (symbol is not IMethodSymbol methodSymbol)
+        if (symbol is not IMethodSymbol methodSymbol || MethodKindLabel(methodSymbol) == null)
         {
             return CreateErrorResponse(
                 ErrorCodes.NotAMethod,
                 "Not a method symbol",
-                hint: "This tool requires a method symbol. Use get_method_signature with type and method names instead.",
+                hint: "This tool requires a method, constructor, operator or local function. Use get_method_signature with type and method names instead.",
                 context: new { actualKind = symbol.Kind.ToString(), symbolName = symbol.Name }
             );
         }
 
-        // Get all members of the containing type with the same name
-        var containingType = methodSymbol.ContainingType;
-        var overloads = containingType.GetMembers(methodSymbol.Name)
-            .OfType<IMethodSymbol>()
-            .Where(m => m.MethodKind == MethodKind.Ordinary)
-            .ToList();
-
-        var overloadList = overloads.Select(m =>
+        var set = GetOverloadSet(methodSymbol, includeInherited: true);
+        var overloadList = set.Members.Select((member, index) =>
         {
-            var location = m.Locations.FirstOrDefault(loc => loc.IsInSource);
-            var lineSpan = location?.GetLineSpan();
-
+            var m = (IMethodSymbol)member;
             return new
             {
+                overloadIndex = index,
                 signature = m.ToDisplayString(),
+                kind = MethodKindLabel(m),
                 parameters = m.Parameters.Select(p => new
                 {
                     name = p.Name,
@@ -55,32 +55,41 @@ public partial class RoslynService
                 returnType = m.ReturnType.ToDisplayString(),
                 isAsync = m.IsAsync,
                 isStatic = m.IsStatic,
-                location = lineSpan != null ? new
-                {
-                    filePath = FormatPath(lineSpan.Value.Path),
-                    line = lineSpan.Value.StartLinePosition.Line,
-                    column = lineSpan.Value.StartLinePosition.Character
-                } : null
+                isInherited = set.IsInherited(index),
+                location = GetSymbolLocation(m)
             };
         }).ToList();
 
         return CreateSuccessResponse(
             data: new
             {
-                methodName = methodSymbol.Name,
-                containingType = containingType.ToDisplayString(),
+                methodName = SymbolParts.Canonical(methodSymbol).Name,
+                containingType = methodSymbol.ContainingType?.ToDisplayString(),
                 overloads = overloadList
             },
+            ResultCounts.Complete(overloadList.Count),
             suggestedNextTools: new[]
             {
                 "find_references to see where overloads are called",
                 "get_method_signature for detailed signature info"
-            },
-            totalCount: overloadList.Count,
-            returnedCount: overloadList.Count
+            }
         );
     }
 
+    // The kind label of a method the method tools address: its MemberKind (Method,
+    // Constructor, StaticConstructor, Finalizer, Operator, Conversion) or LocalFunction;
+    // null for an accessor or a lambda, which are not addressable methods.
+    private static string? MethodKindLabel(IMethodSymbol method) =>
+        method.MethodKind == MethodKind.LocalFunction
+            ? "LocalFunction"
+            : MemberClassifier.Classify(method)?.ToString();
+
+    // The member declaration around a position — a method, constructor, finalizer,
+    // operator, conversion, property, indexer, event (field-like or with accessors), field
+    // (one variable of a multi-variable declaration), enum member or delegate — or, for a
+    // position in a type declaration outside its members, the type. Accessors, local
+    // functions and lambdas are inside their member; a C# 14 extension block is inside its
+    // static class; a top-level statement is inside the program's entry point.
     public async Task<object> GetContainingMemberAsync(
         string filePath, int line, int column, CancellationToken cancellationToken = default)
     {
@@ -89,58 +98,72 @@ public partial class RoslynService
         var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
         if (pos == null) return posError!;
 
-        // Walk up the syntax tree to find the containing member
-        var memberNode = pos.Token.Parent?.AncestorsAndSelf().FirstOrDefault(n =>
-            n is MethodDeclarationSyntax or
-            PropertyDeclarationSyntax or
-            ConstructorDeclarationSyntax or
-            ClassDeclarationSyntax or
-            StructDeclarationSyntax or
-            InterfaceDeclarationSyntax);
-
-        if (memberNode == null)
+        VariableDeclaratorSyntax? declarator = null;
+        for (var node = pos.Token.Parent; node != null; node = node.Parent)
         {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No containing member found",
-                hint: "Position may be outside any method, property, or type declaration",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var symbol = pos.Model.GetDeclaredSymbol(memberNode, cancellationToken);
-        if (symbol == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "Could not resolve symbol for containing member",
-                context: new { filePath, line, column }
-            );
-        }
-
-        var span = memberNode.Span;
-        var lineSpan = pos.Tree.GetLineSpan(span);
-
-        return CreateSuccessResponse(
-            data: new
+            ISymbol? symbol = null;
+            switch (node)
             {
-                memberName = symbol.Name,
-                memberKind = symbol.Kind.ToString(),
-                containingType = symbol.ContainingType?.ToDisplayString(),
-                signature = symbol.ToDisplayString(),
-                span = new
-                {
-                    startLine = lineSpan.StartLinePosition.Line,
-                    startColumn = lineSpan.StartLinePosition.Character,
-                    endLine = lineSpan.EndLinePosition.Line,
-                    endColumn = lineSpan.EndLinePosition.Character
-                }
-            },
-            suggestedNextTools: new[]
-            {
-                $"find_references to see usages of {symbol.Name}",
-                "get_symbol_info for more details"
+                case VariableDeclaratorSyntax variable:
+                    declarator = variable;
+                    continue;
+                case BaseFieldDeclarationSyntax field:
+                    var variables = field.Declaration.Variables;
+                    var named = declarator ?? (variables.Count == 1 ? variables[0] : null);
+                    if (named == null)
+                    {
+                        return CreateErrorResponse(
+                            ErrorCodes.AmbiguousMatch,
+                            $"The position is in a declaration of {variables.Count} members ({string.Join(", ", variables.Select(v => v.Identifier.Text))})",
+                            hint: "Place the position on the name or initializer of one of them.",
+                            context: new { filePath, line, column, members = variables.Select(v => v.Identifier.Text).ToList() });
+                    }
+                    symbol = pos.Model.GetDeclaredSymbol(named, cancellationToken);
+                    break;
+                case EnumMemberDeclarationSyntax or BaseMethodDeclarationSyntax or BasePropertyDeclarationSyntax
+                    or DelegateDeclarationSyntax or BaseTypeDeclarationSyntax:
+                    symbol = pos.Model.GetDeclaredSymbol(node, cancellationToken);
+                    if (symbol is INamedTypeSymbol { IsExtension: true }) continue;
+                    break;
+                case GlobalStatementSyntax:
+                    symbol = pos.Model.GetEnclosingSymbol(pos.Position, cancellationToken);
+                    while (symbol is IMethodSymbol { MethodKind: MethodKind.LocalFunction or MethodKind.AnonymousFunction })
+                        symbol = symbol.ContainingSymbol;
+                    break;
+                default:
+                    continue;
             }
+
+            if (symbol == null) break;
+            var lineSpan = pos.Tree.GetLineSpan(node.Span);
+            return CreateSuccessResponse(
+                data: new
+                {
+                    memberName = symbol.Name,
+                    memberKind = SymbolKindVocabulary.Label(symbol) ?? symbol.Kind.ToString(),
+                    containingType = symbol.ContainingType?.ToDisplayString(),
+                    signature = symbol.ToDisplayString(),
+                    span = new
+                    {
+                        startLine = lineSpan.StartLinePosition.Line,
+                        startColumn = lineSpan.StartLinePosition.Character,
+                        endLine = lineSpan.EndLinePosition.Line,
+                        endColumn = lineSpan.EndLinePosition.Character
+                    }
+                },
+                suggestedNextTools: new[]
+                {
+                    $"find_references to see usages of {symbol.Name}",
+                    "get_symbol_info for more details"
+                }
+            );
+        }
+
+        return CreateErrorResponse(
+            ErrorCodes.SymbolNotFound,
+            "No containing member found",
+            hint: "The position is outside every type declaration (a using directive, a namespace declaration, or between types).",
+            context: new { filePath, line, column }
         );
     }
 
@@ -154,7 +177,10 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
         if (ValidateUnusedCodeKindFilter(symbolKindFilter) is { } filterError) return filterError;
+        if (ParameterValidation.Limit("maxResults", maxResults, MaxListLimit) is { } invalidLimit)
+            return CreateErrorResponse(invalidLimit);
         var data = await FindUnusedCodeDataAsyncCore(projectName, includePrivate, includeInternal, symbolKindFilter, maxResults ?? 50, namePredicate: null, cancellationToken);
+        if (data.Error != null) return data.Error;
 
         var countByKind = data.Symbols
             .GroupBy(s => s.Kind)
@@ -177,18 +203,18 @@ public partial class RoslynService
                     column = s.Column
                 }).ToList()
             },
+            ResultCounts.Capped(data.TotalCount, data.Symbols.Count),
             suggestedNextTools: data.Symbols.Count > 0
                 ? new[] { "find_references to verify symbol is truly unused", "rename_symbol or delete unused code" }
-                : new[] { "No unused code found - codebase is clean" },
-            totalCount: data.TotalCount,
-            returnedCount: data.Symbols.Count
+                : new[] { "No unused code found - codebase is clean" }
         );
     }
 
     // Internal typed-data variant used by GetProjectHealthAsync and
     // RemoveUnusedCodeAsync. namePredicate narrows the candidate sweep to
     // matching symbol names BEFORE any reference counting — an allow-list
-    // query checks a handful of names instead of the whole project.
+    // query checks a handful of names instead of the whole project. An unresolvable
+    // projectName yields no symbols and the canonical project error in Error.
     internal Task<UnusedCodeData> FindUnusedCodeDataAsync(
         string? projectName,
         bool includePrivate,
@@ -198,6 +224,18 @@ public partial class RoslynService
         Func<string, bool>? namePredicate = null,
         CancellationToken cancellationToken = default) => FindUnusedCodeDataAsyncCore(projectName, includePrivate, includeInternal, symbolKindFilter, maxResults, namePredicate, cancellationToken);
 
+    // Unused code: source types and members of the scoped projects (ResolveProjectScope) with
+    // no reference outside their own declaration — a member referenced only by itself (a
+    // self-recursive method) is unused, and a type is unused when nothing outside its own
+    // declarations references it or any of its members. Never reported: code something
+    // outside the source calls (the compilation's entry point and its type, test methods by
+    // each framework's discovery contract and the classes holding them, the lifecycle code
+    // a test runner runs around them, framework-set members such as MSTest's TestContext
+    // property, types a framework discovers by interface or attribute), members reached
+    // through a contract (virtual, abstract, override, and implementations of an interface
+    // member), and compiler-generated, extern and non-source symbols. A multi-targeted
+    // project's symbols are checked once. The list is in canonical location order, capped
+    // at maxResults; TotalCount counts every unused symbol.
     private async Task<UnusedCodeData> FindUnusedCodeDataAsyncCore(
         string? projectName,
         bool includePrivate,
@@ -207,197 +245,189 @@ public partial class RoslynService
         Func<string, bool>? namePredicate = null,
         CancellationToken cancellationToken = default)
     {
-        // The returned list is capped at maxResults to bound the payload, but
-        // totalUnused counts EVERY unused symbol so totalCount is the true total (and
-        // meta.Truncated fires when the cap drops some). Identifying unused code
-        // requires reference-checking every candidate, so this is a full scan by
-        // nature — the only way to know what is unused — bounded by the per-call timeout.
-        var unusedSymbols = new List<UnusedSymbolEntry>();
-        var maxResultsToReturn = maxResults;
-        var totalUnused = 0;
+        var (projects, scopeError) = ResolveProjectScope(projectName);
+        if (projects == null) return new UnusedCodeData(0, Array.Empty<UnusedSymbolEntry>(), scopeError);
 
-        var projectsToAnalyze = string.IsNullOrEmpty(projectName)
-            ? _solution!.Projects
-            : _solution!.Projects.Where(p => p.Name == projectName);
+        var shouldAnalyzeTypes = string.IsNullOrEmpty(symbolKindFilter) ||
+                                 symbolKindFilter.Equals("Class", StringComparison.OrdinalIgnoreCase) ||
+                                 symbolKindFilter.Equals("Interface", StringComparison.OrdinalIgnoreCase) ||
+                                 symbolKindFilter.Equals("Struct", StringComparison.OrdinalIgnoreCase) ||
+                                 symbolKindFilter.Equals("Enum", StringComparison.OrdinalIgnoreCase) ||
+                                 symbolKindFilter.Equals("Delegate", StringComparison.OrdinalIgnoreCase) ||
+                                 symbolKindFilter.Equals("Type", StringComparison.OrdinalIgnoreCase);
+        var shouldAnalyzeMembers = string.IsNullOrEmpty(symbolKindFilter) ||
+                                   symbolKindFilter.Equals("Method", StringComparison.OrdinalIgnoreCase) ||
+                                   symbolKindFilter.Equals("Property", StringComparison.OrdinalIgnoreCase) ||
+                                   symbolKindFilter.Equals("Field", StringComparison.OrdinalIgnoreCase) ||
+                                   symbolKindFilter.Equals("Member", StringComparison.OrdinalIgnoreCase);
 
-        foreach (var project in projectsToAnalyze)
+        bool PassesAccessibility(ISymbol symbol) =>
+            (includePrivate || symbol.DeclaredAccessibility != Accessibility.Private)
+            && (includeInternal || symbol.DeclaredAccessibility != Accessibility.Internal);
+
+        var candidates = new List<(ISymbol Symbol, string? TargetFramework)>();
+        var runtimeUsed = new HashSet<ISymbol>(CrossCompilationSymbolComparer.Instance);
+        foreach (var project in projects)
         {
             var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
-
-            var shouldAnalyzeTypes = string.IsNullOrEmpty(symbolKindFilter) ||
-                                     symbolKindFilter.Equals("Class", StringComparison.OrdinalIgnoreCase) ||
-                                     symbolKindFilter.Equals("Interface", StringComparison.OrdinalIgnoreCase) ||
-                                     symbolKindFilter.Equals("Struct", StringComparison.OrdinalIgnoreCase) ||
-                                     symbolKindFilter.Equals("Enum", StringComparison.OrdinalIgnoreCase) ||
-                                     symbolKindFilter.Equals("Delegate", StringComparison.OrdinalIgnoreCase) ||
-                                     symbolKindFilter.Equals("Type", StringComparison.OrdinalIgnoreCase);
+            var targetFramework = LogicalProject.TargetFrameworkOf(project);
+            runtimeUsed.UnionWith(RuntimeUsedSymbols(compilation, cancellationToken));
 
             if (shouldAnalyzeTypes)
             {
-                // Get all named type symbols (classes, interfaces, structs, enums, delegates)
-                var allTypes = compilation.GetSymbolsWithName(namePredicate ?? (_ => true), SymbolFilter.Type)
-                    .OfType<INamedTypeSymbol>();
-
-                foreach (var typeSymbol in allTypes)
+                foreach (var typeSymbol in compilation.GetSymbolsWithName(namePredicate ?? (_ => true), SymbolFilter.Type, cancellationToken)
+                             .OfType<INamedTypeSymbol>())
                 {
-                    // Skip compiler-generated, extern, and types not in source
-                    if (typeSymbol.IsImplicitlyDeclared ||
-                        typeSymbol.IsExtern ||
-                        !typeSymbol.Locations.Any(loc => loc.IsInSource))
-                        continue;
-
-                    // Narrow to the requested kind: "Class" must not also report
-                    // interfaces, structs, and enums.
-                    if (!MatchesKindFilter(typeSymbol, symbolKindFilter)) continue;
-
-                    // Filter by accessibility
-                    if (!includePrivate && typeSymbol.DeclaredAccessibility == Accessibility.Private)
-                        continue;
-                    if (!includeInternal && typeSymbol.DeclaredAccessibility == Accessibility.Internal)
-                        continue;
-
-                    // Skip classes that implement framework interfaces (likely used via DI or framework)
-                    if (ImplementsFrameworkInterface(typeSymbol))
-                        continue;
-
-                    // Skip classes with framework attributes (controllers, hosted services, etc.)
-                    if (HasFrameworkAttribute(typeSymbol))
-                        continue;
-
-                    // Find references to this type. SymbolFinder reference locations
-                    // exclude the declaration itself, so zero locations means unused.
-                    var references = await SymbolFinder.FindReferencesAsync(typeSymbol, _solution!, cancellationToken);
-                    var referenceCount = references.SelectMany(r => r.Locations).Count();
-
-                    // For types, also check if any members are referenced
-                    // This handles static classes where the class itself isn't referenced
-                    // but its static methods/properties are called
-                    var hasReferencedMembers = false;
-                    if (referenceCount == 0) // Type itself has no references
-                    {
-                        // Check if any public/internal members are referenced
-                        foreach (var member in typeSymbol.GetMembers())
-                        {
-                            // Skip constructors, compiler-generated, and special members
-                            if (member.IsImplicitlyDeclared ||
-                                member is IMethodSymbol { MethodKind: MethodKind.Constructor or MethodKind.StaticConstructor })
-                                continue;
-
-                            var memberRefs = await SymbolFinder.FindReferencesAsync(member, _solution!, cancellationToken);
-                            var memberRefCount = memberRefs.SelectMany(r => r.Locations).Count();
-
-                            if (memberRefCount > 0) // Member is referenced
-                            {
-                                hasReferencedMembers = true;
-                                break; // No need to check other members
-                            }
-                        }
-                    }
-
-                    if (referenceCount == 0 && !hasReferencedMembers)
-                    {
-                        var location = typeSymbol.Locations.FirstOrDefault(loc => loc.IsInSource);
-                        if (location != null)
-                        {
-                            totalUnused++;
-                            if (unusedSymbols.Count < maxResultsToReturn)
-                            {
-                                var lineSpan = location.GetLineSpan();
-                                unusedSymbols.Add(new UnusedSymbolEntry(
-                                    Name: typeSymbol.Name,
-                                    FullName: typeSymbol.ToDisplayString(),
-                                    Kind: GetTypeKindString(typeSymbol),
-                                    Accessibility: typeSymbol.DeclaredAccessibility.ToString(),
-                                    ContainingType: null,
-                                    FilePath: FormatPath(lineSpan.Path),
-                                    Line: lineSpan.StartLinePosition.Line,
-                                    Column: lineSpan.StartLinePosition.Character,
-                                    Symbol: typeSymbol));
-                            }
-                        }
-                    }
+                    if (typeSymbol.IsImplicitlyDeclared || typeSymbol.IsExtern || !typeSymbol.Locations.Any(loc => loc.IsInSource)) continue;
+                    if (!MatchesKindFilter(typeSymbol, symbolKindFilter) || !PassesAccessibility(typeSymbol)) continue;
+                    // Types a framework discovers through an interface or attribute (DI,
+                    // hosted services, controllers, test fixtures, serialization).
+                    if (ImplementsFrameworkInterface(typeSymbol) || HasFrameworkAttribute(typeSymbol)) continue;
+                    candidates.Add((typeSymbol, targetFramework));
                 }
             }
 
-            // Check if we should analyze members
-            var shouldAnalyzeMembers = string.IsNullOrEmpty(symbolKindFilter) ||
-                                       symbolKindFilter.Equals("Method", StringComparison.OrdinalIgnoreCase) ||
-                                       symbolKindFilter.Equals("Property", StringComparison.OrdinalIgnoreCase) ||
-                                       symbolKindFilter.Equals("Field", StringComparison.OrdinalIgnoreCase) ||
-                                       symbolKindFilter.Equals("Member", StringComparison.OrdinalIgnoreCase);
-
             if (shouldAnalyzeMembers)
             {
-                // Also check methods, properties, and fields
-                var allMembers = compilation.GetSymbolsWithName(namePredicate ?? (_ => true), SymbolFilter.Member);
-
-                foreach (var member in allMembers)
+                foreach (var member in compilation.GetSymbolsWithName(namePredicate ?? (_ => true), SymbolFilter.Member, cancellationToken))
                 {
-                    if (member is not (IMethodSymbol or IPropertySymbol or IFieldSymbol))
-                        continue;
-
-                    // Narrow to the requested kind: "Method" must not also report
-                    // properties and fields.
+                    if (member is not (IMethodSymbol or IPropertySymbol or IFieldSymbol)) continue;
                     if (!MatchesKindFilter(member, symbolKindFilter)) continue;
-
-                    // Skip compiler-generated, extern, and symbols not in source
-                    if (member.IsImplicitlyDeclared ||
-                        member.IsExtern ||
-                        !member.Locations.Any(loc => loc.IsInSource))
-                        continue;
-
-                    // Skip special methods (constructors, operators, etc.) and any
-                    // polymorphic-dispatch member — abstract/virtual/override are reached
-                    // through the type contract, not necessarily a direct call. Properties
-                    // dispatch the same way, so an abstract/virtual/override property is
-                    // excluded too.
+                    if (member.IsImplicitlyDeclared || member.IsExtern || !member.Locations.Any(loc => loc.IsInSource)) continue;
+                    // Members reached through a contract rather than a direct reference:
+                    // special methods (constructors, operators, accessors, ...), virtual,
+                    // abstract and override members, and interface implementations.
                     if (member is IMethodSymbol method &&
-                        (method.MethodKind != MethodKind.Ordinary || method.IsOverride
-                         || method.IsVirtual || method.IsAbstract))
+                        (method.MethodKind != MethodKind.Ordinary || method.IsOverride || method.IsVirtual || method.IsAbstract))
                         continue;
-                    if (member is IPropertySymbol property &&
-                        (property.IsOverride || property.IsVirtual || property.IsAbstract))
+                    if (member is IPropertySymbol property && (property.IsOverride || property.IsVirtual || property.IsAbstract))
                         continue;
-
-                    // Filter by accessibility
-                    if (!includePrivate && member.DeclaredAccessibility == Accessibility.Private)
-                        continue;
-                    if (!includeInternal && member.DeclaredAccessibility == Accessibility.Internal)
-                        continue;
-
-                    // Find references. SymbolFinder reference locations exclude the
-                    // declaration itself, so zero locations means unused.
-                    var references = await SymbolFinder.FindReferencesAsync(member, _solution!, cancellationToken);
-                    var referenceCount = references.SelectMany(r => r.Locations).Count();
-
-                    if (referenceCount == 0)
-                    {
-                        var location = member.Locations.FirstOrDefault(loc => loc.IsInSource);
-                        if (location != null)
-                        {
-                            totalUnused++;
-                            if (unusedSymbols.Count < maxResultsToReturn)
-                            {
-                                var lineSpan = location.GetLineSpan();
-                                unusedSymbols.Add(new UnusedSymbolEntry(
-                                    Name: member.Name,
-                                    FullName: member.ToDisplayString(),
-                                    Kind: member.Kind.ToString(),
-                                    Accessibility: member.DeclaredAccessibility.ToString(),
-                                    ContainingType: member.ContainingType?.ToDisplayString(),
-                                    FilePath: FormatPath(lineSpan.Path),
-                                    Line: lineSpan.StartLinePosition.Line,
-                                    Column: lineSpan.StartLinePosition.Character,
-                                    Symbol: member));
-                            }
-                        }
-                    }
+                    if (ImplementsInterfaceMember(member)) continue;
+                    if (!PassesAccessibility(member)) continue;
+                    candidates.Add((member, targetFramework));
                 }
             }
         }
 
-        return new UnusedCodeData(TotalCount: totalUnused, Symbols: unusedSymbols);
+        var unused = new List<(ISymbol Symbol, Location Location)>();
+        foreach (var candidate in TargetFrameworkDeduplication.BySymbol(candidates, c => c.Symbol, c => c.TargetFramework))
+        {
+            var symbol = candidate.Item.Symbol;
+            if (runtimeUsed.Contains(symbol)) continue;
+            var isUnused = symbol is INamedTypeSymbol type
+                ? await IsTypeUnusedAsync(type, cancellationToken)
+                : !await IsReferencedOutsideAsync(symbol, symbol.DeclaringSyntaxReferences, cancellationToken);
+            if (!isUnused) continue;
+            if (SymbolDisplayLocation(symbol) is { } location) unused.Add((symbol, location));
+        }
+
+        var ordered = CanonicalOrder.ByLocation(unused, u => ReportedLocation(u.Location));
+        var entries = ordered.Take(maxResults).Select(u =>
+        {
+            var lineSpan = u.Location.GetLineSpan();
+            return new UnusedSymbolEntry(
+                Name: u.Symbol.Name,
+                FullName: u.Symbol.ToDisplayString(),
+                Kind: u.Symbol is INamedTypeSymbol t ? GetTypeKindString(t) : u.Symbol.Kind.ToString(),
+                Accessibility: u.Symbol.DeclaredAccessibility.ToString(),
+                ContainingType: u.Symbol.ContainingType?.ToDisplayString(),
+                FilePath: FormatPath(lineSpan.Path),
+                Line: lineSpan.StartLinePosition.Line,
+                Column: lineSpan.StartLinePosition.Character,
+                Symbol: u.Symbol);
+        }).ToList();
+
+        return new UnusedCodeData(TotalCount: unused.Count, Symbols: entries);
+    }
+
+    // The symbols of a compilation something outside the source calls: the entry point and
+    // its type; every test entry point (TestFrameworkContracts) and class lifecycle method,
+    // the classes declaring them, and the lifecycle roots the runner runs around their tests
+    // (TestLifecycleResolver: constructors, fixtures, IAsyncLifetime/IDisposable
+    // implementations) with their types; and MSTest's TestContext property, which the
+    // framework sets.
+    private static IEnumerable<ISymbol> RuntimeUsedSymbols(Compilation compilation, CancellationToken cancellationToken)
+    {
+        var used = new List<ISymbol>();
+        if (compilation.GetEntryPoint(cancellationToken) is { } entryPoint)
+        {
+            used.Add(entryPoint);
+            used.Add(entryPoint.ContainingType);
+        }
+
+        var sourceTypes = GetAllNamedTypes(compilation)
+            .Where(t => SymbolEqualityComparer.Default.Equals(t.ContainingAssembly, compilation.Assembly)
+                        && t.Locations.Any(l => l.IsInSource))
+            .ToList();
+        var lifecycle = new TestLifecycleResolver(sourceTypes);
+        foreach (var type in sourceTypes)
+        {
+            var testMethods = type.GetMembers().OfType<IMethodSymbol>()
+                .Where(m => TestFrameworkContracts.ClassifyEntryPoint(m) != null || TestFrameworkContracts.IsClassLifecycleMethod(m))
+                .ToList();
+            if (testMethods.Count > 0)
+            {
+                used.Add(type);
+                used.AddRange(testMethods);
+                foreach (var root in lifecycle.RootsForTestsOf(type))
+                {
+                    used.Add(root);
+                    used.Add(root.ContainingType);
+                }
+            }
+            used.AddRange(type.GetMembers().OfType<IPropertySymbol>()
+                .Where(p => TestFrameworkContracts.Is(p.Type, "Microsoft.VisualStudio.TestTools.UnitTesting", "TestContext")));
+        }
+        return used;
+    }
+
+    // Whether a member implements an interface member of its type (explicitly or
+    // implicitly): the interface contract reaches it, so it is required even with no
+    // direct reference.
+    private static bool ImplementsInterfaceMember(ISymbol member)
+    {
+        if (member.ContainingType is not { } type) return false;
+        return type.AllInterfaces.Any(iface => iface.GetMembers().Any(interfaceMember =>
+            type.FindImplementationForInterfaceMember(interfaceMember) is { } implementation
+            && SymbolEqualityComparer.Default.Equals(implementation, member)));
+    }
+
+    // A type is unused when nothing outside its own declarations references it or any of
+    // its members (constructors aside — `new T()` references the type itself).
+    private async Task<bool> IsTypeUnusedAsync(INamedTypeSymbol type, CancellationToken cancellationToken)
+    {
+        var declarations = type.DeclaringSyntaxReferences;
+        if (await IsReferencedOutsideAsync(type, declarations, cancellationToken)) return false;
+        foreach (var member in type.GetMembers())
+        {
+            if (member.IsImplicitlyDeclared ||
+                member is IMethodSymbol { MethodKind: MethodKind.Constructor or MethodKind.StaticConstructor })
+                continue;
+            if (await IsReferencedOutsideAsync(member, declarations, cancellationToken)) return false;
+        }
+        return true;
+    }
+
+    // Whether any reference to the symbol lies outside the given declarations. A reference
+    // inside them (a recursive call, a type naming itself) does not make the symbol used.
+    // Declarations are compared by file path and span, so the copy of a file another target
+    // framework compiles counts as the same declaration.
+    private async Task<bool> IsReferencedOutsideAsync(
+        ISymbol symbol, IReadOnlyList<SyntaxReference> declarations, CancellationToken cancellationToken)
+    {
+        foreach (var reference in await SymbolFinder.FindReferencesAsync(symbol, _solution!, cancellationToken))
+        {
+            foreach (var location in reference.Locations)
+            {
+                var span = location.Location.SourceSpan;
+                var path = location.Location.SourceTree?.FilePath;
+                var inside = declarations.Any(d =>
+                    string.Equals(d.SyntaxTree.FilePath, path, PathComparison) && d.Span.Contains(span));
+                if (!inside) return true;
+            }
+        }
+        return false;
     }
 
     // The symbolKindFilter values find_unused_code and remove_unused_code accept.
@@ -422,7 +452,8 @@ public partial class RoslynService
     // Honors a specific symbolKindFilter at the symbol level. The group gates
     // (shouldAnalyzeTypes/shouldAnalyzeMembers) decide whether a loop runs at all;
     // this narrows within it. Null/empty matches everything; the group tokens
-    // "Type"/"Member" match every kind in that group.
+    // "Type"/"Member" match every kind in that group. A record is a class and a record
+    // struct a struct.
     private static bool MatchesKindFilter(ISymbol symbol, string? filter)
     {
         if (string.IsNullOrEmpty(filter)) return true;
@@ -448,65 +479,58 @@ public partial class RoslynService
         };
     }
 
+    // The project dependency graph (BuildProjectGraph) as nodes and edges, or as Mermaid
+    // flowchart text, with its cycles.
     public Task<object> GetDependencyGraphAsync(string? format, CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var projectGraph = new Dictionary<string, List<string>>();
-        var allProjects = _solution!.Projects.ToList();
+        if (ParameterValidation.Choice("format", format, new[] { "json", "mermaid" }, out var canonicalFormat) is { } invalidFormat)
+            return Task.FromResult(CreateErrorResponse(invalidFormat));
+        cancellationToken.ThrowIfCancellationRequested();
 
-        // Build dependency graph
-        foreach (var project in allProjects)
+        var graph = BuildProjectGraph();
+        var cycles = DetectCycles(graph.ToAdjacency());
+        var suggestedNextTools = cycles.Cycles.Count > 0
+            ? new[] { "Resolve circular dependencies before building" }
+            : new[] { "get_project_structure for detailed project info" };
+
+        if (canonicalFormat == "mermaid")
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var dependencies = project.ProjectReferences
-                .Select(pr => _solution!.GetProject(pr.ProjectId)?.Name)
-                .Where(name => name != null)
-                .Cast<string>()
-                .ToList();
-
-            projectGraph[project.Name] = dependencies;
-        }
-
-        // Detect cycles
-        var cycles = DetectCycles(projectGraph);
-
-        // Generate output based on format
-        if (format?.ToLower() == "mermaid")
-        {
-            var mermaid = GenerateMermaidGraph(projectGraph);
             return Task.FromResult(CreateSuccessResponse(
                 data: new
                 {
                     format = "mermaid",
-                    graph = mermaid,
-                    hasCycles = cycles.Count > 0,
-                    cycles
+                    graph = RenderMermaid(graph),
+                    hasCycles = cycles.Cycles.Count > 0,
+                    cycles = cycles.Cycles,
+                    cyclesTruncated = cycles.Truncated,
+                    stronglyConnectedComponents = cycles.StronglyConnectedComponents
                 },
-                suggestedNextTools: cycles.Count > 0
-                    ? new[] { "Resolve circular dependencies before building" }
-                    : new[] { "get_project_structure for detailed project info" },
-                totalCount: allProjects.Count,
-                returnedCount: allProjects.Count
-            ));
+                ResultCounts.Complete(graph.Nodes.Count),
+                suggestedNextTools: suggestedNextTools));
         }
 
-        // Default: return structured data
         return Task.FromResult(CreateSuccessResponse(
             data: new
             {
-                dependencies = projectGraph,
-                hasCycles = cycles.Count > 0,
-                cycles
+                nodes = FormatGraphNodes(graph),
+                edges = FormatGraphEdges(graph),
+                hasCycles = cycles.Cycles.Count > 0,
+                cycles = cycles.Cycles,
+                cyclesTruncated = cycles.Truncated,
+                stronglyConnectedComponents = cycles.StronglyConnectedComponents
             },
-            suggestedNextTools: cycles.Count > 0
-                ? new[] { "Resolve circular dependencies before building" }
-                : new[] { "get_project_structure for detailed project info" },
-            totalCount: allProjects.Count,
-            returnedCount: allProjects.Count
-        ));
+            ResultCounts.Complete(graph.Nodes.Count),
+            suggestedNextTools: suggestedNextTools));
     }
 
+    // The members a type must still provide, exactly the compiler's requirements: one
+    // entry per interface member without an implementation (CS0535) — abstract members,
+    // static abstract ones included, never a member with a default body, a static member
+    // with a body, or a nested type — and per abstract base member no class between the
+    // type and its declaring base overrides (CS0534). A property or event is one entry,
+    // never its accessors.
     public async Task<object> GetMissingMembersAsync(
         string filePath, int line, int column, CancellationToken cancellationToken = default)
     {
@@ -515,7 +539,6 @@ public partial class RoslynService
         var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
         if (pos == null) return posError!;
 
-        // Find the type declaration
         var typeDecl = pos.Token.Parent?.AncestorsAndSelf().OfType<TypeDeclarationSyntax>().FirstOrDefault();
         if (typeDecl == null)
         {
@@ -527,8 +550,7 @@ public partial class RoslynService
             );
         }
 
-        var typeSymbol = pos.Model.GetDeclaredSymbol(typeDecl, cancellationToken) as INamedTypeSymbol;
-        if (typeSymbol == null)
+        if (pos.Model.GetDeclaredSymbol(typeDecl, cancellationToken) is not INamedTypeSymbol typeSymbol)
         {
             return CreateErrorResponse(
                 ErrorCodes.SymbolNotFound,
@@ -538,35 +560,28 @@ public partial class RoslynService
         }
 
         var missingMembers = new List<object>();
-
-        // Check interfaces
         foreach (var iface in typeSymbol.AllInterfaces)
         {
             foreach (var member in iface.GetMembers())
             {
-                if (member.IsStatic || member.DeclaredAccessibility == Accessibility.Private)
-                    continue;
-
-                var implementation = typeSymbol.FindImplementationForInterfaceMember(member);
-                if (implementation == null)
+                if (!member.IsAbstract || member is INamedTypeSymbol || MemberClassifier.Classify(member) is not { } kind) continue;
+                if (typeSymbol.FindImplementationForInterfaceMember(member) != null) continue;
+                missingMembers.Add(new
                 {
-                    missingMembers.Add(new
-                    {
-                        fromInterface = iface.ToDisplayString(),
-                        memberName = member.Name,
-                        kind = member.Kind.ToString(),
-                        signature = GetMemberSignature(member),
-                        returnType = GetMemberReturnType(member)
-                    });
-                }
+                    fromInterface = iface.ToDisplayString(),
+                    memberName = member.Name,
+                    kind = kind.ToString(),
+                    isStatic = member.IsStatic,
+                    signature = GetMemberSignature(member),
+                    returnType = GetMemberReturnType(member)
+                });
             }
         }
 
-        // Check abstract base class members. INamedTypeSymbol.GetMembers on the queried
-        // type sees only its OWN declarations, so whether an inherited abstract member is
-        // satisfied is resolved by walking the base chain (IsAbstractSlotSatisfied) — an
-        // override living in an intermediate abstract base counts. Each abstract slot is
-        // reported once, attributed to the base that originally declared it.
+        // Whether an inherited abstract member is satisfied is resolved by walking the base
+        // chain (IsAbstractSlotSatisfied) — an override in an intermediate abstract base
+        // counts. Each abstract slot is reported once, attributed to the base that
+        // originally declared it.
         var reportedSlots = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
         for (var baseType = typeSymbol.BaseType; baseType != null; baseType = baseType.BaseType)
         {
@@ -574,7 +589,7 @@ public partial class RoslynService
 
             foreach (var member in baseType.GetMembers())
             {
-                if (!member.IsAbstract) continue;
+                if (!member.IsAbstract || member is INamedTypeSymbol || MemberClassifier.Classify(member) == null) continue;
 
                 var slotRoot = GetOverrideSlotRoot(member);
                 if (!reportedSlots.Add(slotRoot.OriginalDefinition)) continue;
@@ -584,7 +599,8 @@ public partial class RoslynService
                 {
                     fromAbstractClass = slotRoot.ContainingType.ToDisplayString(),
                     memberName = slotRoot.Name,
-                    kind = slotRoot.Kind.ToString(),
+                    kind = MemberClassifier.Classify(slotRoot)!.Value.ToString(),
+                    isStatic = slotRoot.IsStatic,
                     signature = GetMemberSignature(slotRoot),
                     returnType = GetMemberReturnType(slotRoot)
                 });
@@ -599,11 +615,10 @@ public partial class RoslynService
                 interfaces = typeSymbol.AllInterfaces.Select(i => i.ToDisplayString()).ToList(),
                 missingMembers
             },
+            ResultCounts.Complete(missingMembers.Count),
             suggestedNextTools: missingMembers.Count > 0
                 ? new[] { "Use the signatures to implement the missing members" }
-                : new[] { "All interface and abstract members are implemented" },
-            totalCount: missingMembers.Count,
-            returnedCount: missingMembers.Count
+                : new[] { "All interface and abstract members are implemented" }
         );
     }
 
@@ -615,9 +630,9 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
-        var (type, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
-        if (ambiguousType != null) return ambiguousType;
-        if (type == null)
+        var resolution = await ResolveTypeByNameAsync(typeName, cancellationToken);
+        if (resolution.Error != null) return resolution.Error;
+        if (resolution.Type is not { } type)
         {
             return CreateErrorResponse(
                 ErrorCodes.TypeNotFound,
@@ -627,7 +642,6 @@ public partial class RoslynService
             );
         }
 
-        // Get constructors
         var constructors = type.Constructors
             .Where(c => c.DeclaredAccessibility == Accessibility.Public ||
                         c.DeclaredAccessibility == Accessibility.Protected)
@@ -646,12 +660,12 @@ public partial class RoslynService
             })
             .ToList();
 
-        // Find static factory methods
+        var definition = type.OriginalDefinition;
         var factoryMethods = type.GetMembers()
             .OfType<IMethodSymbol>()
             .Where(m => m.IsStatic &&
-                       m.DeclaredAccessibility == Accessibility.Public &&
-                       SymbolEqualityComparer.Default.Equals(m.ReturnType, type))
+                        m.DeclaredAccessibility == Accessibility.Public &&
+                        SymbolEqualityComparer.Default.Equals(m.ReturnType.OriginalDefinition, definition))
             .Select(m => new
             {
                 name = m.Name,
@@ -666,57 +680,45 @@ public partial class RoslynService
             })
             .ToList();
 
-        // Find factory methods in other types that return this type. Re-resolve
-        // `type` in each project's augmented compilation: FindTypeByNameAsync
-        // returns the type from the BASE compilation, but allTypes (and their
-        // return types) come from the AUGMENTED compilation. When a project has
-        // source generators (implicit .NET SDK generators count), base != augmented
-        // and SymbolEqualityComparer.Default returns false for the "same" source
-        // type across compilations — silently breaking external-factory detection.
-        // Match the target type by its documentation-comment id — stable across the
-        // base→augmented compilation boundary AND across constructed/definition forms.
-        // The old GetTypeByMetadataName fed a display string (with angle brackets) to an
-        // API that needs `+`-nested, backtick-arity metadata names, so generic/nested
-        // receiver types resolved to null and were skipped entirely; and comparing a
-        // factory's (possibly constructed) return type to the unbound definition by
-        // symbol equality missed generic factories. OriginalDefinition + doc-id fixes both.
-        var targetTypeId = type.OriginalDefinition.GetDocumentationCommentId();
-        var externalFactories = new List<object>();
-        foreach (var project in _solution!.Projects)
+        // Static Create*/Build*/New* methods of other source types that return this type
+        // (any construction of it), each once however many target frameworks compile it,
+        // in the canonical order. The target matches across compilations by the solution's
+        // identity rule: a generator-augmented or retargeted compilation binds the same
+        // declaration to a different instance.
+        var candidates = new List<(IMethodSymbol Factory, string? TargetFramework)>();
+        foreach (var project in GetLogicalProjects().Projects.SelectMany(p => p.Projects))
         {
-            if (targetTypeId == null) break;
             var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
+            var targetFramework = LogicalProject.TargetFrameworkOf(project);
 
-            var allTypes = compilation.GetSymbolsWithName(_ => true, SymbolFilter.Type).OfType<INamedTypeSymbol>();
-            foreach (var t in allTypes)
+            foreach (var t in compilation.GetSymbolsWithName(_ => true, SymbolFilter.Type, cancellationToken).OfType<INamedTypeSymbol>())
             {
-                if (t.OriginalDefinition.GetDocumentationCommentId() == targetTypeId) continue; // the type itself
-
-                var factories = t.GetMembers()
-                    .OfType<IMethodSymbol>()
-                    .Where(m => m.IsStatic &&
-                               m.DeclaredAccessibility == Accessibility.Public &&
-                               (m.Name.StartsWith("Create") || m.Name.StartsWith("Build") || m.Name.StartsWith("New")) &&
-                               m.ReturnType.OriginalDefinition.GetDocumentationCommentId() == targetTypeId)
-                    .Take(5); // Limit to avoid too many
-
-                foreach (var f in factories)
+                if (CrossCompilationSymbolComparer.Instance.Equals(t.OriginalDefinition, definition)) continue;
+                foreach (var factory in t.GetMembers().OfType<IMethodSymbol>())
                 {
-                    externalFactories.Add(new
+                    if (factory.IsStatic &&
+                        factory.DeclaredAccessibility == Accessibility.Public &&
+                        (factory.Name.StartsWith("Create") || factory.Name.StartsWith("Build") || factory.Name.StartsWith("New")) &&
+                        CrossCompilationSymbolComparer.Instance.Equals(factory.ReturnType.OriginalDefinition, definition))
                     {
-                        containingType = t.ToDisplayString(),
-                        name = f.Name,
-                        signature = f.ToDisplayString()
-                    });
+                        candidates.Add((factory, targetFramework));
+                    }
                 }
             }
-
-            if (externalFactories.Count >= 10) break; // Limit total
         }
+        var externalFactories = CanonicalOrder.BySymbol(
+                TargetFrameworkDeduplication.BySymbol(candidates, c => c.Factory, c => c.TargetFramework),
+                m => m.Item.Factory)
+            .Select(m => new
+            {
+                containingType = m.Item.Factory.ContainingType.ToDisplayString(),
+                name = m.Item.Factory.Name,
+                signature = m.Item.Factory.ToDisplayString()
+            })
+            .ToList();
 
-        // Check for common patterns
-        var implementsIDisposable = type.AllInterfaces.Any(i => i.Name == "IDisposable");
+        var implementsIDisposable = type.AllInterfaces.Any(i => i.SpecialType == SpecialType.System_IDisposable);
         // A real source type named {Type}Builder, not a filename substring.
         var builderTypeName = $"{type.Name}Builder";
         var hasBuilder = false;
@@ -732,14 +734,20 @@ public partial class RoslynService
             }
         }
 
+        // What prevents or shapes instantiation, most decisive first: an interface (which
+        // the symbol model also marks abstract), a static class, an abstract class, then
+        // IDisposable.
         string? hint = null;
-        if (implementsIDisposable)
-            hint = "Type implements IDisposable - consider using 'using' statement";
+        if (type.TypeKind == TypeKind.Interface)
+            hint = "Type is an interface - cannot instantiate directly";
+        else if (type.IsStatic)
+            hint = "Type is static - it cannot be instantiated";
         else if (type.IsAbstract)
             hint = "Type is abstract - cannot instantiate directly, use derived type";
-        else if (type.TypeKind == TypeKind.Interface)
-            hint = "Type is an interface - cannot instantiate directly";
+        else if (implementsIDisposable)
+            hint = "Type implements IDisposable - consider using 'using' statement";
 
+        var total = constructors.Count + factoryMethods.Count + externalFactories.Count;
         return CreateSuccessResponse(
             data: new
             {
@@ -752,15 +760,15 @@ public partial class RoslynService
                 externalFactories,
                 implementsIDisposable,
                 hasBuilder,
-                hint
+                hint,
+                notice = resolution.ShadowNotice
             },
+            ResultCounts.Complete(total),
             suggestedNextTools: new[]
             {
                 "get_method_signature for constructor parameter details",
                 "get_type_members to see what methods are available after creation"
-            },
-            totalCount: constructors.Count + factoryMethods.Count + externalFactories.Count,
-            returnedCount: constructors.Count + factoryMethods.Count + externalFactories.Count
+            }
         );
     }
 
@@ -777,42 +785,38 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
+        if (ParameterValidation.Choice("changeType", changeType, ChangeTypes, out var canonicalChangeType) is { } invalidChange)
+            return CreateErrorResponse(invalidChange);
+
         var (symbol, _, error) = await ResolveSymbolAtAsync(filePath, line, column, cancellationToken);
         if (symbol == null) return error!;
 
-        // Find all references
-        var references = await SymbolFinder.FindReferencesAsync(symbol, _solution!, cancellationToken);
-        var allLocations = references.SelectMany(r => r.Locations).ToList();
+        // The same reference set find_references reports: each site once.
+        var sites = await FindReferenceSitesAsync(symbol, cancellationToken);
 
         var impactedLocations = new List<object>();
         var breakingChanges = 0;
         var warnings = 0;
 
-        foreach (var location in allLocations)
+        foreach (var site in sites.Select(s => s.Item))
         {
-            if (!location.Location.IsInSource) continue;
-
-            var lineSpan = location.Location.GetLineSpan();
-
             string impact;
             string severity;
 
-            switch (changeType.ToLower())
+            switch (canonicalChangeType)
             {
                 case "rename":
                     impact = "Reference will need to be updated";
                     severity = "info";
                     break;
 
-                case "changetype":
-                case "change_type":
-                    impact = $"Usage may be incompatible with new type";
+                case "changeType":
+                    impact = "Usage may be incompatible with new type";
                     severity = "warning";
                     warnings++;
                     break;
 
-                case "addparameter":
-                case "add_parameter":
+                case "addParameter":
                     // A new parameter WITH a default value (newValue carries `=`) is
                     // source-compatible: existing call sites compile unchanged. Only
                     // a defaultless addition breaks them. This is the one real per-site
@@ -830,15 +834,13 @@ public partial class RoslynService
                     }
                     break;
 
-                case "removeparameter":
-                case "remove_parameter":
+                case "removeParameter":
                     impact = "Call site has extra parameter";
                     severity = "error";
                     breakingChanges++;
                     break;
 
-                case "changeaccessibility":
-                case "change_accessibility":
+                case "changeAccessibility":
                     if (symbol.DeclaredAccessibility == Accessibility.Public)
                     {
                         impact = "External usages may lose access";
@@ -853,23 +855,18 @@ public partial class RoslynService
                     }
                     break;
 
-                case "delete":
+                default:
                     impact = "Reference will be broken";
                     severity = "error";
                     breakingChanges++;
-                    break;
-
-                default:
-                    impact = "Unknown impact";
-                    severity = "info";
                     break;
             }
 
             impactedLocations.Add(new
             {
-                filePath = FormatPath(lineSpan.Path),
-                line = lineSpan.StartLinePosition.Line,
-                column = lineSpan.StartLinePosition.Character,
+                filePath = site.FilePath,
+                line = site.Line,
+                column = site.Column,
                 impact,
                 severity
             });
@@ -880,9 +877,9 @@ public partial class RoslynService
             {
                 symbol = symbol.ToDisplayString(),
                 symbolKind = symbol.Kind.ToString(),
-                changeType,
+                changeType = canonicalChangeType,
                 newValue,
-                totalReferences = allLocations.Count,
+                totalReferences = sites.Count,
                 breakingChanges,
                 warnings,
                 safe = breakingChanges == 0,
@@ -894,11 +891,10 @@ public partial class RoslynService
                 note = "Severities are derived from changeType + accessibility, not a per-call-site feasibility check (except addParameter, which honors a default value in newValue). Validate with get_diagnostics after applying.",
                 impactedLocations
             },
+            ResultCounts.Complete(sites.Count),
             suggestedNextTools: breakingChanges > 0
                 ? new[] { "Fix breaking changes before applying", "Use rename_symbol for safe renames" }
-                : new[] { "Safe to proceed with change" },
-            totalCount: allLocations.Count,
-            returnedCount: impactedLocations.Count
+                : new[] { "Safe to proceed with change" }
         );
     }
 
@@ -967,128 +963,146 @@ public partial class RoslynService
         return false;
     }
 
-    /// <summary>
-    /// Gets the actual source code of a method by name.
-    /// </summary>
+    // The method a by-name method tool (get_method_source, get_method_signature) addresses:
+    // typeName resolved (the TypeResolution carries the shadowing notice), methodName looked
+    // up in the canonical overload set with inherited overloads after the declared ones
+    // (GetMembersByName — constructors by ".ctor" or the type's simple name, an explicit
+    // interface implementation by its implemented member's name), and overloadIndex
+    // (default 0) selecting within it. A name that denotes a non-method is NOT_A_METHOD.
+    private async Task<(IMethodSymbol? Method, OverloadSet? Set, int Index, TypeResolution? Type, object? Error)> ResolveMethodByNameAsync(
+        string typeName, string methodName, int? overloadIndex, CancellationToken cancellationToken)
+    {
+        var resolution = await ResolveTypeByNameAsync(typeName, cancellationToken);
+        if (resolution.Error != null) return (null, null, 0, resolution, resolution.Error);
+        if (resolution.Type is not { } type)
+        {
+            return (null, null, 0, resolution, CreateErrorResponse(
+                ErrorCodes.TypeNotFound,
+                $"Type not found: {typeName}",
+                hint: "Use search_symbols to find the correct type name",
+                context: new { typeName }));
+        }
+
+        var set = GetMembersByName(type, methodName, includeInherited: true);
+        if (set.Count == 0)
+        {
+            return (null, null, 0, resolution, CreateErrorResponse(
+                ErrorCodes.SymbolNotFound,
+                $"Method '{methodName}' not found in type '{type.ToDisplayString()}'",
+                hint: resolution.ShadowNotice ?? "Use get_type_members to see available methods",
+                context: new { typeName, methodName, shadowedTypes = resolution.ShadowedMatches }));
+        }
+
+        var index = overloadIndex ?? 0;
+        if (index < 0 || index >= set.Count)
+        {
+            return (null, null, 0, resolution, CreateErrorResponse(
+                ErrorCodes.InvalidParameter,
+                $"Invalid overloadIndex {index}. Available: 0 to {set.Count - 1}",
+                hint: resolution.ShadowNotice,
+                context: new { overloadIndex, availableOverloads = set.Count }));
+        }
+
+        if (set.Members[index] is not IMethodSymbol method || MethodKindLabel(method) == null)
+        {
+            var member = set.Members[index];
+            return (null, null, 0, resolution, CreateErrorResponse(
+                ErrorCodes.NotAMethod,
+                $"'{member.ToDisplayString()}' is a {SymbolKindVocabulary.Label(member) ?? member.Kind.ToString()}, not a method",
+                hint: "Use get_type_members or get_symbol_info for non-method members.",
+                context: new { typeName, methodName, overloadIndex = index, actualKind = SymbolKindVocabulary.Label(member) ?? member.Kind.ToString() }));
+        }
+
+        return (method, set, index, resolution, null);
+    }
+
+    // The source code of a method by name: the source of the part that carries the body (a partial method's implementation);
+    // location is its name, span the whole declaration. A primary constructor's source is
+    // its type's declaration header through the parameter list.
     public async Task<object> GetMethodSourceAsync(
         string typeName, string methodName, int? overloadIndex = null,
         CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
 
-        var (type, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
-        if (ambiguousType != null) return ambiguousType;
-        if (type == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.TypeNotFound,
-                $"Type not found: {typeName}",
-                hint: "Use search_symbols to find the correct type name",
-                context: new { typeName }
-            );
-        }
+        var (method, set, index, resolution, error) = await ResolveMethodByNameAsync(typeName, methodName, overloadIndex, cancellationToken);
+        if (method == null) return error!;
 
-        // Find all methods with matching name
-        var methods = type.GetMembers(methodName)
-            .OfType<IMethodSymbol>()
-            .Where(m => m.MethodKind == MethodKind.Ordinary)
-            .ToList();
-
-        if (methods.Count == 0)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                $"Method '{methodName}' not found in type '{typeName}'",
-                hint: "Use get_type_members to see available methods",
-                context: new { typeName, methodName }
-            );
-        }
-
-        // Select specific overload or default to first
-        var index = overloadIndex ?? 0;
-        if (index < 0 || index >= methods.Count)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"Invalid overloadIndex {index}. Available: 0 to {methods.Count - 1}",
-                context: new { overloadIndex, availableOverloads = methods.Count }
-            );
-        }
-
-        var method = methods[index];
-        var location = method.Locations.FirstOrDefault(l => l.IsInSource);
-
-        if (location == null)
+        var location = SymbolDisplayLocation(method);
+        if (location?.SourceTree is not { } syntaxTree)
         {
             return CreateErrorResponse(
                 ErrorCodes.AnalysisFailed,
                 "Method is defined in metadata (external library), source not available",
                 hint: "This method is from a compiled assembly, not source code",
-                context: new { typeName, methodName, isFromMetadata = true }
-            );
-        }
-
-        // Get the syntax node
-        var syntaxTree = location.SourceTree;
-        if (syntaxTree == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                "Could not get syntax tree for method",
-                context: new { typeName, methodName }
-            );
+                context: new { typeName, methodName, isFromMetadata = true });
         }
 
         var root = await syntaxTree.GetRootAsync(cancellationToken);
-        var node = root.FindNode(location.SourceSpan);
-
-        // Find the method declaration
-        var methodDecl = node.AncestorsAndSelf().OfType<MethodDeclarationSyntax>().FirstOrDefault();
-        if (methodDecl == null)
+        var declaration = root.FindNode(location.SourceSpan).AncestorsAndSelf()
+            .FirstOrDefault(n => n is BaseMethodDeclarationSyntax or LocalFunctionStatementSyntax or TypeDeclarationSyntax);
+        if (declaration == null)
         {
             return CreateErrorResponse(
                 ErrorCodes.AnalysisFailed,
-                "Could not find method declaration syntax",
-                context: new { typeName, methodName }
-            );
+                "Could not find the method's declaration syntax",
+                context: new { typeName, methodName });
         }
 
-        // Span the whole method declaration (not the symbol's identifier-only
-        // location) so the reported start/end and lineCount describe the same
-        // range, and lineCount excludes leading-trivia lines.
-        var lineSpan = methodDecl.GetLocation().GetLineSpan();
-        var sourceText = methodDecl.ToFullString();
+        // A method located at its type's declaration is declared by the type: a primary
+        // constructor by the type's parameter list, or an implicitly declared member (a
+        // default or copy constructor) with no source of its own. A C# 14 extension member's
+        // implementation, though implicitly declared, is located at the member it implements.
+        if (declaration is TypeDeclarationSyntax typeDeclaration
+            && (method.IsImplicitlyDeclared || typeDeclaration.ParameterList == null))
+        {
+            return CreateErrorResponse(
+                ErrorCodes.AnalysisFailed,
+                $"'{method.ToDisplayString()}' is declared implicitly and has no source",
+                hint: "Only methods declared in source have source code.",
+                context: new { typeName, methodName, isFromMetadata = false });
+        }
 
-        // Also get just the body if available
-        string? bodySource = null;
-        if (methodDecl.Body != null)
+        // A method's declaration spans the whole member; a primary constructor (declared by
+        // its type's parameter list) spans the type's header through that list.
+        var span = declaration is TypeDeclarationSyntax { ParameterList: { } parameterList } primaryOwner
+            ? TextSpan.FromBounds(primaryOwner.SpanStart, parameterList.Span.End)
+            : declaration.Span;
+        var text = await syntaxTree.GetTextAsync(cancellationToken);
+        var fullSource = declaration is TypeDeclarationSyntax
+            ? text.ToString(span)
+            : declaration.ToFullString();
+        var bodySource = declaration switch
         {
-            bodySource = methodDecl.Body.ToFullString();
-        }
-        else if (methodDecl.ExpressionBody != null)
-        {
-            bodySource = methodDecl.ExpressionBody.ToFullString();
-        }
+            BaseMethodDeclarationSyntax m => (m.Body ?? (SyntaxNode?)m.ExpressionBody)?.ToFullString(),
+            LocalFunctionStatementSyntax f => (f.Body ?? (SyntaxNode?)f.ExpressionBody)?.ToFullString(),
+            _ => null
+        };
+        var lineSpan = syntaxTree.GetLineSpan(span);
 
         return CreateSuccessResponse(
             data: new
             {
-                typeName = type.ToDisplayString(),
+                typeName = resolution!.Type!.ToDisplayString(),
                 methodName = method.Name,
                 signature = method.ToDisplayString(),
                 overloadIndex = index,
-                totalOverloads = methods.Count,
-                location = new
+                totalOverloads = set!.Count,
+                isInherited = set.IsInherited(index),
+                location = FormatLocation(location),
+                span = new
                 {
-                    filePath = FormatPath(lineSpan.Path),
                     startLine = lineSpan.StartLinePosition.Line,
-                    endLine = lineSpan.EndLinePosition.Line
+                    startColumn = lineSpan.StartLinePosition.Character,
+                    endLine = lineSpan.EndLinePosition.Line,
+                    endColumn = lineSpan.EndLinePosition.Character
                 },
-                fullSource = sourceText,
+                fullSource,
                 bodySource,
-                // The declaration's own line span — consistent with start/end and
-                // free of the leading-trivia lines that ToFullString() carries.
-                lineCount = lineSpan.EndLinePosition.Line - lineSpan.StartLinePosition.Line + 1
+                // The declaration's own line span — consistent with span and free of the
+                // leading-trivia lines that fullSource carries.
+                lineCount = lineSpan.EndLinePosition.Line - lineSpan.StartLinePosition.Line + 1,
+                notice = resolution.ShadowNotice
             },
             suggestedNextTools: new[]
             {
@@ -1107,6 +1121,9 @@ public partial class RoslynService
         CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
+
+        if (ParameterValidation.Limit("maxMethods", maxMethods, MaxListLimit) is { } invalidLimit)
+            return CreateErrorResponse(invalidLimit);
 
         if (methods == null || methods.Count == 0)
         {
@@ -1191,6 +1208,8 @@ public partial class RoslynService
             }
         }
 
+        // Every requested method is answered — resolved or with its error — so nothing is
+        // cut off: totalCount is the request size, returnedCount the resolved ones.
         return CreateSuccessResponse(
             data: new
             {
@@ -1200,13 +1219,12 @@ public partial class RoslynService
                 results,
                 errors = errors.Count > 0 ? errors : null
             },
+            ResultCounts.Explicit(methods.Count, results.Count, truncated: false),
             suggestedNextTools: new[]
             {
                 results.Count > 0 ? "analyze_method for deeper analysis of specific methods" : null,
                 errors.Count > 0 ? "Check type/method names - some were not found" : null
-            }.Where(s => s != null).ToArray()!,
-            totalCount: methods.Count,
-            returnedCount: results.Count
+            }.Where(s => s != null).ToArray()!
         );
     }
 }

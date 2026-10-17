@@ -27,13 +27,14 @@ public partial class RoslynService
                 hint: "Provide a fully-qualified type name, e.g. 'System.Net.Http.HttpClient'",
                 context: new { parameter = "typeName" });
         }
+        if (ParameterValidation.Limit("maxMembers", maxMembers, MaxListLimit) is { } invalidLimit)
+            return CreateErrorResponse(invalidLimit);
 
-        // Try every project's compilation; metadata symbols are interchangeable across
-        // projects as long as the same assembly is referenced. Returning from the first
-        // project that resolves the type is sufficient.
+        // Try every project's compilation, in logical-project order; metadata symbols are
+        // interchangeable across projects as long as the same assembly is referenced, so the
+        // first project that resolves the type is sufficient.
         INamedTypeSymbol? type = null;
-        Compilation? owningCompilation = null;
-        foreach (var project in _solution!.Projects)
+        foreach (var project in GetLogicalProjects().Projects.SelectMany(p => p.Projects))
         {
             var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
@@ -42,7 +43,6 @@ public partial class RoslynService
             if (resolved != null && IsFromExpectedAssembly(resolved, assemblyName))
             {
                 type = resolved;
-                owningCompilation = compilation;
                 break;
             }
 
@@ -55,7 +55,6 @@ public partial class RoslynService
                 if (resolved != null && IsFromExpectedAssembly(resolved, assemblyName))
                 {
                     type = resolved;
-                    owningCompilation = compilation;
                     break;
                 }
             }
@@ -72,50 +71,37 @@ public partial class RoslynService
                 context: new { typeName, assemblyName });
         }
 
-        var allMembers = type.GetMembers().ToList();
-        if (includeInherited)
-        {
-            var current = type.BaseType;
-            while (current != null && current.SpecialType != SpecialType.System_Object)
-            {
-                allMembers.AddRange(current.GetMembers());
-                current = current.BaseType;
-            }
-            // Interface members (including default-interface-members) are part of
-            // the inherited surface but not on the base-type chain.
-            foreach (var iface in type.AllInterfaces)
-            {
-                allMembers.AddRange(iface.GetMembers());
-            }
-        }
-
-        var visibleMembers = allMembers
-            .Where(m => !m.IsImplicitlyDeclared)
-            .Where(m => m.DeclaredAccessibility == Accessibility.Public
-                     || m.DeclaredAccessibility == Accessibility.Protected
-                     || m.DeclaredAccessibility == Accessibility.ProtectedOrInternal)
-            // An override and the base member it replaces (and an implemented
-            // interface member) share a containing-type-free signature; keep the
-            // most-derived occurrence, which the type-first walk added first.
-            .GroupBy(m => m.ToDisplayString(MemberDedupFormat))
-            .Select(g => g.First())
+        // The type's surface by the one listing rule (UserVisibleMembers: no accessors,
+        // compiler-generated members or inherited constructors; overridden and hidden base
+        // members once), limited to what code outside the assembly can use — public and
+        // protected members, never an explicit interface implementation, which only the
+        // interface reaches.
+        var visibleMembers = UserVisibleMembers.Of(type, includeInherited)
+            .Where(m => !m.IsExplicitInterfaceImplementation)
+            .Where(m => m.Symbol.DeclaredAccessibility is Accessibility.Public
+                        or Accessibility.Protected or Accessibility.ProtectedOrInternal)
             .ToList();
 
         var totalMembers = visibleMembers.Count;
 
         var memberList = visibleMembers
             .Take(maxMembers)
-            .Select(m => new
+            .Select(entry =>
             {
-                name = m.Name,
-                kind = m.Kind.ToString(),
-                signature = m.ToDisplayString(),
-                xmlDoc = includeXmlDocs
-                    ? StructuredDocsToWireOrNull(XmlDocParser.Parse(m.GetDocumentationCommentXml()).docs)
-                    : null,
-                isStatic = m.IsStatic,
-                isObsolete = m.GetAttributes().Any(a => a.AttributeClass?.Name == "ObsoleteAttribute"),
-                accessibility = m.DeclaredAccessibility.ToString()
+                var m = entry.Symbol;
+                return new
+                {
+                    name = m.Name,
+                    kind = entry.Kind.ToString(),
+                    signature = m.ToDisplayString(),
+                    xmlDoc = includeXmlDocs
+                        ? StructuredDocsToWireOrNull(XmlDocParser.Parse(m.GetDocumentationCommentXml()).docs)
+                        : null,
+                    isStatic = m.IsStatic,
+                    isObsolete = m.GetAttributes().Any(a => a.AttributeClass?.Name == "ObsoleteAttribute"),
+                    accessibility = m.DeclaredAccessibility.ToString(),
+                    isInherited = entry.IsInherited
+                };
             })
             .ToList();
 
@@ -138,13 +124,12 @@ public partial class RoslynService
                 xmlDoc = typeXmlDoc,
                 members = memberList
             },
+            ResultCounts.Capped(totalMembers, memberList.Count),
             suggestedNextTools: new[]
             {
                 "get_external_type_info on a base type or interface to inspect inherited surface",
                 "find_references to see where this external type is used in the solution"
-            },
-            totalCount: totalMembers,
-            returnedCount: memberList.Count);
+            });
     }
 
     private static bool IsFromExpectedAssembly(INamedTypeSymbol type, string? assemblyName)

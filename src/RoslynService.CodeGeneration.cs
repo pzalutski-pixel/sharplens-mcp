@@ -1,14 +1,18 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Formatting;
 using Microsoft.CodeAnalysis.Text;
-using System.Text;
 
 namespace SharpLensMcp;
 
+// add_null_checks and generate_equality_members. Both insert generated syntax marked
+// with Formatter.Annotation (the apply formats it with the document's options and line
+// breaks) and use only APIs that exist in every target framework of the project the
+// document belongs to: ArgumentNullException.ThrowIfNull and System.HashCode where every
+// framework has them, an equivalent built from older APIs otherwise.
 public partial class RoslynService
 {
-
     /// <summary>
     /// Add null check guard clauses to method parameters.
     /// </summary>
@@ -34,6 +38,7 @@ public partial class RoslynService
         if (pos == null) return posError!;
         var document = pos.Document;
         var semanticModel = pos.Model;
+        var notice = address.TypeResolution?.ShadowNotice;
 
         // Any parameterized, block-bodied member: method, constructor, operator, or
         // local function.
@@ -44,11 +49,11 @@ public partial class RoslynService
                 ErrorCodes.NotAMethod,
                 "No method, constructor, operator, or local function found at this position",
                 hint: "Position cursor on a method/constructor/operator/local-function declaration",
-                context: new { filePath = address.FilePath, line = address.Line, column = address.Column }
+                context: new { filePath = FormatPath(document.FilePath), line = address.Line, column = address.Column }
             );
         }
 
-        var (declarationNode, parameterList, body, methodName) = target.Value;
+        var (_, parameterList, body, methodName) = target.Value;
         if (body == null)
         {
             return CreateErrorResponse(
@@ -62,87 +67,105 @@ public partial class RoslynService
         var alreadyGuarded = GetAlreadyGuardedParameterNames(body);
         var skippedNullable = new List<string>();
         var skippedAlreadyGuarded = new List<string>();
+        var skippedOut = new List<string>();
 
-        // Guard candidates: non-nullable reference-type parameters. Parameters
-        // annotated nullable (string?) declare that null is a VALID argument —
-        // throwing on them would contradict their own contract. Parameters the
-        // body already guards are skipped so a second run doesn't duplicate.
-        var nullableParams = new List<string>();
+        // Guard candidates: reference-type parameters a caller can pass null to whose
+        // contract does not allow it. Skipped: out parameters (assigned by the method,
+        // never read on entry); parameters whose contract permits null — annotated
+        // nullable (string?), nullable value types (int?), or a default of null; and
+        // parameters the body already guards, so a second run doesn't duplicate.
+        var guarded = new List<string>();
         foreach (var p in parameterList.Parameters)
         {
             var paramSymbol = semanticModel.GetDeclaredSymbol(p, cancellationToken);
             if (paramSymbol == null) continue;
 
+            if (paramSymbol.RefKind == RefKind.Out)
+            {
+                skippedOut.Add(paramSymbol.Name);
+                continue;
+            }
+
             var type = paramSymbol.Type;
             var isNullableValueType = type.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T;
             if (!type.IsReferenceType && !isNullableValueType) continue;
 
-            if (paramSymbol.NullableAnnotation == NullableAnnotation.Annotated || isNullableValueType)
+            if (paramSymbol.NullableAnnotation == NullableAnnotation.Annotated || isNullableValueType
+                || (paramSymbol.HasExplicitDefaultValue && paramSymbol.ExplicitDefaultValue == null))
             {
-                skippedNullable.Add(p.Identifier.Text);
+                skippedNullable.Add(paramSymbol.Name);
                 continue;
             }
 
             if (alreadyGuarded.Contains(p.Identifier.Text))
             {
-                skippedAlreadyGuarded.Add(p.Identifier.Text);
+                skippedAlreadyGuarded.Add(paramSymbol.Name);
                 continue;
             }
 
-            nullableParams.Add(p.Identifier.Text);
+            guarded.Add(paramSymbol.Name);
         }
 
-        if (nullableParams.Count == 0)
+        if (guarded.Count == 0)
         {
             return CreateSuccessResponse(
                 data: new
                 {
-                    message = "No nullable parameters found that need null checks",
+                    message = "No reference-type parameter needs a null check",
                     methodName,
                     skippedNullable,
-                    skippedAlreadyGuarded
+                    skippedAlreadyGuarded,
+                    skippedOut,
+                    notice
                 }
             );
         }
 
-        // Generate null check code, indented one level deeper than the method
-        // declaration (derived from its column, not a hardcoded 8 spaces).
-        var methodColumn = declarationNode.GetLocation().GetLineSpan().StartLinePosition.Character;
-        var indent = new string(' ', methodColumn + 4);
-        var nullChecks = new StringBuilder();
-        foreach (var param in nullableParams)
+        // ThrowIfNull where every target framework has it (.NET 6+), an if-null-throw
+        // guard otherwise. Each guard is a statement of its own line; the last is
+        // followed by a blank line when the body has statements.
+        var throwIfNull = await ApiInEveryTargetFrameworkAsync(document, HasThrowIfNull, cancellationToken);
+        var guardMarker = new SyntaxAnnotation("SharpLens.NullCheck");
+        var guards = guarded.Select((name, i) =>
         {
-            nullChecks.AppendLine($"{indent}global::System.ArgumentNullException.ThrowIfNull({param});");
-        }
+            var identifier = EscapedName(name).Identifier.Text;
+            var statement = SyntaxFactory.ParseStatement(throwIfNull
+                ? $"global::System.ArgumentNullException.ThrowIfNull({identifier});"
+                : $"if ({identifier} is null) throw new global::System.ArgumentNullException(nameof({identifier}));");
+            var trailing = i == guarded.Count - 1 && body.Statements.Count > 0
+                ? SyntaxFactory.TriviaList(SyntaxFactory.LineFeed, SyntaxFactory.LineFeed)
+                : SyntaxFactory.TriviaList(SyntaxFactory.LineFeed);
+            return statement.WithLeadingTrivia().WithTrailingTrivia(trailing)
+                .WithAdditionalAnnotations(Formatter.Annotation, guardMarker);
+        }).ToList();
 
-        var openBrace = body.OpenBraceToken;
-        var insertPosition = openBrace.Span.End;
-
-        // Get the text and create the modified version
-        var sourceText = await document.GetTextAsync(cancellationToken);
-        var newText = sourceText.Replace(new TextSpan(insertPosition, 0),
-            WithDocumentLineEndings("\n" + nullChecks.ToString(), sourceText));
+        var root = (await document.GetSyntaxRootAsync(cancellationToken))!;
+        var newRoot = root.ReplaceNode(body, body.WithStatements(body.Statements.InsertRange(0, guards)));
+        var newSolution = _solution!.WithDocumentSyntaxRoot(document.Id, newRoot);
 
         if (preview)
         {
+            var generatedCode = await AnnotatedTextAsync(newSolution.GetDocument(document.Id)!, guardMarker, dedent: false, cancellationToken);
             return CreateSuccessResponse(
                 data: new
                 {
                     preview = true,
                     methodName,
-                    parametersWithNullChecks = nullableParams,
+                    parametersWithNullChecks = guarded,
                     skippedNullable,
                     skippedAlreadyGuarded,
-                    generatedCode = nullChecks.ToString().Trim(),
+                    skippedOut,
+                    generatedCode,
                     changes = new[]
                     {
                         new
                         {
-                            filePath = address.FilePath,
-                            insertAfterLine = openBrace.GetLocation().GetLineSpan().StartLinePosition.Line,
-                            newCode = nullChecks.ToString().Trim()
+                            filePath = FormatPath(document.FilePath),
+                            insertAfterLine = body.OpenBraceToken.GetLocation().GetLineSpan().StartLinePosition.Line,
+                            newCode = generatedCode
                         }
-                    }
+                    },
+                    notice
                 },
                 suggestedNextTools: new[] { "add_null_checks with preview=false to apply" }
             );
@@ -150,7 +173,6 @@ public partial class RoslynService
 
         // Apply through the unified path — workspace, in-memory solution, caches,
         // and disk stay consistent; no sync_documents needed afterward.
-        var newSolution = _solution!.WithDocumentText(document.Id, newText);
         var (ok, applyError, applyReport, introducedErrors) = await ApplyAndReportAsync(newSolution, cancellationToken);
         if (!ok) return applyError!;
 
@@ -159,15 +181,61 @@ public partial class RoslynService
             {
                 applied = true,
                 methodName,
-                parametersWithNullChecks = nullableParams,
+                parametersWithNullChecks = guarded,
                 skippedNullable,
                 skippedAlreadyGuarded,
-                generatedCode = nullChecks.ToString().Trim(),
+                skippedOut,
+                generatedCode = await AnnotatedTextAsync(newSolution.GetDocument(document.Id)!, guardMarker, dedent: false, cancellationToken),
                 changedFiles = FormatAppliedChanges(applyReport),
-                postApplyErrors = introducedErrors.Count > 0 ? introducedErrors : null
+                postApplyErrors = introducedErrors.Count > 0 ? introducedErrors : null,
+                notice
             },
             suggestedNextTools: new[] { "get_diagnostics to verify the guards compile" }
         );
+    }
+
+    // Whether every target framework the document compiles for (each project holding a
+    // document of its file) passes the probe — an API generated code may use only when
+    // it exists in all of them.
+    private async Task<bool> ApiInEveryTargetFrameworkAsync(
+        Document document, Func<Compilation, bool> probe, CancellationToken cancellationToken)
+    {
+        var documentIds = document.FilePath == null
+            ? (IReadOnlyList<DocumentId>)new[] { document.Id }
+            : _solution!.GetDocumentIdsWithFilePath(document.FilePath);
+        foreach (var documentId in documentIds)
+        {
+            var compilation = await _solution!.GetDocument(documentId)!.Project.GetCompilationAsync(cancellationToken);
+            if (compilation == null || !probe(compilation)) return false;
+        }
+        return true;
+    }
+
+    private static bool HasThrowIfNull(Compilation compilation) =>
+        compilation.GetTypeByMetadataName("System.ArgumentNullException")?.GetMembers("ThrowIfNull")
+            .OfType<IMethodSymbol>()
+            .Any(m => m.IsStatic && m.DeclaredAccessibility == Accessibility.Public
+                      && m.Parameters.Length > 0 && m.Parameters[0].Type.SpecialType == SpecialType.System_Object) == true;
+
+    private static bool HasHashCode(Compilation compilation) =>
+        compilation.GetTypeByMetadataName("System.HashCode") is { DeclaredAccessibility: Accessibility.Public };
+
+    // The text of the nodes carrying the annotation, as the apply's formatting will lay
+    // them out: from the first node's start to the last node's end, in the document's
+    // line-break style; dedented to the first node's column when asked.
+    private static async Task<string> AnnotatedTextAsync(
+        Document document, SyntaxAnnotation annotation, bool dedent, CancellationToken cancellationToken)
+    {
+        var original = await document.GetTextAsync(cancellationToken);
+        var formatted = await Formatter.FormatAsync(document, Formatter.Annotation, cancellationToken: cancellationToken);
+        var root = (await formatted.GetSyntaxRootAsync(cancellationToken))!;
+        var text = await formatted.GetTextAsync(cancellationToken);
+        var nodes = root.GetAnnotatedNodes(annotation).ToList();
+        var span = TextSpan.FromBounds(nodes[0].SpanStart, nodes[^1].Span.End);
+        var lineBreak = LineEndings.UniformStyle(original) ?? LineEndings.DominantStyle(original) ?? "\n";
+        return dedent
+            ? Dedent(text, span, lineBreak)
+            : LineEndings.Convert(text.ToString(span), lineBreak);
     }
 
     // The nearest parameterized member at a position whose parameters can be
@@ -272,9 +340,6 @@ public partial class RoslynService
     private static string? GuardedName(ExpressionSyntax? expr) =>
         (expr as IdentifierNameSyntax)?.Identifier.Text;
 
-    /// <summary>
-    /// Generate Equals, GetHashCode, and operators for a type.
-    /// </summary>
     // The user-declared instance field a manual property's accessors read/write, or
     // null when the accessors don't reference one (computed property). Heuristic: the
     // first non-implicit instance field of the same type referenced in get/set.
@@ -305,6 +370,9 @@ public partial class RoslynService
         return null;
     }
 
+    /// <summary>
+    /// Generate Equals, GetHashCode, and operators for a type.
+    /// </summary>
     public async Task<object> GenerateEqualityMembersAsync(
         string? filePath,
         int? line,
@@ -325,6 +393,7 @@ public partial class RoslynService
             address.FilePath, address.Line, address.Column, cancellationToken);
         if (pos == null) return posError!;
         var document = pos.Document;
+        var notice = address.TypeResolution?.ShadowNotice;
 
         // Find the type declaration
         var typeNode = pos.Token.Parent?.AncestorsAndSelf()
@@ -337,7 +406,7 @@ public partial class RoslynService
                 ErrorCodes.NotAType,
                 "No type declaration found at this position",
                 hint: "Position cursor on a class or struct declaration",
-                context: new { filePath = address.FilePath, line = address.Line, column = address.Column }
+                context: new { filePath = FormatPath(document.FilePath), line = address.Line, column = address.Column }
             );
         }
 
@@ -410,8 +479,12 @@ public partial class RoslynService
         // Equality compares STORED state: explicit instance fields plus properties
         // with a backing store (auto-properties, settable properties). Excluded:
         // compiler-generated backing fields (their <Prop>k__BackingField names are
-        // not valid C# and the auto-property already covers that storage) and
-        // computed get-only properties (they derive from other compared state).
+        // not valid C# and the auto-property already covers that storage), computed
+        // get-only properties (they derive from other compared state), indexers (not
+        // a single value) and explicit interface implementations (not reachable by
+        // name).
+        static bool IsNamedProperty(IPropertySymbol p) =>
+            !p.IsStatic && !p.IsIndexer && p.ExplicitInterfaceImplementations.IsEmpty;
         var autoPropertyTargets = typeSymbol.GetMembers()
             .OfType<IFieldSymbol>()
             .Where(f => f.IsImplicitlyDeclared && f.AssociatedSymbol is IPropertySymbol)
@@ -423,7 +496,7 @@ public partial class RoslynService
         // The property is the compared member, so exclude the field it reads/writes.
         var backingFields = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
         foreach (var prop in typeSymbol.GetMembers().OfType<IPropertySymbol>()
-            .Where(p => !p.IsStatic && p.GetMethod != null && p.SetMethod != null
+            .Where(p => IsNamedProperty(p) && p.GetMethod != null && p.SetMethod != null
                 && !autoPropertyTargets.Contains(p)))
         {
             if (await BackingFieldOfAsync(prop, cancellationToken) is { } backing)
@@ -435,9 +508,9 @@ public partial class RoslynService
             .Where(m =>
                 (m is IFieldSymbol field && !field.IsStatic && !field.IsConst
                     && !backingFields.Contains(field)) ||
-                (m is IPropertySymbol prop && !prop.IsStatic && prop.GetMethod != null
+                (m is IPropertySymbol prop && IsNamedProperty(prop) && prop.GetMethod != null
                     && (prop.SetMethod != null || autoPropertyTargets.Contains(prop))))
-            .Select(m => m.Name)
+            .Select(m => (name: m.Name, type: m is IFieldSymbol f ? f.Type : ((IPropertySymbol)m).Type))
             .ToList();
 
         if (members.Count == 0 && !chainBase)
@@ -446,26 +519,29 @@ public partial class RoslynService
                 data: new
                 {
                     message = "No instance fields or properties found to compare",
-                    typeName = targetTypeName
+                    typeName = targetTypeName,
+                    notice
                 }
             );
         }
 
-        // Build the members as syntax, not string concatenation (the bug class
-        // behind emitting <Prop>k__BackingField names): identifiers flow through
-        // the generator, and NormalizeWhitespace is correct for fresh generated
-        // syntax. GetHashCode uses the HashCode builder so EVERY compared member
-        // feeds the hash — HashCode.Combine caps at eight arguments, and hashing
-        // a subset of what Equals compares breaks the Equals/GetHashCode contract.
+        // Nullable annotations (object?, T?) only where the type's nullable context
+        // enables them; System.HashCode only where every target framework has it.
+        var nullableAnnotations = pos.Model.GetNullableContext(typeNode.SpanStart).AnnotationsEnabled();
+        var hashCodeAvailable = await ApiInEveryTargetFrameworkAsync(document, HasHashCode, cancellationToken);
         var generator = Microsoft.CodeAnalysis.Editing.SyntaxGenerator.GetGenerator(document);
+        var memberMarker = new SyntaxAnnotation("SharpLens.EqualityMember");
         var generatedMembers = BuildEqualityMemberDeclarations(
-            generator, declaredTypeName, members, includeOperators, chainBase, chainBaseHash, typeSymbol.IsValueType);
-        var generatedText = string.Join("\n\n",
-            generatedMembers.Select(m => m.NormalizeWhitespace().ToFullString()));
+                generator, declaredTypeName, members, includeOperators, chainBase, chainBaseHash,
+                typeSymbol.IsValueType, nullableAnnotations, hashCodeAvailable)
+            .Select(m => (MemberDeclarationSyntax)m.WithAdditionalAnnotations(Formatter.Annotation, memberMarker))
+            .ToArray();
 
-        // Find where to insert (before closing brace of type)
-        var closeBrace = typeNode.CloseBraceToken;
-        var insertPosition = closeBrace.SpanStart;
+        var root = (await document.GetSyntaxRootAsync(cancellationToken))!;
+        var newRoot = root.ReplaceNode(typeNode, typeNode.AddMembers(generatedMembers));
+        var newSolution = _solution!.WithDocumentSyntaxRoot(document.Id, newRoot);
+        var generatedText = await AnnotatedTextAsync(newSolution.GetDocument(document.Id)!, memberMarker, dedent: true, cancellationToken);
+        var membersCompared = members.Select(m => m.name).ToList();
 
         if (preview)
         {
@@ -474,9 +550,10 @@ public partial class RoslynService
                 {
                     preview = true,
                     typeName = targetTypeName,
-                    membersCompared = members,
+                    membersCompared,
                     includeOperators,
-                    generatedCode = generatedText
+                    generatedCode = generatedText,
+                    notice
                 },
                 suggestedNextTools: new[] { "generate_equality_members with preview=false to apply" }
             );
@@ -484,10 +561,6 @@ public partial class RoslynService
 
         // Apply through the unified path — workspace, in-memory solution, caches,
         // and disk stay consistent; no sync_documents needed afterward.
-        var sourceText = await document.GetTextAsync(cancellationToken);
-        var newText = sourceText.Replace(new TextSpan(insertPosition, 0),
-            WithDocumentLineEndings("\n" + generatedText + "\n", sourceText));
-        var newSolution = _solution!.WithDocumentText(document.Id, newText);
         var (ok, applyError, applyReport, introducedErrors) = await ApplyAndReportAsync(newSolution, cancellationToken);
         if (!ok) return applyError!;
 
@@ -496,18 +569,16 @@ public partial class RoslynService
             {
                 applied = true,
                 typeName = targetTypeName,
-                membersCompared = members,
+                membersCompared,
                 includeOperators,
                 changedFiles = FormatAppliedChanges(applyReport),
-                postApplyErrors = introducedErrors.Count > 0 ? introducedErrors : null
+                postApplyErrors = introducedErrors.Count > 0 ? introducedErrors : null,
+                notice
             },
             suggestedNextTools: new[] { "get_diagnostics to verify the generated members compile" }
         );
     }
 
-    // The equality members as syntax declarations. Member and type names enter
-    // as identifier nodes (keyword escaping handled by the generator), never
-    // interpolated strings.
     // Whether the type (or one of its bases, excluding object) overrides
     // object.Equals — i.e. participates in value equality.
     private static bool DeclaresEqualsOverride(INamedTypeSymbol type)
@@ -540,18 +611,43 @@ public partial class RoslynService
         return false;
     }
 
+    // Whether == compares two values of the type by value and reflexively: the built-in
+    // operators of the integral types, bool, char, decimal and string, and of enums and
+    // nullable forms of them. Every other type (a struct without ==, a type parameter,
+    // float and double whose NaN is not equal to itself, a reference type whose == is
+    // reference identity) is compared with EqualityComparer<T>.Default.
+    private static bool ComparesWithEqualityOperator(ITypeSymbol type)
+    {
+        if (type is INamedTypeSymbol { OriginalDefinition.SpecialType: SpecialType.System_Nullable_T } nullable)
+            type = nullable.TypeArguments[0];
+        return type.TypeKind == TypeKind.Enum || type.SpecialType is
+            SpecialType.System_Boolean or SpecialType.System_Char or SpecialType.System_SByte or SpecialType.System_Byte
+            or SpecialType.System_Int16 or SpecialType.System_UInt16 or SpecialType.System_Int32 or SpecialType.System_UInt32
+            or SpecialType.System_Int64 or SpecialType.System_UInt64 or SpecialType.System_Decimal or SpecialType.System_String
+            or SpecialType.System_IntPtr or SpecialType.System_UIntPtr;
+    }
+
+    // EqualityComparer<T>.Default for the member's type, fully qualified.
+    private static ExpressionSyntax DefaultComparer(ITypeSymbol type) =>
+        SyntaxFactory.ParseExpression($"global::System.Collections.Generic.EqualityComparer<{TypeRef(type)}>.Default");
+
+    // The equality members as syntax declarations. Member and type names enter
+    // as identifier nodes (keyword escaping handled by the generator), never
+    // interpolated strings.
     private static List<SyntaxNode> BuildEqualityMemberDeclarations(
         Microsoft.CodeAnalysis.Editing.SyntaxGenerator generator,
         string typeName,
-        List<string> memberNames,
+        List<(string name, ITypeSymbol type)> members,
         bool includeOperators,
         bool chainBase,
         bool chainBaseHash,
-        bool isValueType)
+        bool isValueType,
+        bool nullableAnnotations,
+        bool hashCodeAvailable)
     {
         var boolType = generator.TypeExpression(SpecialType.System_Boolean);
         var typeSyntax = SyntaxFactory.ParseTypeName(typeName);
-        var nullableTypeSyntax = SyntaxFactory.ParseTypeName(typeName + "?");
+        var nullableTypeSyntax = nullableAnnotations ? SyntaxFactory.ParseTypeName(typeName + "?") : typeSyntax;
         // A struct's strongly-typed Equals takes the value non-nullable (`T`, not
         // `T?` which would be Nullable<T>); the `is null` and ReferenceEquals
         // short-circuits are class-only — both are meaningless on a value type
@@ -561,7 +657,7 @@ public partial class RoslynService
 
         var objectEquals = generator.MethodDeclaration(
             "Equals",
-            parameters: new[] { generator.ParameterDeclaration("obj", SyntaxFactory.ParseTypeName("object?")) },
+            parameters: new[] { generator.ParameterDeclaration("obj", SyntaxFactory.ParseTypeName(nullableAnnotations ? "object?" : "object")) },
             returnType: boolType,
             accessibility: Accessibility.Public,
             modifiers: Microsoft.CodeAnalysis.Editing.DeclarationModifiers.Override,
@@ -586,16 +682,27 @@ public partial class RoslynService
 
         // Raw SyntaxFactory for the comparison chain: the generator's
         // ValueEquals/LogicalAnd wrap every operand in parentheses; the
-        // intended shape is `A == other.A && B == other.B`.
-        ExpressionSyntax? memberComparison = memberNames.Count > 0
-            ? memberNames
-                .Select(ExpressionSyntax (m) => SyntaxFactory.BinaryExpression(
-                    SyntaxKind.EqualsExpression,
-                    (ExpressionSyntax)generator.IdentifierName(m),
-                    SyntaxFactory.MemberAccessExpression(
-                        SyntaxKind.SimpleMemberAccessExpression,
-                        SyntaxFactory.IdentifierName("other"),
-                        (SimpleNameSyntax)generator.IdentifierName(m))))
+        // intended shape is `A == other.A && EqualityComparer<T>.Default.Equals(B, other.B)`.
+        ExpressionSyntax Compare(string name, ITypeSymbol type)
+        {
+            var mine = (ExpressionSyntax)generator.IdentifierName(name);
+            var theirs = SyntaxFactory.MemberAccessExpression(
+                SyntaxKind.SimpleMemberAccessExpression,
+                SyntaxFactory.IdentifierName("other"),
+                (SimpleNameSyntax)generator.IdentifierName(name));
+            return ComparesWithEqualityOperator(type)
+                ? SyntaxFactory.BinaryExpression(SyntaxKind.EqualsExpression, mine, theirs)
+                : SyntaxFactory.InvocationExpression(
+                    SyntaxFactory.MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression,
+                        DefaultComparer(type), SyntaxFactory.IdentifierName("Equals")),
+                    SyntaxFactory.ArgumentList(SyntaxFactory.SeparatedList(new[]
+                    {
+                        SyntaxFactory.Argument(mine), SyntaxFactory.Argument(theirs)
+                    })));
+        }
+        ExpressionSyntax? memberComparison = members.Count > 0
+            ? members
+                .Select(m => Compare(m.name, m.type))
                 .Aggregate((left, right) => SyntaxFactory.BinaryExpression(
                     SyntaxKind.LogicalAndExpression, left, right))
             : null;
@@ -641,32 +748,14 @@ public partial class RoslynService
             accessibility: Accessibility.Public,
             statements: typedEqualsStatements);
 
-        var hashStatements = new List<SyntaxNode>
-        {
-            generator.LocalDeclarationStatement("hash",
-                generator.ObjectCreationExpression(SyntaxFactory.ParseTypeName("global::System.HashCode")))
-        };
-        if (chainBaseHash)
-        {
-            hashStatements.Add(generator.ExpressionStatement(
-                generator.InvocationExpression(
-                    generator.MemberAccessExpression(generator.IdentifierName("hash"), "Add"),
-                    generator.InvocationExpression(
-                        generator.MemberAccessExpression(SyntaxFactory.BaseExpression(), "GetHashCode")))));
-        }
-        hashStatements.AddRange(memberNames.Select(m => generator.ExpressionStatement(
-            generator.InvocationExpression(
-                generator.MemberAccessExpression(generator.IdentifierName("hash"), "Add"),
-                generator.IdentifierName(m)))));
-        hashStatements.Add(generator.ReturnStatement(
-            generator.InvocationExpression(
-                generator.MemberAccessExpression(generator.IdentifierName("hash"), "ToHashCode"))));
         var getHashCode = generator.MethodDeclaration(
             "GetHashCode",
             returnType: generator.TypeExpression(SpecialType.System_Int32),
             accessibility: Accessibility.Public,
             modifiers: Microsoft.CodeAnalysis.Editing.DeclarationModifiers.Override,
-            statements: hashStatements);
+            statements: hashCodeAvailable
+                ? HashCodeBuilderStatements(generator, members, chainBaseHash)
+                : MultiplicativeHashStatements(members, chainBaseHash));
 
         var declarations = new List<SyntaxNode> { objectEquals, typedEquals, getHashCode };
         if (!includeOperators) return declarations;
@@ -710,27 +799,51 @@ public partial class RoslynService
         return declarations;
     }
 
-    // The document's line ending (from its first line break), defaulting to "\n".
-    internal static string DetectLineEnding(SourceText text)
+    // GetHashCode through System.HashCode: every compared member feeds the hash
+    // (HashCode.Combine caps at eight arguments, and hashing a subset of what Equals
+    // compares breaks the Equals/GetHashCode contract).
+    private static List<SyntaxNode> HashCodeBuilderStatements(
+        Microsoft.CodeAnalysis.Editing.SyntaxGenerator generator, List<(string name, ITypeSymbol type)> members, bool chainBaseHash)
     {
-        if (text.Lines.Count > 0)
+        var statements = new List<SyntaxNode>
         {
-            var first = text.Lines[0];
-            if (first.EndIncludingLineBreak > first.End)
-                return text.ToString(TextSpan.FromBounds(first.End, first.EndIncludingLineBreak));
+            generator.LocalDeclarationStatement("hash",
+                generator.ObjectCreationExpression(SyntaxFactory.ParseTypeName("global::System.HashCode")))
+        };
+        if (chainBaseHash)
+        {
+            statements.Add(generator.ExpressionStatement(
+                generator.InvocationExpression(
+                    generator.MemberAccessExpression(generator.IdentifierName("hash"), "Add"),
+                    generator.InvocationExpression(
+                        generator.MemberAccessExpression(SyntaxFactory.BaseExpression(), "GetHashCode")))));
         }
-        return "\n";
+        statements.AddRange(members.Select(m => generator.ExpressionStatement(
+            generator.InvocationExpression(
+                generator.MemberAccessExpression(generator.IdentifierName("hash"), "Add"),
+                generator.IdentifierName(m.name)))));
+        statements.Add(generator.ReturnStatement(
+            generator.InvocationExpression(
+                generator.MemberAccessExpression(generator.IdentifierName("hash"), "ToHashCode"))));
+        return statements;
     }
 
-    // Rewrites generated code's newlines to the document's line ending, so generated
-    // members/guards spliced into a CRLF file don't introduce lone LFs.
-    internal static string WithDocumentLineEndings(string generated, SourceText document)
+    // GetHashCode for frameworks without System.HashCode: the multiplicative combination
+    // of EqualityComparer<T>.Default hashes (null-safe), in an unchecked block so it
+    // cannot overflow-throw under /checked.
+    private static List<SyntaxNode> MultiplicativeHashStatements(List<(string name, ITypeSymbol type)> members, bool chainBaseHash)
     {
-        var eol = DetectLineEnding(document);
-        // Normalize in both directions: collapse any CRLF in the generated text to LF first,
-        // then expand to the document's ending — so CRLF-bearing generated text spliced into
-        // an LF file (and the reverse) never leaves mixed endings.
-        return generated.Replace("\r\n", "\n").Replace("\n", eol);
+        StatementSyntax Line(string statement) =>
+            SyntaxFactory.ParseStatement(statement).WithTrailingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed);
+        var statements = new List<StatementSyntax> { Line("int hash = 17;") };
+        if (chainBaseHash) statements.Add(Line("hash = hash * -1521134295 + base.GetHashCode();"));
+        statements.AddRange(members.Select(m => Line(
+            $"hash = hash * -1521134295 + {DefaultComparer(m.type)}.GetHashCode({EscapedName(m.name).ToFullString()});")));
+        statements.Add(Line("return hash;"));
+        return new List<SyntaxNode>
+        {
+            SyntaxFactory.CheckedStatement(SyntaxKind.UncheckedStatement, SyntaxFactory.Block(statements))
+        };
     }
 
     // Renders a type for GENERATED code: fully qualified with a global:: prefix so it

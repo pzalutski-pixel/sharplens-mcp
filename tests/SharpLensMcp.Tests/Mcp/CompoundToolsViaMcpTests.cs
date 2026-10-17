@@ -316,16 +316,15 @@ public class CompoundToolsViaMcpTests : McpTestBase
         data["lineCount"]!.Value<int>().Should().BeGreaterThan(20,
             "GetHealthCheckAsync spans well over 20 lines");
 
-        // location { filePath, startLine, endLine }.
-        // Note: the impl uses method.Locations.GetLineSpan() — that's the
-        // IDENTIFIER token's span (one line for a single-line declaration),
-        // NOT the full method body span. So startLine == endLine is normal.
+        // location { filePath, line, column } is the method's name; span covers the whole
+        // declaration, which lineCount measures.
         var location = data["location"]!;
-        location["filePath"]!.Value<string>()!.Should().EndWith(".cs");
-        location["startLine"]!.Value<int>().Should().BeGreaterOrEqualTo(0);
-        location["endLine"]!.Value<int>().Should().BeGreaterOrEqualTo(
-            location["startLine"]!.Value<int>(),
-            "endLine is >= startLine (equal when the identifier fits on one line)");
+        location["filePath"]!.Value<string>()!.Should().Be("src/RoslynService.cs");
+        var span = data["span"]!;
+        span["startLine"]!.Value<int>().Should().Be(location["line"]!.Value<int>(),
+            "the declaration starts on the line of its name");
+        data["lineCount"]!.Value<int>().Should().Be(
+            span["endLine"]!.Value<int>() - span["startLine"]!.Value<int>() + 1);
 
         var source = data["fullSource"]!.Value<string>()!;
         source.Should().Contain("public async Task<object> GetHealthCheckAsync(",

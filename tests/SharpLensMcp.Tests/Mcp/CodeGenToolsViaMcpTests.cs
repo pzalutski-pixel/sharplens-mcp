@@ -64,7 +64,7 @@ public class CodeGenToolsViaMcpTests : McpTestBase
             filePath = file, line, column = col, preview = true
         });
         data["methodName"]!.Value<string>().Should().Be("GetHealthCheckAsync");
-        data["message"]!.Value<string>()!.Should().Contain("No nullable parameters",
+        data["message"]!.Value<string>()!.Should().Be("No reference-type parameter needs a null check",
             "GetHealthCheckAsync has zero parameters, so no guards can be generated");
 
         // Lock the absence of the with-params response fields — a regression that

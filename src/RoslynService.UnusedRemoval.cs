@@ -8,7 +8,9 @@ namespace SharpLensMcp;
 // declarations; whole field declarations only when every declarator is dead),
 // drops using directives that the removals made unnecessary, and returns each
 // touched file's full updated content — the agent writes the files itself and
-// runs sync_documents. Per product rule, new tools never write.
+// runs sync_documents. Per product rule, new tools never write. Declarations are
+// removed with DeclarationRemoval, so the directives around them (#region, #if)
+// stay balanced; a file compiled once per target framework is computed once.
 public partial class RoslynService
 {
     public async Task<object> RemoveUnusedCodeAsync(
@@ -23,14 +25,8 @@ public partial class RoslynService
         EnsureSolutionLoaded();
 
         if (ValidateUnusedCodeKindFilter(symbolKindFilter) is { } filterError) return filterError;
-
-        if (maxSymbols is < 1 or > 500)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"maxSymbols must be between 1 and 500 (got {maxSymbols})",
-                context: new { maxSymbols });
-        }
+        if (ParameterValidation.Limit("maxSymbols", maxSymbols, 500) is { } maxSymbolsError) return CreateErrorResponse(maxSymbolsError);
+        if (ResolveProjectScope(projectName).Error is { } projectError) return projectError;
 
         // An allow-list narrows the detector's candidate sweep up front: only
         // the named symbols get reference-checked instead of the whole project.
@@ -49,7 +45,10 @@ public partial class RoslynService
 
         var skipped = new List<object>();
         var removed = new List<object>();
-        var nodesByDocument = new Dictionary<DocumentId, List<SyntaxNode>>();
+        // Per file path: the document the removals are computed on and the spans of the
+        // declarations to remove. A declaration of a multi-targeted project is found in
+        // the document of each target framework; it is one declaration of one file.
+        var removalsByPath = new Dictionary<string, (Document document, HashSet<Microsoft.CodeAnalysis.Text.TextSpan> spans)>(PathComparer);
 
         foreach (var entry in data.Symbols)
         {
@@ -62,18 +61,18 @@ public partial class RoslynService
             foreach (var declRef in entry.Symbol.DeclaringSyntaxReferences)
             {
                 var document = _solution!.GetDocument(declRef.SyntaxTree);
-                if (document == null) continue;
+                if (document?.FilePath == null) continue;
 
                 var node = await declRef.GetSyntaxAsync(cancellationToken);
                 var removable = ToRemovableNode(node);
                 if (removable == null) continue;
 
-                if (!nodesByDocument.TryGetValue(document.Id, out var nodes))
+                if (!removalsByPath.TryGetValue(document.FilePath, out var removals))
                 {
-                    nodes = new List<SyntaxNode>();
-                    nodesByDocument[document.Id] = nodes;
+                    removals = (document, new HashSet<Microsoft.CodeAnalysis.Text.TextSpan>());
+                    removalsByPath[document.FilePath] = removals;
                 }
-                nodes.Add(removable);
+                removals.spans.Add(removable.Span);
                 mappedAny = true;
             }
 
@@ -106,18 +105,20 @@ public partial class RoslynService
         // Build the updated contents on a FORKED solution — nothing is applied.
         var files = new List<object>();
         var forked = _solution!;
-        foreach (var (documentId, nodes) in nodesByDocument)
+        foreach (var (_, (document, spans)) in removalsByPath)
         {
-            var document = _solution!.GetDocument(documentId);
-            if (document?.FilePath == null) continue;
             var root = await document.GetSyntaxRootAsync(cancellationToken);
             if (root == null) continue;
+            var nodes = spans
+                .Select(span => root.FindNode(span, getInnermostNodeForTie: false))
+                .Select(node => ToRemovableNode(node) ?? node)
+                .Distinct()
+                .ToList();
 
             // A member nested inside a removed type vanishes with the type;
-            // passing both to RemoveNodes is redundant and fragile.
+            // passing both to the removal is redundant and fragile.
             var topLevel = nodes
                 .Where(n => !nodes.Any(other => other != n && other.Span.Contains(n.Span)))
-                .Distinct()
                 .ToList();
 
             // When EVERY declarator of a multi-declarator field/local (`int a, b;`) is
@@ -128,7 +129,7 @@ public partial class RoslynService
             var toRemove = new List<SyntaxNode>();
             foreach (var node in topLevel)
             {
-                if (node is VariableDeclaratorSyntax { Parent: VariableDeclarationSyntax decl } declarator
+                if (node is VariableDeclaratorSyntax { Parent: VariableDeclarationSyntax decl }
                     && decl.Variables.Count > 1
                     && decl.Variables.All(removalSet.Contains)
                     && decl.Parent is { } wholeDeclaration)
@@ -141,14 +142,14 @@ public partial class RoslynService
                 }
             }
 
-            var newRoot = root.RemoveNodes(toRemove, SyntaxRemoveOptions.KeepNoTrivia)!;
-            forked = forked.WithDocumentSyntaxRoot(documentId, newRoot);
+            var newRoot = DeclarationRemoval.Remove(root, toRemove);
+            forked = forked.WithDocumentSyntaxRoot(document.Id, newRoot);
 
             var (finalRoot, removedUsings) = await RemoveNewlyUnusedUsingsAsync(
-                document, forked.GetDocument(documentId)!, cancellationToken);
+                document, forked.GetDocument(document.Id)!, cancellationToken);
             if (removedUsings > 0)
             {
-                forked = forked.WithDocumentSyntaxRoot(documentId, finalRoot);
+                forked = forked.WithDocumentSyntaxRoot(document.Id, finalRoot);
             }
 
             files.Add(new
@@ -156,7 +157,8 @@ public partial class RoslynService
                 filePath = FormatPath(document.FilePath),
                 removedDeclarations = topLevel.Count,
                 removedUsings,
-                updatedContent = (removedUsings > 0 ? finalRoot : newRoot).ToFullString()
+                updatedContent = await MatchDocumentLineEndingsAsync(
+                    document, (removedUsings > 0 ? finalRoot : newRoot).ToFullString(), cancellationToken)
             });
         }
 

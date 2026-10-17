@@ -363,22 +363,18 @@ public class AnalysisToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
-    public async Task AnalyzeChangeImpact_UnknownChangeType_DefaultsToInfo()
+    public async Task AnalyzeChangeImpact_UnknownChangeType_IsInvalidParameter()
     {
         var (file, line, col) = await LocateSymbolAsync("CreateSuccessResponse", kind: "Method",
             r => r["containingType"]?.Value<string>()?.Contains("RoslynService") == true);
-        var data = await CallAndGetDataAsync("analyze_change_impact", new
+        var error = await CallAndGetErrorAsync("analyze_change_impact", new
         {
             filePath = file, line, column = col,
             changeType = "somethingUnknown",
             newValue = "n/a"
-        });
-        data["safe"]!.Value<bool>().Should().BeTrue();
-        foreach (var loc in (data["impactedLocations"] as JArray)!)
-        {
-            loc["severity"]!.Value<string>().Should().Be("info");
-            loc["impact"]!.Value<string>().Should().Be("Unknown impact");
-        }
+        }, codeContains: ErrorCodes.InvalidParameter);
+        error["context"]!["parameter"]!.Value<string>().Should().Be("changeType",
+            "an unknown change type is a caller error, never a 'safe' verdict");
     }
 
     [Fact]
@@ -727,22 +723,22 @@ public class AnalysisToolsViaMcpTests : McpTestBase
         (data["cycles"] as JArray)!.Count.Should().Be(0);
     }
 
+    // The cycles themselves are pinned on a deterministic fixture (DependencyCycleTests);
+    // here the namespace graph of the loaded solution has the same nodes/edges shape as the
+    // project level, with its namespaces as nodes.
     [Fact]
-    public async Task FindCircularDependencies_Namespace_NoCyclesInOurSolution()
+    public async Task FindCircularDependencies_Namespace_ReportsTheSolutionNamespacesAsNodes()
     {
         var data = await CallAndGetDataAsync("find_circular_dependencies", new
         {
             level = "namespace"
         });
         data["level"]!.Value<string>().Should().Be("namespace");
-        data["hasCycles"]!.Value<bool>().Should().BeFalse(
-            "the SharpLens solution has no namespace cycles");
-        (data["cycles"] as JArray)!.Count.Should().Be(0);
-        data["namespaceCount"]!.Value<int>().Should().BeGreaterThan(0,
-            "the solution has multiple namespaces (SharpLensMcp, SharpLensMcp.Tests, etc.)");
-        // graph must always be emitted for shape consistency with the project-level form
-        (data["graph"] as JObject).Should().NotBeNull(
-            "namespace-level response must include graph");
+        var nodes = ((JArray)data["nodes"]!).Select(n => n["id"]!.Value<string>()).ToList();
+        nodes.Should().Contain(new[] { "SharpLensMcp", "SharpLensMcp.Tests", "SharpLensMcp.Tests.Fixtures" });
+        data["namespaceCount"]!.Value<int>().Should().Be(nodes.Count);
+        ((JArray)data["edges"]!).Select(e => $"{e["from"]}>{e["to"]}")
+            .Should().Contain("SharpLensMcp.Tests>SharpLensMcp", "the tests use RoslynService");
     }
 
     [Fact]

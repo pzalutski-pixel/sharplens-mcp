@@ -190,15 +190,13 @@ public class InfrastructureTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // The default-format response carries a dependencies dictionary, not a graph string.
-        var deps = data["dependencies"] as JObject;
-        deps.Should().NotBeNull("json format returns a Dictionary<string, List<string>>");
-        deps!["SharpLensMcp.Tests"].Should().NotBeNull(
-            "the test project must appear as a key in the dependency graph");
-        var testDeps = deps["SharpLensMcp.Tests"] as JArray;
-        testDeps.Should().NotBeNullOrEmpty();
-        testDeps!.Select(t => t.Value<string>())
-            .Should().Contain("SharpLensMcp",
+        // The json format carries nodes and edges (by node id), not a graph string.
+        var nameById = ((JArray)data["nodes"]!).ToDictionary(n => n["id"]!.Value<string>()!, n => n["name"]!.Value<string>()!);
+        nameById.Should().ContainKey("SharpLensMcp_Tests").WhoseValue.Should().Be("SharpLensMcp.Tests",
+            "the test project is a node, its id the Mermaid-valid form of its name");
+        ((JArray)data["edges"]!)
+            .Select(e => $"{nameById[e["from"]!.Value<string>()!]}>{nameById[e["to"]!.Value<string>()!]}")
+            .Should().Contain("SharpLensMcp.Tests>SharpLensMcp",
                 "SharpLensMcp.Tests project-references SharpLensMcp");
 
         data["hasCycles"].Should().NotBeNull();
@@ -248,49 +246,43 @@ public class InfrastructureTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task SyncDocuments_WithNoFiles_UpdatesAllExistingAddsNoneRemovesNone()
+    public async Task SyncDocuments_WithNoFiles_OverAnInSyncSolution_ChangesNothing()
     {
         var result = await Service.SyncDocumentsAsync(null);
 
         AssertSuccess(result);
         var data = GetData(result);
-        // Sync-all walks every document already in the solution; none of them are
-        // missing from disk and none are unknown, so:
-        //  - added must be 0 (nothing new appears via the existing-document path)
-        //  - removed must be 0 (every file still exists on disk)
-        //  - updated must be > 0 (every existing doc is rewritten with on-disk text)
-        //  - totalSynced must equal updated + added + removed
-        var updated = data["updated"]!.Value<int>();
-        var added = data["added"]!.Value<int>();
-        var removed = data["removed"]!.Value<int>();
-        added.Should().Be(0, "sync-all over an in-sync solution adds no new documents");
-        removed.Should().Be(0, "sync-all over a solution with all files present removes nothing");
-        updated.Should().BeGreaterThan(0, "every existing doc gets rewritten with disk text");
-        data["totalSynced"].Should().NotBeNull();
-        data["totalSynced"]!.Value<int>().Should().Be(updated + added + removed);
+        // Sync-all checks every document against disk and every compile item the
+        // projects evaluate to. The loaded solution matches disk, so nothing is updated,
+        // added or removed, and every document path is reported unchanged.
+        var documentPaths = Service.GetSolutionForTesting()!.Projects
+            .SelectMany(p => p.Documents)
+            .Where(d => d.FilePath != null)
+            .Select(d => Path.GetFullPath(d.FilePath!))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count();
+        data["updated"]!.Value<int>().Should().Be(0, "no file changed on disk since the load");
+        data["added"]!.Value<int>().Should().Be(0, "every compile item is already a document");
+        data["removed"]!.Value<int>().Should().Be(0, "every document's file still exists");
+        data["unchanged"]!.Value<int>().Should().Be(documentPaths);
+        data["totalSynced"]!.Value<int>().Should().Be(0);
     }
 
     [Fact]
-    public async Task SyncDocuments_WithSpecificFile_SyncsOnlyThatFile()
+    public async Task SyncDocuments_WithSpecificUnchangedFile_ReportsItUnchanged()
     {
         var result = await Service.SyncDocumentsAsync(new List<string> { "src/RoslynService.cs" });
 
         AssertSuccess(result);
         var data = GetData(result);
-        // The updated count + the updatedFiles list must agree, and the named file
-        // must appear in the list.
-        data["totalSynced"].Should().NotBeNull();
-        data["totalSynced"]!.Value<int>().Should().Be(1);
-        data["updated"].Should().NotBeNull();
-        data["updated"]!.Value<int>().Should().Be(1);
-        data["added"].Should().NotBeNull();
+        // The file on disk equals the loaded text: it is checked (unchanged 1) but not
+        // updated, and nothing else is touched.
+        data["unchanged"]!.Value<int>().Should().Be(1);
+        data["totalSynced"]!.Value<int>().Should().Be(0);
+        data["updated"]!.Value<int>().Should().Be(0);
         data["added"]!.Value<int>().Should().Be(0);
-        data["removed"].Should().NotBeNull();
         data["removed"]!.Value<int>().Should().Be(0);
-        var updatedFiles = data["updatedFiles"] as JArray;
-        updatedFiles.Should().NotBeNullOrEmpty();
-        updatedFiles!.Any(f => f.Value<string>()?.EndsWith("RoslynService.cs") == true)
-            .Should().BeTrue("the requested file must appear in the updatedFiles list");
+        ((JArray)data["updatedFiles"]!).Should().BeEmpty();
     }
 
     [Fact]
@@ -311,6 +303,10 @@ public class InfrastructureTests : RoslynServiceTestBase
         data["added"]!.Value<int>().Should().Be(0);
         data["removed"].Should().NotBeNull();
         data["removed"]!.Value<int>().Should().Be(0);
+        var errors = (JArray)data["errors"]!;
+        errors.Should().HaveCount(1, "a path that is neither on disk nor in the solution is reported, not ignored");
+        errors[0]["path"]!.Value<string>().Should().Be("src/NonExistent.cs");
+        errors[0]["error"]!.Value<string>().Should().Be("File not found on disk and not in the solution");
     }
 
     [Fact]
@@ -372,15 +368,13 @@ public class InfrastructureTests : RoslynServiceTestBase
     [Fact]
     public async Task DependencyGraph_WithNullFormat_DefaultsToJsonDictionary()
     {
-        // The impl routes anything that isn't "mermaid" through the json
-        // (dictionary) branch. Calling with format=null must therefore behave like
-        // format="json" — emit dependencies + hasCycles + cycles, NOT a graph string.
+        // An absent format is json: nodes + edges + hasCycles + cycles, NOT a graph string.
         var result = await Service.GetDependencyGraphAsync(format: null);
 
         AssertSuccess(result);
         var data = GetData(result);
-        (data["dependencies"] as JObject).Should().NotBeNull(
-            "null format defaults to the dictionary branch");
+        ((JArray)data["nodes"]!).Select(n => n["name"]!.Value<string>())
+            .Should().Contain(new[] { "SharpLensMcp", "SharpLensMcp.Tests" }, "null format is the json format");
         data["graph"].Should().BeNull(
             "the mermaid `graph` string must not appear in the default response");
         data["hasCycles"].Should().NotBeNull();

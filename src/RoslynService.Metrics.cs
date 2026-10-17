@@ -5,10 +5,14 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 namespace SharpLensMcp;
 
 // get_complexity_metrics: cyclomatic, cognitive, nesting, LOC, and parameter
-// counts per method and per file. Metrics analysis, kept apart from the codegen
-// and edit tools it formerly shared a file with.
+// counts per method and per file. Members are named as C# declares them (a constructor
+// by its type name, "operator +", "this[].get") and located at their name, not at an
+// attribute above it.
 public partial class RoslynService
 {
+    private static readonly IReadOnlyList<string> ComplexityMetricNames =
+        new[] { "cyclomatic", "nesting", "loc", "parameters", "cognitive" };
+
     /// <summary>
     /// Get complexity metrics for a method or file.
     /// </summary>
@@ -20,6 +24,31 @@ public partial class RoslynService
         CancellationToken cancellationToken = default)
     {
         EnsureSolutionLoaded();
+
+        // Every requested metric must be a known one (matched case-insensitively); an empty
+        // list could only return nothing.
+        var requestedMetrics = new List<string>();
+        if (metrics != null)
+        {
+            if (metrics.Count == 0)
+            {
+                return CreateErrorResponse(
+                    ErrorCodes.InvalidParameter,
+                    $"metrics must name at least one of: {string.Join(", ", ComplexityMetricNames)}",
+                    hint: "Omit metrics for all of them, or list the ones you need.",
+                    context: new { parameter = "metrics", allowedValues = ComplexityMetricNames });
+            }
+            foreach (var metric in metrics)
+            {
+                if (ParameterValidation.Choice("metrics", metric, ComplexityMetricNames, out var canonical) is { } invalid)
+                    return CreateErrorResponse(invalid);
+                if (!requestedMetrics.Contains(canonical!)) requestedMetrics.Add(canonical!);
+            }
+        }
+        else
+        {
+            requestedMetrics.AddRange(ComplexityMetricNames);
+        }
 
         Document document;
         try
@@ -49,12 +78,6 @@ public partial class RoslynService
         }
 
         var root = await syntaxTree.GetRootAsync(cancellationToken);
-
-        // Default to all metrics if none specified
-        var requestedMetrics = metrics ?? new List<string>
-        {
-            "cyclomatic", "nesting", "loc", "parameters", "cognitive"
-        };
 
         // If line is specified, find the method at that position
         if (line.HasValue)
@@ -91,12 +114,11 @@ public partial class RoslynService
                 }
 
                 var memberMetrics = CalculateComplexityMetrics(memberNode, requestedMetrics);
-                var memberSymbol = accessor != null ? null : semanticModel.GetDeclaredSymbol(memberNode, cancellationToken);
                 return CreateSuccessResponse(
                     data: new
                     {
                         scope = accessor != null ? "accessor" : "property",
-                        name = ComplexityMemberName(memberNode, memberSymbol),
+                        name = ComplexityMemberName(memberNode),
                         metrics = memberMetrics
                     },
                     suggestedNextTools: new[]
@@ -115,7 +137,7 @@ public partial class RoslynService
                 data: new
                 {
                     scope = "method",
-                    name = ComplexityMemberName(methodNode, methodSymbol),
+                    name = ComplexityMemberName(methodNode),
                     containingType = methodSymbol?.ContainingType?.Name,
                     metrics = methodMetrics
                 },
@@ -149,20 +171,17 @@ public partial class RoslynService
                 var methodMetrics = CalculateComplexityMetrics(m, requestedMetrics);
                 return new
                 {
-                    name = ComplexityMemberName(m, symbol),
+                    name = ComplexityMemberName(m),
                     containingType = symbol?.ContainingType?.Name,
-                    line = m.GetLocation().GetLineSpan().StartLinePosition.Line,
+                    line = DeclarationNameToken(m).GetLocation().GetLineSpan().StartLinePosition.Line,
                     metrics = methodMetrics
                 };
             })
             .ToList();
 
-        // Calculate file-level totals
+        // Calculate file-level totals. Max() is guarded against an empty method set
+        // (interfaces, enums, DTOs).
         var fileTotals = new Dictionary<string, object>();
-        // Match the metric name case-insensitively, exactly as the per-method
-        // CalculateComplexityMetrics does (it switches on metric.ToLowerInvariant());
-        // a case-sensitive == here would silently drop file totals for "Cyclomatic".
-        // Max() is guarded against an empty method set (interfaces, enums, DTOs).
         double Avg(string key) => methods.Count > 0
             ? Math.Round(methods.Sum(m => m.metrics.TryGetValue(key, out var v) ? (int)v : 0) / (double)methods.Count, 2)
             : 0;
@@ -171,7 +190,7 @@ public partial class RoslynService
             : 0;
         foreach (var metric in requestedMetrics)
         {
-            switch (metric.ToLowerInvariant())
+            switch (metric)
             {
                 case "cyclomatic":
                     fileTotals["avgCyclomatic"] = Avg("cyclomatic");
@@ -199,23 +218,22 @@ public partial class RoslynService
             data: new
             {
                 scope = "file",
-                filePath,
+                filePath = FormatPath(document.FilePath),
                 methodCount = methods.Count,
                 fileTotals,
                 methods
             },
-            totalCount: methods.Count,
-            returnedCount: methods.Count
-        );
+            ResultCounts.Complete(methods.Count));
     }
 
+    // The requested metrics (canonical names) of one member.
     private Dictionary<string, object> CalculateComplexityMetrics(SyntaxNode node, List<string> requestedMetrics)
     {
         var result = new Dictionary<string, object>();
 
         foreach (var metric in requestedMetrics)
         {
-            switch (metric.ToLowerInvariant())
+            switch (metric)
             {
                 case "cyclomatic":
                     result["cyclomatic"] = CalculateCyclomaticComplexity(node);
@@ -238,9 +256,11 @@ public partial class RoslynService
         return result;
     }
 
-    // The single cyclomatic counter shared by get_complexity_metrics and the
-    // find_god_objects / find_untested_code estimate (EstimateCyclomaticAsync), so
-    // the two tools never report different numbers for the same method.
+    // The single cyclomatic counter shared by get_complexity_metrics and find_untested_code's
+    // complexity (EstimateCyclomaticAsync), so the two tools never report different numbers
+    // for the same member. One plus one per decision point: if, ?:, ?., ??, ??=, every
+    // loop, catch and catch filter, case label and non-discard switch-expression arm, `when`
+    // clause, and each && / || / pattern and / pattern or.
     internal static int CalculateCyclomaticComplexity(SyntaxNode node)
     {
         // Start with 1 (the method itself is one path)
@@ -259,6 +279,8 @@ public partial class RoslynService
                 case ForStatementSyntax:
                 case ForEachStatementSyntax:
                 case CatchClauseSyntax:
+                case CatchFilterClauseSyntax: // catch (…) when (…)
+                case WhenClauseSyntax: // case … when …, switch-expression arm … when …
                 case ConditionalAccessExpressionSyntax: // ?.
                     complexity++;
                     break;
@@ -271,6 +293,12 @@ public partial class RoslynService
                     binary.Kind() == SyntaxKind.LogicalAndExpression ||
                     binary.Kind() == SyntaxKind.LogicalOrExpression ||
                     binary.Kind() == SyntaxKind.CoalesceExpression: // ??
+                    complexity++;
+                    break;
+                case AssignmentExpressionSyntax assignment when assignment.IsKind(SyntaxKind.CoalesceAssignmentExpression): // ??=
+                    complexity++;
+                    break;
+                case BinaryPatternSyntax: // pattern `and` / `or`
                     complexity++;
                     break;
             }
@@ -286,13 +314,15 @@ public partial class RoslynService
         return maxDepth;
     }
 
+    // The deepest stack of nested control structures. An `else if` continues its if/else
+    // chain at the chain's level: it is not one level deeper than the `if` it follows.
     private void CalculateNestingDepthRecursive(SyntaxNode node, int currentDepth, ref int maxDepth)
     {
         foreach (var child in node.ChildNodes())
         {
             int newDepth = currentDepth;
 
-            if (child is IfStatementSyntax ||
+            if ((child is IfStatementSyntax && child.Parent is not ElseClauseSyntax) ||
                 child is WhileStatementSyntax ||
                 child is DoStatementSyntax ||
                 child is ForStatementSyntax ||
@@ -337,38 +367,61 @@ public partial class RoslynService
         _ => 0
     };
 
-    // A display name for a member when no declared symbol is available — methods,
-    // constructors, operators, conversions, destructors, and local functions.
-    private static string MemberSyntaxName(SyntaxNode node) => node switch
+    // A member's name as C# declares it, used by BOTH the cursor and file-scope paths so
+    // the two never name one member differently: a constructor by its type name, a
+    // destructor "~Type", "operator +", "implicit operator int", an indexer "this[]", an
+    // accessor "<property, indexer or event>.<keyword>".
+    private static string ComplexityMemberName(SyntaxNode node) => node switch
     {
-        MethodDeclarationSyntax m => m.Identifier.Text,
-        ConstructorDeclarationSyntax c => c.Identifier.Text,
+        MethodDeclarationSyntax m => m.Identifier.ValueText,
+        ConstructorDeclarationSyntax c => c.Identifier.ValueText,
+        DestructorDeclarationSyntax d => $"~{d.Identifier.ValueText}",
         OperatorDeclarationSyntax o => $"operator {o.OperatorToken.Text}",
-        ConversionOperatorDeclarationSyntax => "conversion operator",
-        DestructorDeclarationSyntax d => $"~{d.Identifier.Text}",
-        LocalFunctionStatementSyntax lf => lf.Identifier.Text,
+        ConversionOperatorDeclarationSyntax co => $"{co.ImplicitOrExplicitKeyword.Text} operator {co.Type}",
+        LocalFunctionStatementSyntax lf => lf.Identifier.ValueText,
+        PropertyDeclarationSyntax p => p.Identifier.ValueText,
+        IndexerDeclarationSyntax => "this[]",
+        AccessorDeclarationSyntax a => $"{AccessorOwnerName(a)}.{a.Keyword.Text}",
         _ => "member"
     };
 
-    // The member name used by BOTH the cursor and file-scope complexity paths, so the
-    // two never report the same member differently. An accessor reads as
-    // "Property.get"/"Property.set"; everything else uses the symbol name.
-    private static string ComplexityMemberName(SyntaxNode node, ISymbol? symbol) => node switch
+    // The property, indexer ("this[]") or event an accessor belongs to.
+    private static string AccessorOwnerName(AccessorDeclarationSyntax accessor) =>
+        accessor.Ancestors().OfType<BasePropertyDeclarationSyntax>().FirstOrDefault() switch
+        {
+            PropertyDeclarationSyntax property => property.Identifier.ValueText,
+            IndexerDeclarationSyntax => "this[]",
+            EventDeclarationSyntax eventDeclaration => eventDeclaration.Identifier.ValueText,
+            _ => "?"
+        };
+
+    // The token that names a member declaration — where its location is reported.
+    private static SyntaxToken DeclarationNameToken(SyntaxNode node) => node switch
     {
-        AccessorDeclarationSyntax acc => acc.Parent?.Parent is PropertyDeclarationSyntax prop
-            ? $"{prop.Identifier.Text}.{acc.Keyword.Text}"
-            : acc.Keyword.Text,
-        _ => symbol?.Name ?? MemberSyntaxName(node)
+        MethodDeclarationSyntax m => m.Identifier,
+        ConstructorDeclarationSyntax c => c.Identifier,
+        DestructorDeclarationSyntax d => d.Identifier,
+        OperatorDeclarationSyntax o => o.OperatorKeyword,
+        ConversionOperatorDeclarationSyntax co => co.OperatorKeyword,
+        LocalFunctionStatementSyntax lf => lf.Identifier,
+        PropertyDeclarationSyntax p => p.Identifier,
+        IndexerDeclarationSyntax i => i.ThisKeyword,
+        AccessorDeclarationSyntax a => a.Keyword,
+        _ => node.GetFirstToken()
     };
 
     private int CalculateCognitiveComplexity(SyntaxNode node)
     {
-        // Cognitive complexity is similar to cyclomatic but penalizes nesting
         int complexity = 0;
         CalculateCognitiveComplexityRecursive(node, 0, ref complexity);
         return complexity;
     }
 
+    // Sonar's cognitive complexity: +1 per break in linear flow (if, else if, else, ?:,
+    // switch statement or expression, loop, catch, goto, each run of like boolean or
+    // pattern operators) plus, for the nesting structures (if, ?:, switch, loop, catch),
+    // the current nesting level. Those structures nest what they contain, and so do
+    // lambdas, anonymous methods and local functions (no increment of their own).
     private void CalculateCognitiveComplexityRecursive(SyntaxNode node, int nestingLevel, ref int complexity)
     {
         foreach (var child in node.ChildNodes())
@@ -390,12 +443,21 @@ public partial class RoslynService
                 case ForStatementSyntax:
                 case ForEachStatementSyntax:
                 case SwitchStatementSyntax:
+                case SwitchExpressionSyntax:
                 case CatchClauseSyntax:
                     increment = 1 + nestingLevel; // Base + nesting penalty
                     newNesting = nestingLevel + 1;
                     break;
                 case ConditionalExpressionSyntax: // ?:
                     increment = 1 + nestingLevel;
+                    newNesting = nestingLevel + 1;
+                    break;
+                case AnonymousFunctionExpressionSyntax:
+                case LocalFunctionStatementSyntax:
+                    newNesting = nestingLevel + 1;
+                    break;
+                case GotoStatementSyntax:
+                    increment = 1;
                     break;
                 // One increment per RUN of the same boolean operator: `a && b && c` is a
                 // single &&-sequence (+1), but `a && b || c` mixes operators (+2). Count
@@ -405,6 +467,11 @@ public partial class RoslynService
                      binary.Kind() == SyntaxKind.LogicalOrExpression)
                     && (binary.Parent is not BinaryExpressionSyntax parent || parent.Kind() != binary.Kind()):
                     increment = 1; // No nesting penalty for && and ||
+                    break;
+                // Pattern `and` / `or` runs, counted the same way.
+                case BinaryPatternSyntax pattern
+                    when pattern.Parent is not BinaryPatternSyntax parentPattern || parentPattern.Kind() != pattern.Kind():
+                    increment = 1;
                     break;
                 case ElseClauseSyntax:
                     increment = 1; // else adds complexity

@@ -67,23 +67,21 @@ public class ExceptionFlowTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task Rethrower_BareThrow_EscapesAsTheCaughtType()
+    public async Task Rethrower_BareThrow_LetsTheOriginalEscape_AndAbsorbsNothing()
     {
         var data = await RunOn("RethrowerD");
 
-        // The callee's exception is caught at D's catch...
-        var caught = (data["caught"] as JArray)!;
-        caught.Count.Should().Be(1);
-        caught[0]["exceptionType"]!.Value<string>().Should().Be("System.InvalidOperationException");
+        // The catch rethrows everything it catches, so it absorbs nothing...
+        (data["caught"] as JArray)!.Should().BeEmpty(
+            "a catch whose block rethrows lets the caught exception continue");
 
-        // ...and the bare `throw;` re-escapes it as the caught type, NOT
-        // re-absorbed by the same try.
+        // ...and the callee's exception escapes D unchanged, from its original throw.
         var escaping = (data["escaping"] as JArray)!;
         escaping.Count.Should().Be(1);
         escaping[0]["exceptionType"]!.Value<string>().Should().Be("System.InvalidOperationException");
         escaping[0]["sampleThrowSite"]!["line"]!.Value<int>().Should().Be(
-            FixtureLineOf("            throw;"),
-            "the sample site must be the rethrow statement inside RethrowerD");
+            FixtureLineOf("throw new InvalidOperationException(\"a\")"),
+            "the escaping exception is the one ThrowerA throws, not a new one at the rethrow");
     }
 
     [Fact]

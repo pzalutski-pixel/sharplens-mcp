@@ -4,10 +4,21 @@ using Microsoft.CodeAnalysis.CSharp;
 namespace SharpLensMcp;
 
 // get_extension_methods: which extension members apply to a type — classic
-// `this`-parameter methods (IsExtensionMethod + ReduceExtensionMethod) and
-// C# 14 `extension(T receiver)` blocks (nested IsExtension containers whose
-// receiver the target converts to). Source-declared extensions only, grouped
-// by their containing static class.
+// `this`-parameter methods and C# 14 `extension(T receiver)` block members — grouped
+// by their containing static class. Source-declared extensions only.
+//   - A classic method applies when the compiler can call it on the type
+//     (ReduceExtensionMethod: receiver conversion, type inference and constraints). For a
+//     generic type definition (List`1), one whose receiver is a construction of it, of a
+//     base class or of an interface it implements (this List<int>) applies too: it applies
+//     to some construction of the type.
+//   - A block applies when its receiver accepts the type: the compiler's own check on the
+//     classic method an instance member lowers to, else the receiver's conversion, the
+//     constraints of a type-parameter receiver (extension<T>(T value) where T : IShape),
+//     or, for a generic receiver or a generic type definition, the same construction
+//     rule. Each block member is reported once as the block member, never again as the
+//     compiler-generated classic method it lowers to.
+// Each member is reported once however many target frameworks compile it, in class
+// then source order, with its declared receiver type and { filePath, line, column }.
 public partial class RoslynService
 {
     public async Task<object> GetExtensionMethodsAsync(
@@ -15,17 +26,12 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
-        if (maxResults is < 1 or > 500)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"maxResults must be between 1 and 500 (got {maxResults})",
-                context: new { maxResults });
-        }
+        if (ParameterValidation.Limit("maxResults", maxResults, 500) is { } invalidLimit)
+            return CreateErrorResponse(invalidLimit);
 
-        var (targetType, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
-        if (ambiguousType != null) return ambiguousType;
-        if (targetType == null)
+        var resolution = await ResolveTypeByNameAsync(typeName, cancellationToken);
+        if (resolution.Error != null) return resolution.Error;
+        if (resolution.Type is not { } targetType)
         {
             return CreateErrorResponse(
                 ErrorCodes.TypeNotFound,
@@ -34,22 +40,19 @@ public partial class RoslynService
                 context: new { typeName });
         }
         // The METADATA name (backtick arity, '+' nesting), not the display string —
-        // GetTypeByMetadataName fails on "List<int>"/"Outer.Inner", so a generic or
-        // nested target used to skip every project that only references it.
+        // GetTypeByMetadataName fails on "List<int>"/"Outer.Inner".
         var targetMetadataName = FullMetadataName(targetType);
 
-        var membersByClass = new Dictionary<string, List<object>>(StringComparer.Ordinal);
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        var totalFound = 0;
-
-        foreach (var project in _solution!.Projects)
+        var found = new List<(ISymbol Member, INamedTypeSymbol ContainingClass, string Style, ITypeSymbol Receiver, string? TargetFramework)>();
+        foreach (var project in GetLogicalProjects().Projects.SelectMany(p => p.Projects))
         {
             cancellationToken.ThrowIfCancellationRequested();
             var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
+            var targetFramework = LogicalProject.TargetFrameworkOf(project);
 
-            // The target re-resolved IN THIS compilation: ReduceExtensionMethod
-            // and ClassifyConversion need same-compilation symbol identity.
+            // The target re-resolved IN THIS compilation: ReduceExtensionMethod and
+            // ClassifyConversion need same-compilation symbol identity.
             var targetInCompilation = compilation.GetTypeByMetadataName(targetMetadataName)
                 ?? (SymbolEqualityComparer.Default.Equals(targetType.ContainingAssembly, compilation.Assembly)
                     ? targetType
@@ -66,18 +69,19 @@ public partial class RoslynService
                 {
                     switch (member)
                     {
-                        case IMethodSymbol { IsExtensionMethod: true } classic
-                            when classic.ReduceExtensionMethod(targetInCompilation) != null:
-                            AddEntry(staticClass, classic, "classic");
+                        // A block member's lowered classic method is implicitly declared.
+                        case IMethodSymbol { IsExtensionMethod: true, IsImplicitlyDeclared: false } classic
+                            when ClassicExtensionApplies(classic, targetInCompilation):
+                            found.Add((classic, staticClass, "classic", classic.Parameters[0].Type, targetFramework));
                             break;
 
-                        case INamedTypeSymbol { IsExtension: true } extensionBlock
-                            when ReceiverAccepts(compilation, extensionBlock, targetInCompilation):
+                        case INamedTypeSymbol { IsExtension: true, ExtensionParameter: { } receiver } extensionBlock
+                            when ExtensionBlockApplies(compilation, extensionBlock, targetInCompilation):
                             foreach (var blockMember in extensionBlock.GetMembers())
                             {
                                 if (blockMember.IsImplicitlyDeclared) continue;
                                 if (blockMember is not (IMethodSymbol { MethodKind: MethodKind.Ordinary } or IPropertySymbol)) continue;
-                                AddEntry(staticClass, blockMember, "extensionBlock");
+                                found.Add((blockMember, staticClass, "extensionBlock", receiver.Type, targetFramework));
                             }
                             break;
                     }
@@ -85,49 +89,45 @@ public partial class RoslynService
             }
         }
 
+        // One entry per member, by the solution's identity rule; a member without a
+        // SolutionKey is keyed by its static class and signature.
+        var merged = TargetFrameworkDeduplication.By(
+                found,
+                f => CrossCompilationSymbol.SolutionKey(f.Member)
+                     ?? $"{CrossCompilationSymbol.SolutionKey(f.ContainingClass)}|{f.Member.ToDisplayString()}",
+                StringComparer.Ordinal,
+                f => f.TargetFramework)
+            .OrderBy(m => m.Item.ContainingClass.ToDisplayString(), StringComparer.Ordinal)
+            .ThenBy(m => ReportedLocation(SymbolDisplayLocation(m.Item.Member)), ResultLocationComparer.Instance)
+            .ToList();
+        var reported = merged.Take(maxResults).ToList();
+
         return CreateSuccessResponse(
             data: new
             {
                 typeName = targetType.ToDisplayString(),
-                groups = membersByClass
-                    .OrderBy(g => g.Key, StringComparer.Ordinal)
-                    .Select(g => new { containingClass = g.Key, members = g.Value })
-                    .ToList()
+                groups = reported
+                    .GroupBy(m => m.Item.ContainingClass.ToDisplayString(), StringComparer.Ordinal)
+                    .Select(g => new
+                    {
+                        containingClass = g.Key,
+                        members = g.Select(m => WithTargetFrameworks(new Dictionary<string, object?>
+                        {
+                            ["name"] = m.Item.Member.Name,
+                            ["style"] = m.Item.Style,
+                            ["kind"] = MemberClassifier.Classify(m.Item.Member)?.ToString() ?? m.Item.Member.Kind.ToString(),
+                            ["signature"] = m.Item.Member.ToDisplayString(),
+                            ["receiverType"] = m.Item.Receiver.ToDisplayString(),
+                            ["location"] = GetSymbolLocation(m.Item.Member)
+                        }, m.TargetFrameworks)).ToList()
+                    })
+                    .ToList(),
+                notice = resolution.ShadowNotice
             },
-            suggestedNextTools: membersByClass.Count > 0
+            ResultCounts.Capped(merged.Count, reported.Count),
+            suggestedNextTools: merged.Count > 0
                 ? new[] { "get_method_source on an extension to read its implementation" }
-                : new[] { "No source-declared extensions apply to this type" },
-            totalCount: totalFound,
-            returnedCount: membersByClass.Values.Sum(v => v.Count));
-
-        void AddEntry(INamedTypeSymbol containingClass, ISymbol member, string style)
-        {
-            var classKey = containingClass.ToDisplayString();
-            var signature = member.ToDisplayString();
-            if (!seen.Add($"{classKey}|{signature}")) return;
-
-            totalFound++;
-            var currentCount = membersByClass.Values.Sum(v => v.Count);
-            if (currentCount >= maxResults) return;
-
-            var location = member.Locations.FirstOrDefault(l => l.IsInSource);
-            var lineSpan = location?.GetLineSpan();
-            if (!membersByClass.TryGetValue(classKey, out var entries))
-            {
-                entries = new List<object>();
-                membersByClass[classKey] = entries;
-            }
-            entries.Add(new
-            {
-                name = member.Name,
-                style,
-                kind = member.Kind.ToString(),
-                signature,
-                location = lineSpan is { } span
-                    ? new { filePath = FormatPath(span.Path), line = span.StartLinePosition.Line }
-                    : null as object
-            });
-        }
+                : new[] { "No source-declared extensions apply to this type" });
     }
 
     // The full metadata name of a type's definition: namespace + the nested-type
@@ -147,34 +147,88 @@ public partial class RoslynService
             : nested;
     }
 
-    // A C# 14 extension block applies when the target type IS the receiver
-    // type or converts to it implicitly by identity/reference.
-    private static bool ReceiverAccepts(
-        Compilation compilation, INamedTypeSymbol extensionBlock, INamedTypeSymbol target)
-    {
-        var receiverType = extensionBlock.ExtensionParameter?.Type;
-        if (receiverType == null) return false;
-        if (SymbolEqualityComparer.Default.Equals(
-                receiverType.OriginalDefinition, target.OriginalDefinition)) return true;
+    private static bool ClassicExtensionApplies(IMethodSymbol extension, INamedTypeSymbol target) =>
+        extension.ReduceExtensionMethod(target) != null
+        || (IsGenericDefinition(target) && AppliesToSomeConstruction(extension.Parameters[0].Type, target));
 
-        // A generic receiver the target satisfies through an interface or base type
-        // (an extension on IEnumerable<T> applies to a List<int> target). The
-        // receiver's T is unbound from the target, so match by its definition.
-        if (receiverType is INamedTypeSymbol { IsGenericType: true } genericReceiver)
+    private static bool ExtensionBlockApplies(Compilation compilation, INamedTypeSymbol extensionBlock, INamedTypeSymbol target)
+    {
+        var receiver = extensionBlock.ExtensionParameter!.Type;
+        // The compiler's own applicability check on the classic method an instance member
+        // lowers to: receiver conversion, type inference and constraints. The check runs
+        // on the lowered method as its static class declares it (implicitly), found by the
+        // signature AssociatedExtensionImplementation names: the symbol that property
+        // returns is not the class's member, and ReduceExtensionMethod does not reduce it
+        // for a generic receiver (extension<T>(T value)).
+        var associated = extensionBlock.GetMembers().OfType<IMethodSymbol>()
+            .Select(m => m.AssociatedExtensionImplementation?.ToDisplayString())
+            .OfType<string>()
+            .ToHashSet(StringComparer.Ordinal);
+        var implementations = extensionBlock.ContainingType.GetMembers().OfType<IMethodSymbol>()
+            .Where(m => m.IsImplicitlyDeclared && m.IsExtensionMethod && associated.Contains(m.ToDisplayString()))
+            .ToList();
+        if (implementations.Count > 0)
         {
-            var definition = genericReceiver.OriginalDefinition;
-            for (var baseType = target.BaseType; baseType != null; baseType = baseType.BaseType)
-            {
-                if (SymbolEqualityComparer.Default.Equals(baseType.OriginalDefinition, definition)) return true;
-            }
-            if (target.AllInterfaces.Any(i => SymbolEqualityComparer.Default.Equals(i.OriginalDefinition, definition)))
-                return true;
+            return implementations.Any(i => i.ReduceExtensionMethod(target) != null)
+                   || (IsGenericDefinition(target) && AppliesToSomeConstruction(receiver, target));
         }
 
-        var conversion = compilation.ClassifyConversion(target, receiverType);
-        // Boxing (a value-type target to object/an interface) is implicit but not a
-        // reference conversion, yet the extension still applies.
-        return conversion.IsIdentity ||
-               (conversion.IsImplicit && (conversion.IsReference || conversion.IsBoxing));
+        return receiver switch
+        {
+            ITypeParameterSymbol typeParameter => SatisfiesConstraints(compilation, typeParameter, target),
+            _ => ConvertsImplicitly(compilation, target, receiver)
+                 || ((IsGenericDefinition(target) || MentionsTypeParameters(receiver)) && AppliesToSomeConstruction(receiver, target))
+        };
+    }
+
+    // A generic type definition, such as the List<T> "List`1" names.
+    private static bool IsGenericDefinition(INamedTypeSymbol type) =>
+        type.Arity > 0 && SymbolEqualityComparer.Default.Equals(type, type.OriginalDefinition);
+
+    // Whether a receiver type is a construction of the target's definition, of one of its
+    // base classes, or of an interface it implements — so it accepts some construction of
+    // the target.
+    private static bool AppliesToSomeConstruction(ITypeSymbol receiver, INamedTypeSymbol target)
+    {
+        if (receiver is not INamedTypeSymbol named) return false;
+        var definition = named.OriginalDefinition;
+        for (INamedTypeSymbol? current = target; current != null; current = current.BaseType)
+        {
+            if (SymbolEqualityComparer.Default.Equals(current.OriginalDefinition, definition)) return true;
+        }
+        return target.AllInterfaces.Any(i => SymbolEqualityComparer.Default.Equals(i.OriginalDefinition, definition));
+    }
+
+    private static bool MentionsTypeParameters(ITypeSymbol type) => type switch
+    {
+        ITypeParameterSymbol => true,
+        INamedTypeSymbol named => named.TypeArguments.Any(MentionsTypeParameters),
+        IArrayTypeSymbol array => MentionsTypeParameters(array.ElementType),
+        _ => false
+    };
+
+    // Identity, an implicit reference conversion, or boxing (a value-type target to object
+    // or an interface): the conversions an extension receiver accepts.
+    private static bool ConvertsImplicitly(Compilation compilation, ITypeSymbol source, ITypeSymbol destination)
+    {
+        var conversion = compilation.ClassifyConversion(source, destination);
+        return conversion.IsIdentity || (conversion.IsImplicit && (conversion.IsReference || conversion.IsBoxing));
+    }
+
+    // Whether the target satisfies a type-parameter receiver's constraints: class, struct,
+    // unmanaged and new(), and each constraint type (one generic over the type parameter
+    // itself by its definition).
+    private static bool SatisfiesConstraints(Compilation compilation, ITypeParameterSymbol typeParameter, INamedTypeSymbol target)
+    {
+        if (typeParameter.HasReferenceTypeConstraint && !target.IsReferenceType) return false;
+        if (typeParameter.HasValueTypeConstraint && !target.IsValueType) return false;
+        if (typeParameter.HasUnmanagedTypeConstraint && !target.IsUnmanagedType) return false;
+        if (typeParameter.HasConstructorConstraint && !target.IsValueType
+            && (target.IsAbstract || !target.InstanceConstructors.Any(c => c.Parameters.Length == 0 && c.DeclaredAccessibility == Accessibility.Public)))
+            return false;
+        return typeParameter.ConstraintTypes.All(constraint =>
+            MentionsTypeParameters(constraint)
+                ? AppliesToSomeConstruction(constraint, target)
+                : ConvertsImplicitly(compilation, target, constraint));
     }
 }

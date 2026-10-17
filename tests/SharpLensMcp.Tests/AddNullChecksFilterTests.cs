@@ -170,7 +170,7 @@ public class Service
         var rerunResult = await service.AddNullChecksAsync(filePath, line, column);
         var rerunJson = JObject.FromObject(rerunResult);
         rerunJson["success"]!.Value<bool>().Should().BeTrue(rerunJson.ToString());
-        rerunJson["data"]!["message"]!.Value<string>().Should().Contain("No nullable parameters",
+        rerunJson["data"]!["message"]!.Value<string>().Should().Be("No reference-type parameter needs a null check",
             "a second run after apply must find nothing left to guard");
         (rerunJson["data"]!["skippedAlreadyGuarded"] as JArray)!
             .Select(p => p.Value<string>()).Should().BeEquivalentTo(new[] { "name" });

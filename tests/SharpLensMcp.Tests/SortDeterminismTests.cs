@@ -36,11 +36,12 @@ public class T
     }
 
     [Fact]
-    public async Task FindNamingViolations_Truncation_KeepsTheDisplayNameSortedPrefix()
+    public async Task FindNamingViolations_Truncation_KeepsTheLocationSortedPrefix()
     {
         // Three lowercase type names violate the PascalCase rule; declared in
-        // non-alphabetical order. With maxResults=2 the kept set must be the two
-        // alphabetically-first symbols, not whichever two the walk reached first.
+        // non-alphabetical order. Violations are location results, sorted in the canonical
+        // location order (file, line, column) before the cap, so with maxResults=2 the kept
+        // set is the first two in that order on every run.
         const string code = @"
 namespace Demo;
 public class zebra { }
@@ -57,7 +58,7 @@ public class mango { }
             .ToList();
 
         data["violationCount"]!.Value<int>().Should().Be(3, "all three lowercase types violate the rule");
-        symbols.Should().Equal(new[] { "Demo.apple", "Demo.mango" },
-            "deterministic truncation keeps the two display-name-first symbols, in order");
+        symbols.Should().Equal(new[] { "Demo.zebra", "Demo.apple" },
+            "deterministic truncation keeps the two location-first symbols, in order");
     }
 }

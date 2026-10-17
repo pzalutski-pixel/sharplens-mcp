@@ -28,6 +28,15 @@ public class McpServer
     // catch's in-band INTERNAL_ERROR path without coupling the test to any one tool's
     // failure mode. Null in production (never fires).
     private readonly Exception? _testToolCallFault;
+    // Deterministic seam for the startup auto-load: when non-null, the auto-load awaits it
+    // (with the auto-load's own token) before loading, so a test controls exactly when the
+    // load proceeds — or makes it outlast its budget. Null in production (never awaited).
+    private readonly Func<CancellationToken, Task>? _testAutoLoadGate;
+    // Budget for the DOTNET_SOLUTION_PATH auto-load: the per-call timeout in production,
+    // since a load_solution call gets that same budget.
+    private readonly TimeSpan _autoLoadTimeout;
+    // The running (or finished) startup auto-load; null when DOTNET_SOLUTION_PATH is unset.
+    private Task? _autoLoad;
 
     public McpServer() : this(ReadConfiguredToolCallTimeout())
     {
@@ -37,10 +46,13 @@ public class McpServer
     // cancellation token). Tests must not mutate SHARPLENS_TIMEOUT_SECONDS —
     // environment variables are process-wide and parallel test classes would race.
     internal McpServer(TimeSpan toolCallTimeout, CancellationToken testToolCallCancellation = default,
-        Exception? testToolCallFault = null)
+        Exception? testToolCallFault = null, Func<CancellationToken, Task>? testAutoLoadGate = null,
+        TimeSpan? autoLoadTimeout = null)
     {
+        _testAutoLoadGate = testAutoLoadGate;
+        _autoLoadTimeout = autoLoadTimeout ?? toolCallTimeout;
         _roslynService = new RoslynService();
-        _logLevel = EnvironmentConfig.Get("SHARPLENS_LOG_LEVEL", "ROSLYN_LOG_LEVEL") ?? "Information";
+        _logLevel = ParseLogLevel(EnvironmentConfig.Get("SHARPLENS_LOG_LEVEL", "ROSLYN_LOG_LEVEL"));
         _jsonOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -61,67 +73,61 @@ public class McpServer
         => _roslynService.LoadFromWorkspaceForTesting(workspace);
 
     private static TimeSpan ReadConfiguredToolCallTimeout() =>
-        TimeSpan.FromSeconds(ParseToolCallTimeoutSeconds(
-            EnvironmentConfig.Get("SHARPLENS_TIMEOUT_SECONDS", "ROSLYN_TIMEOUT_SECONDS")));
+        TimeSpan.FromSeconds(EnvironmentConfig.GetToolCallTimeoutSeconds());
 
     // A configured timeout must be a positive integer; anything else (missing,
-    // non-numeric, zero, or negative) falls back to the 30s default. Pure so the
-    // guard is unit-testable without mutating the shared process environment.
+    // non-numeric, zero, or negative) falls back to the 30s default, and a value above
+    // the timer maximum is clamped to it. Pure so the guard is unit-testable without
+    // mutating the shared process environment.
     internal static int ParseToolCallTimeoutSeconds(string? configured) =>
-        int.TryParse(configured, out var parsed) && parsed > 0 ? parsed : 30;
+        EnvironmentConfig.ParseInt("SHARPLENS_TIMEOUT_SECONDS", configured,
+            EnvironmentConfig.DefaultToolCallTimeoutSeconds, minimum: 1,
+            maximum: EnvironmentConfig.MaxToolCallTimeoutSeconds).Value;
 
-    public async Task RunAsync()
+    // The configured log level matched case-insensitively against the known levels; an
+    // unknown or missing value is Information.
+    internal static string ParseLogLevel(string? configured) =>
+        LogLevels.FirstOrDefault(level => string.Equals(level, configured?.Trim(), StringComparison.OrdinalIgnoreCase))
+        ?? "Information";
+
+    // Serves JSON-RPC messages, one per line, from input to output until input ends.
+    // autoLoadPath is DOTNET_SOLUTION_PATH: a solution file, or a directory holding one.
+    // Its load runs beside the request loop, so initialize/ping/tools/list are answered
+    // at once however large the solution; every tools/call waits for it to finish.
+    public async Task RunAsync(TextReader input, TextWriter output, string? autoLoadPath)
     {
         await LogAsync("Information", "SharpLens MCP server starting...");
 
-        // Auto-load solution from environment variable
-        var solutionPath = Environment.GetEnvironmentVariable("DOTNET_SOLUTION_PATH");
-        if (!string.IsNullOrEmpty(solutionPath))
+        using var shutdown = new CancellationTokenSource();
+        if (!string.IsNullOrWhiteSpace(autoLoadPath))
         {
-            try
-            {
-                // If it's a directory, try to find a .sln or .slnx file
-                if (Directory.Exists(solutionPath))
-                {
-                    var slnFiles = Directory.GetFiles(solutionPath, "*.sln")
-                        .Concat(Directory.GetFiles(solutionPath, "*.slnx"))
-                        .ToArray();
-                    if (slnFiles.Length > 0)
-                    {
-                        solutionPath = slnFiles[0];
-                    }
-                }
-
-                if (File.Exists(solutionPath))
-                {
-                    await LogAsync("Information", $"Auto-loading solution: {solutionPath}");
-                    await _roslynService.LoadSolutionAsync(solutionPath);
-                }
-            }
-            catch (Exception ex)
-            {
-                await LogAsync("Warning", $"Failed to auto-load solution: {ex.Message}");
-            }
+            _autoLoad = Task.Run(() => AutoLoadAsync(autoLoadPath, shutdown.Token));
         }
-
-        // Main event loop - read from stdin, write to stdout
-        using var reader = Console.In;
-        using var writer = Console.Out;
 
         while (true)
         {
+            string? line;
             try
             {
-                var line = await reader.ReadLineAsync();
-                if (line == null)
-                {
-                    await LogAsync("Information", "Received EOF on stdin, shutting down");
-                    break;
-                }
+                line = await input.ReadLineAsync();
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+            {
+                // stdin is gone (broken pipe): there is no client left to serve.
+                await LogAsync("Error", $"stdin failed, shutting down: {ex.Message}");
+                break;
+            }
+            if (line == null)
+            {
+                await LogAsync("Information", "Received EOF on stdin, shutting down");
+                break;
+            }
 
-                if (string.IsNullOrWhiteSpace(line))
-                    continue;
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
 
+            try
+            {
                 await LogAsync("Debug", $"Received request: {line}");
 
                 var response = await HandleRequestAsync(line);
@@ -129,8 +135,8 @@ public class McpServer
                 if (response != null)
                 {
                     var responseJson = JsonSerializer.Serialize(response, _jsonOptions);
-                    await writer.WriteLineAsync(responseJson);
-                    await writer.FlushAsync();
+                    await output.WriteLineAsync(responseJson);
+                    await output.FlushAsync();
 
                     await LogAsync("Debug", $"Sent response: {responseJson}");
                 }
@@ -140,101 +146,180 @@ public class McpServer
                 await LogAsync("Error", $"Error in main loop: {ex}");
             }
         }
+
+        // An auto-load still running at shutdown is cancelled and awaited, so its workspace
+        // (and build host processes) are disposed rather than abandoned.
+        if (_autoLoad != null)
+        {
+            shutdown.Cancel();
+            await _autoLoad;
+        }
     }
+
+    // The startup auto-load. Never throws: every outcome is logged, and one that leaves the
+    // requested solution unloaded is recorded for health_check (lastLoadFailure), so it is
+    // visible to the client and not only on stderr. Bounded by the same budget a
+    // load_solution call gets.
+    private async Task AutoLoadAsync(string configuredPath, CancellationToken shutdownToken)
+    {
+        var resolution = SolutionPathResolver.Resolve(configuredPath);
+        if (resolution.Path is not { } solutionPath)
+        {
+            _roslynService.RecordLoadFailure(new LoadFailure(configuredPath, ErrorCodes.InvalidParameter,
+                resolution.Error!, DateTime.UtcNow));
+            await LogAsync("Warning", $"Auto-load skipped: {resolution.Error}");
+            return;
+        }
+
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken);
+        budget.CancelAfter(_autoLoadTimeout);
+        try
+        {
+            if (_testAutoLoadGate != null) await _testAutoLoadGate(budget.Token);
+            await LogAsync("Information", $"Auto-loading solution: {solutionPath}");
+            var result = JsonSerializer.SerializeToNode(
+                await _roslynService.LoadSolutionAsync(solutionPath, budget.Token), _jsonOptions);
+
+            if (result?["success"]?.GetValue<bool>() != true)
+            {
+                await LogAsync("Warning", $"Auto-load of {solutionPath} failed: {result?["error"]?["message"]}");
+            }
+            else if (result["data"]?["partial"]?.GetValue<bool>() == true)
+            {
+                await LogAsync("Warning",
+                    $"Auto-loaded {solutionPath} is PARTIAL: {result["data"]?["loadFailures"]?.ToJsonString()}");
+            }
+            else
+            {
+                await LogAsync("Information", $"Auto-loaded {solutionPath}: {result["data"]?["projectCount"]} projects");
+            }
+        }
+        catch (OperationCanceledException) when (budget.IsCancellationRequested)
+        {
+            var message = shutdownToken.IsCancellationRequested
+                ? $"The startup auto-load of {solutionPath} (DOTNET_SOLUTION_PATH) was cancelled at shutdown."
+                : $"The startup auto-load of {solutionPath} (DOTNET_SOLUTION_PATH) exceeded its " +
+                  $"{_autoLoadTimeout.TotalSeconds.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}-second budget. " +
+                  "Raise SHARPLENS_TIMEOUT_SECONDS, or call load_solution.";
+            _roslynService.RecordLoadFailure(new LoadFailure(solutionPath, ErrorCodes.Timeout, message, DateTime.UtcNow));
+            await LogAsync("Warning", message);
+        }
+        catch (Exception ex)
+        {
+            var message = $"The startup auto-load of {solutionPath} (DOTNET_SOLUTION_PATH) failed: {ex.Message}";
+            _roslynService.RecordLoadFailure(new LoadFailure(solutionPath, ErrorCodes.InternalError, message, DateTime.UtcNow));
+            await LogAsync("Error", $"{message}\n{ex}");
+        }
+    }
+
+    // The request methods this server answers. Anything else is -32601 Method not found.
+    private static readonly HashSet<string> ServedMethods =
+        new(StringComparer.Ordinal) { "initialize", "ping", "tools/list", "tools/call" };
 
     internal async Task<object?> HandleRequestAsync(string requestJson)
     {
-        // Three-state machine for the outer catch's spec compliance:
-        //   parsed=false           — exception before we knew if it was a notification → §5.1 parse-error response
-        //   parsed=true, hasId=true  — a Request → §5.1 error response with the id
-        //   parsed=true, hasId=false — a Notification → §4.3 no response at all
-        var parsed = false;
-        var hasId = false;
-        RequestId? id = null;
-
-        JsonObject? request;
+        JsonNode? root;
         try
         {
-            request = JsonSerializer.Deserialize<JsonObject>(requestJson);
+            root = JsonNode.Parse(requestJson);
         }
         catch (JsonException ex)
         {
-            // Per JSON-RPC 2.0 §5.1, malformed JSON must surface as -32700 Parse error,
-            // not -32603 Internal error. Caught here before the main try-block so we
-            // don't bury the spec-correct code under a generic exception handler.
+            // JSON-RPC 2.0 §5.1: text that is not JSON is -32700 Parse error, answered with
+            // id null because no id can be read from it.
             await LogAsync("Error", $"Parse error: {ex.Message}");
             return CreateErrorResponse((RequestId?)null, -32700, $"Parse error: {ex.Message}");
         }
-        if (request == null)
+
+        // Valid JSON that is not a single Request object (a scalar, null, or an array) is an
+        // Invalid Request, not a parse error. An array is a JSON-RPC batch, which MCP
+        // 2025-06-18 removed; it is rejected as one Invalid Request.
+        if (root is not JsonObject request)
         {
-            return CreateErrorResponse((RequestId?)null, -32700, "Parse error");
+            return CreateErrorResponse((RequestId?)null, -32600, "Invalid Request: expected a JSON-RPC request object");
         }
 
-        try
+        // JSON-RPC 2.0 §4.1: a request is a Notification if and only if the `id` member is
+        // ABSENT. A present id is read even when it is JSON null: MCP forbids a null id, so
+        // that request is invalid and is answered (with id null) rather than ignored.
+        var isNotification = !request.ContainsKey("id");
+        RequestId? id = null;
+        if (!isNotification)
         {
-
-            // Per JSON-RPC 2.0 §4.3: a request is a Notification if and only if the
-            // `id` member is absent. Notifications produce NO response (including no
-            // error response). The previous heuristic of `method.StartsWith("notifications/")`
-            // was incorrect and produced `{"id":null,...}` for valid notifications like
-            // `{"jsonrpc":"2.0","method":"initialize"}`, which Zod-validated clients reject.
-            hasId = request.ContainsKey("id") && request["id"] != null;
+            var idNode = request["id"];
+            if (idNode is null)
+            {
+                return CreateErrorResponse((RequestId?)null, -32600, "Invalid Request: id must not be null");
+            }
             try
             {
-                id = hasId
-                    ? JsonSerializer.Deserialize<RequestId>(request["id"]!, _jsonOptions)
-                    : null;
+                id = idNode.Deserialize<RequestId>(_jsonOptions);
             }
             catch (JsonException)
             {
-                // Per JSON-RPC 2.0 §4.2 the id MUST be a string, number, or null. A
-                // structurally-invalid id (object/array) is an Invalid Request (-32600),
-                // not an internal error; we cannot echo the bad id, so respond id:null.
-                return CreateErrorResponse((RequestId?)null, -32600,
-                    "Invalid Request: id must be a string, number, or null");
+                // §4: the id is a string or a number. A bool/object/array id cannot be
+                // echoed, so the Invalid Request is answered with id null.
+                return CreateErrorResponse((RequestId?)null, -32600, "Invalid Request: id must be a string or number");
             }
-            parsed = true;
-            // A non-string method (number/object/array) is as invalid as a missing one;
-            // read it safely so it routes to the -32600/notification handling below
-            // instead of throwing GetValue<string>() into the generic catch (-32603).
-            string? method = null;
-            if (request["method"] is JsonValue methodValue) methodValue.TryGetValue<string>(out method);
-            var paramsNode = request["params"];
+        }
 
-            if (string.IsNullOrEmpty(method))
-            {
-                if (!hasId) return null;
-                return CreateErrorResponse(id, -32600, "Invalid Request: missing or non-string method");
-            }
+        // §4: jsonrpc MUST be exactly "2.0".
+        var isVersion2 = request["jsonrpc"] is JsonValue versionValue
+            && versionValue.TryGetValue<string>(out var version) && version == "2.0";
+        if (!isVersion2)
+        {
+            return isNotification
+                ? null
+                : CreateErrorResponse(id, -32600, "Invalid Request: jsonrpc must be exactly \"2.0\"");
+        }
 
-            // Per JSON-RPC 2.0 §4.3 a request without `id` is a Notification, which
-            // gets no response. The methods we serve (initialize/tools/list/tools/call)
-            // all REQUIRE a response, so receiving one as a notification is a client
-            // error — do not dispatch it. Dispatching would run a possibly mutating tool
-            // whose result the spec forbids us from returning. Genuine notifications
-            // (notifications/*) are not handled and simply no-op here.
-            if (!hasId)
-            {
-                await LogAsync("Debug", $"Ignoring notification '{method}': request methods require an id and are not dispatched");
-                return null;
-            }
+        // A non-string method (number/object/array) is as invalid as a missing one.
+        string? method = null;
+        if (request["method"] is JsonValue methodValue) methodValue.TryGetValue<string>(out method);
 
+        // §4.1: a Notification gets no response, not even an error. The methods served
+        // here (initialize/ping/tools/list/tools/call) all REQUIRE a response, so one sent
+        // as a notification is a client error and is not dispatched — dispatching would run
+        // a possibly mutating tool whose result the spec forbids returning. Genuine
+        // notifications (notifications/*) have no handler and are ignored.
+        if (isNotification)
+        {
+            await LogAsync("Debug", $"Ignoring notification '{method}': request methods require an id and are not dispatched");
+            return null;
+        }
+
+        if (string.IsNullOrEmpty(method))
+        {
+            return CreateErrorResponse(id, -32600, "Invalid Request: missing or non-string method");
+        }
+
+        if (!ServedMethods.Contains(method))
+        {
+            return CreateErrorResponse(id, -32601, $"Method not found: {method}");
+        }
+
+        // MCP params are always an object. A JSON null is treated as absent; any other
+        // non-object value is invalid params.
+        var paramsNode = request["params"];
+        if (paramsNode is not null and not JsonObject)
+        {
+            return CreateErrorResponse(id, -32602, $"Invalid params: params for '{method}' must be an object");
+        }
+        var requestParams = paramsNode as JsonObject;
+
+        try
+        {
             return method switch
             {
-                "initialize" => await HandleInitializeAsync(id, paramsNode?.AsObject()),
+                "initialize" => await HandleInitializeAsync(id, requestParams),
+                "ping" => CreateSuccessResponse(id, new { }),
                 "tools/list" => await HandleListToolsAsync(id),
-                "tools/call" => await HandleToolCallAsync(id, paramsNode?.AsObject()),
-                _ => CreateErrorResponse(id, -32601, $"Method not found: {method}")
+                _ => await HandleToolCallAsync(id, requestParams),
             };
         }
         catch (Exception ex)
         {
             await LogAsync("Error", $"Error handling request: {ex}");
-            if (parsed && !hasId)
-            {
-                // Notification path: spec §4.3 forbids any response, even on exception.
-                return null;
-            }
             return CreateErrorResponse(id, -32603, $"Internal error: {ex.Message}");
         }
     }
@@ -304,6 +389,14 @@ public class McpServer
             }
 
             var p = new JsonRpcParameters(arguments, name);
+
+            // Every tool sees the solution the startup auto-load produces, so a call that
+            // arrives while it is still running waits for it, within this call's budget.
+            if (_autoLoad is { IsCompleted: false } autoLoad)
+            {
+                await LogAsync("Debug", $"Tool call '{name}' waits for the startup auto-load to finish");
+                await autoLoad.WaitAsync(timeoutCts.Token);
+            }
 
             // Check cancellation before the synchronous prelude / dispatch, so an
             // already-cancelled budget surfaces as TIMEOUT deterministically rather than
@@ -378,7 +471,7 @@ public class McpServer
             await LogAsync("Error", $"Tool call '{name}' timed out after {_toolCallTimeout.TotalSeconds:0}s");
             return CreateToolErrorResult(id, ErrorCodes.Timeout,
                 $"Tool call '{name}' exceeded the {_toolCallTimeout.TotalSeconds:0}-second timeout",
-                hint: "Raise SHARPLENS_TIMEOUT_SECONDS, or narrow the request (single file or project, smaller maxResults).");
+                hint: TimeoutHint(name));
         }
         catch (FileNotFoundException ex)
         {
@@ -399,6 +492,20 @@ public class McpServer
                 $"Unhandled error executing tool: {ex.Message}",
                 hint: "This is a server-side failure. Retry once; if it persists, adjust the arguments or report the message.");
         }
+    }
+
+    // A load cannot be narrowed — it builds every project — so its timeout advice is only
+    // the budget; every other tool can also be asked for less. A call that timed out while
+    // waiting for the startup auto-load is told so.
+    private string TimeoutHint(string? toolName)
+    {
+        if (_autoLoad is { IsCompleted: false })
+        {
+            return "The startup auto-load of DOTNET_SOLUTION_PATH is still running and this call waited for it; retry once it finishes (health_check reports the outcome), or raise SHARPLENS_TIMEOUT_SECONDS.";
+        }
+        return toolName is "load_solution" or "roslyn:load_solution"
+            ? "Raise SHARPLENS_TIMEOUT_SECONDS: loading runs a design-time build of every project, so a large solution needs a larger budget. The previously loaded solution, if any, is unchanged."
+            : "Raise SHARPLENS_TIMEOUT_SECONDS, or narrow the request (single file or project, smaller maxResults).";
     }
 
     // Wraps a structured tool-error envelope as an in-band CallToolResult with
@@ -460,7 +567,8 @@ public class McpServer
     {
         if (ShouldLog(level))
         {
-            await Console.Error.WriteLineAsync($"[{DateTime.Now:HH:mm:ss}] [{level}] {message}");
+            await Console.Error.WriteLineAsync(
+                $"[{DateTime.Now.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture)}] [{level}] {message}");
         }
     }
 

@@ -329,6 +329,11 @@ public class McpServerTests
             "an unloaded solution must surface as Not Ready, not as an error");
         text.Should().Contain("load_solution",
             "the message must point the caller at load_solution");
+        // Server configuration does not depend on a loaded solution, so it is reported
+        // before the first load too (the test process sets none of the variables).
+        var inner = JsonSerializer.Deserialize<JsonObject>(text)!;
+        inner["data"]!["configuration"]!.ToJsonString().Should().Be(
+            """{"maxDiagnostics":100,"timeoutSeconds":30,"semanticCacheEnabled":true,"absolutePaths":false}""");
     }
 
     [Fact]
@@ -454,8 +459,8 @@ namespace Demo
         var server = new McpServer();
         server.LoadFromWorkspaceForTesting(workspace);
 
-        // Renaming a body-used parameter leaves the body referencing the old name (CS0103).
-        var request = """{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"change_signature","arguments":{"typeName":"C","memberName":"Add","preview":false,"changes":[{"action":"rename","name":"amount","newName":"value"}]}}}""";
+        // Removing a body-used parameter leaves the body referencing it (CS0103).
+        var request = """{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"change_signature","arguments":{"typeName":"C","memberName":"Add","preview":false,"changes":[{"action":"remove","name":"amount"}]}}}""";
         var response = ParseResponse(await server.HandleRequestAsync(request));
 
         var result = response["result"]!.AsObject();
@@ -469,8 +474,8 @@ namespace Demo
         inner["data"]!["applied"]!.GetValue<bool>().Should().BeTrue("the edit was applied");
         inner["data"]!["postApplyErrors"]!.AsArray()
             .Select(e => e!.GetValue<string>())
-            .Should().Contain(s => s.Contains("CS0103"),
-                "the rewritten body still references the old parameter name 'amount'");
+            .Should().ContainSingle(s => s.EndsWith(" (line 5) CS0103: The name 'amount' does not exist in the current context"),
+                "the body still references the removed parameter 'amount'");
     }
 
     [Fact]
@@ -594,16 +599,100 @@ namespace Demo
             .Should().BeTrue("the invalid id cannot be echoed, so it is null");
     }
 
-    [Fact]
-    public async Task HandleRequest_RequestThatTriggersInternalException_ReturnsErrorWithId()
+    [Theory]
+    [InlineData("""{"jsonrpc":"2.0","id":42,"method":"tools/call","params":"not-an-object"}""", "tools/call")]
+    [InlineData("""{"jsonrpc":"2.0","id":42,"method":"tools/call","params":[1,2]}""", "tools/call")]
+    [InlineData("""{"jsonrpc":"2.0","id":42,"method":"initialize","params":"x"}""", "initialize")]
+    [InlineData("""{"jsonrpc":"2.0","id":42,"method":"tools/list","params":7}""", "tools/list")]
+    public async Task HandleRequest_NonObjectParams_ReturnsInvalidParamsWithId(string request, string method)
     {
-        // Same shape but WITH an id — must produce a structured -32603 error.
-        var request = """{"jsonrpc":"2.0","id":42,"method":"tools/call","params":"not-an-object"}""";
+        // MCP params are always an object. A string/array/number params value is a caller
+        // mistake in the params (-32602), not a server failure (-32603).
         var response = ParseResponse(await _server.HandleRequestAsync(request));
 
         response["id"]!.GetValue<long>().Should().Be(42);
         var error = response["error"]!.AsObject();
-        error["code"]!.GetValue<int>().Should().Be(-32603);
+        error["code"]!.GetValue<int>().Should().Be(-32602);
+        error["message"]!.GetValue<string>().Should().Be($"Invalid params: params for '{method}' must be an object");
+    }
+
+    [Fact]
+    public async Task HandleRequest_Ping_ReturnsEmptyResult()
+    {
+        // MCP basic/utilities/ping: the receiver MUST respond promptly with an empty result.
+        var response = await _server.HandleRequestAsync("""{"jsonrpc":"2.0","id":"p-1","method":"ping"}""");
+
+        JsonSerializer.Serialize(response, _jsonOptions).Should().Be("""{"jsonrpc":"2.0","id":"p-1","result":{}}""");
+    }
+
+    [Fact]
+    public async Task HandleRequest_PingAsNotification_ReturnsNull()
+    {
+        var response = await _server.HandleRequestAsync("""{"jsonrpc":"2.0","method":"ping"}""");
+
+        response.Should().BeNull("an id-less ping is a notification and gets no response");
+    }
+
+    [Fact]
+    public async Task HandleRequest_NullId_ReturnsInvalidRequestWithNullId()
+    {
+        // A present id:null is not a notification (only an ABSENT id is); MCP forbids a
+        // null id, so the request is invalid and must still be answered, with id null.
+        var response = await _server.HandleRequestAsync("""{"jsonrpc":"2.0","id":null,"method":"tools/list"}""");
+
+        JsonSerializer.Serialize(response, _jsonOptions).Should().Be(
+            """{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request: id must not be null"}}""");
+    }
+
+    [Theory]
+    [InlineData("""[{"jsonrpc":"2.0","id":3,"method":"ping"}]""")]
+    [InlineData("42")]
+    [InlineData("\"hello\"")]
+    [InlineData("null")]
+    [InlineData("[]")]
+    public async Task HandleRequest_ValidJsonThatIsNotAnObject_ReturnsInvalidRequest(string request)
+    {
+        // JSON-RPC 2.0 §5.1: -32700 is reserved for text that is not JSON. Valid JSON that
+        // is not a Request object is an Invalid Request (-32600), answered with id null.
+        var response = await _server.HandleRequestAsync(request);
+
+        JsonSerializer.Serialize(response, _jsonOptions).Should().Be(
+            """{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request: expected a JSON-RPC request object"}}""");
+    }
+
+    [Theory]
+    [InlineData("1e3")]
+    [InlineData("1.5")]
+    [InlineData("12345678901234567890")]
+    public async Task HandleRequest_NonInt64NumericId_IsAcceptedAndEchoedExactly(string idText)
+    {
+        var response = await _server.HandleRequestAsync(
+            $$"""{"jsonrpc":"2.0","id":{{idText}},"method":"ping"}""");
+
+        JsonSerializer.Serialize(response, _jsonOptions).Should().Be(
+            $$$"""{"jsonrpc":"2.0","id":{{{idText}}},"result":{}}""");
+    }
+
+    [Theory]
+    [InlineData("""{"jsonrpc":"1.0","id":5,"method":"ping"}""", 5)]
+    [InlineData("""{"id":6,"method":"ping"}""", 6)]
+    [InlineData("""{"jsonrpc":2,"id":7,"method":"ping"}""", 7)]
+    public async Task HandleRequest_JsonRpcVersionNotExactly2_0_ReturnsInvalidRequest(string request, long id)
+    {
+        var response = ParseResponse(await _server.HandleRequestAsync(request));
+
+        response["id"]!.GetValue<long>().Should().Be(id);
+        response["error"]!["code"]!.GetValue<int>().Should().Be(-32600);
+        response["error"]!["message"]!.GetValue<string>().Should().Be(
+            "Invalid Request: jsonrpc must be exactly \"2.0\"");
+    }
+
+    [Fact]
+    public async Task HandleRequest_NotificationWithWrongJsonRpcVersion_ReturnsNull()
+    {
+        var response = await _server.HandleRequestAsync("""{"jsonrpc":"1.0","method":"notifications/initialized"}""");
+
+        response.Should().BeNull("a notification is never answered, even when invalid");
     }
 
     [Fact]

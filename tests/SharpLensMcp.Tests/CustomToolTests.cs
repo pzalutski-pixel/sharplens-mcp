@@ -206,13 +206,13 @@ public class CustomToolTests : RoslynServiceTestBase
 
         AssertSuccess(result);
         var data = GetData(result);
-        // GetHealthCheckAsync has no nullable reference params. The impl returns a
-        // success with `message = "No nullable parameters found..."` and the method
-        // name, but no `parametersWithNullChecks` array.
+        // GetHealthCheckAsync has no reference-type params. The impl returns a
+        // success with the nothing-to-guard message and the method name, but no
+        // `parametersWithNullChecks` array.
         data["methodName"].Should().NotBeNull();
         data["methodName"]!.Value<string>().Should().Be("GetHealthCheckAsync");
         data["message"].Should().NotBeNull();
-        data["message"]!.Value<string>().Should().Contain("No nullable parameters",
+        data["message"]!.Value<string>().Should().Be("No reference-type parameter needs a null check",
             "a parameter-less method must trigger the 'nothing to guard' branch");
         data["parametersWithNullChecks"].Should().BeNull(
             "the no-guards branch must not emit a parametersWithNullChecks array");
@@ -573,7 +573,7 @@ public class CustomToolTests : RoslynServiceTestBase
         // we need an actually-expression-bodied method. RefactoringTarget.Compute uses
         // expression body `=> a * 2 + 7;`. The impl returns AnalysisFailed
         // for expression-bodied methods because there's no Block to insert null-checks into.
-        var searchResult = await Service.SearchSymbolsAsync("Compute", kind: "Method", maxResults: 10);
+        var searchResult = await Service.SearchSymbolsAsync("Compute", kind: "Method", maxResults: 500);
         var symbols = GetData(searchResult)["results"] as JArray;
         var compute = symbols!.First(s =>
             s["containingType"]?.Value<string>()?.Contains("RefactoringTarget") == true);
@@ -586,7 +586,7 @@ public class CustomToolTests : RoslynServiceTestBase
             preview: true);
 
         // Compute(int a) has no reference-type params, so the impl takes the
-        // "No nullable parameters found" success branch first — never reaches
+        // nothing-to-guard success branch first — never reaches
         // the body check. The expression-bodied AnalysisFailed branch is therefore
         // only reachable for methods that DO have nullable ref params AND no block body.
         // GreetingFor uses block body so won't trigger it. This is a real impl-level
@@ -595,7 +595,7 @@ public class CustomToolTests : RoslynServiceTestBase
         AssertSuccess(result);
         var data = GetData(result);
         data["message"].Should().NotBeNull();
-        data["message"]!.Value<string>().Should().Contain("No nullable parameters",
+        data["message"]!.Value<string>().Should().Be("No reference-type parameter needs a null check",
             "Compute takes only int; the no-guard branch must fire before the body check");
     }
 

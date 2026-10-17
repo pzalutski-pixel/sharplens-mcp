@@ -5,9 +5,9 @@ using Xunit;
 namespace SharpLensMcp.Tests;
 
 // A property referenced only inside nameof(...) is a compile-time reference, not a
-// runtime read. get_outgoing_calls must not list it as an outgoing call, and
-// get_exception_flow must not pull in its accessor's exceptions. Both walkers share
-// IsInNameofOrAttributeArgument, but each is exercised here.
+// runtime read. get_outgoing_calls must not list its getter as an outgoing call, and
+// get_exception_flow must not pull in the getter's exceptions. Both read the call edges
+// of CallEdgeCollector, which skips nameof; each tool is exercised here.
 public class NameofPropertyGuardTests
 {
     private const string Code = @"
@@ -45,10 +45,10 @@ public class Thrower
     {
         var service = Loaded();
 
-        (await OutgoingShortNamesOf(service, "Names")).Should().NotContain("Thrower.Danger",
-            "Danger appears only inside nameof in Names(), so it is not an outgoing reference");
-        (await OutgoingShortNamesOf(service, "Reads")).Should().Contain("Thrower.Danger",
-            "Reads() actually reads Danger, so it is an outgoing reference (control)");
+        (await OutgoingShortNamesOf(service, "Names")).Should().BeEmpty(
+            "Danger appears only inside nameof in Names(), so nothing runs");
+        (await OutgoingShortNamesOf(service, "Reads")).Should().Equal(new[] { "Thrower.Danger.get", "String.Length.get" },
+            "Reads() actually reads Danger, so its getter is an outgoing call (control); nameof(Danger).Length reads string.Length");
     }
 
     private static async Task<List<string>> EscapingOf(RoslynService service, string member)

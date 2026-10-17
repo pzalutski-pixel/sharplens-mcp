@@ -115,7 +115,7 @@ public class AuditToolsViaMcpTests : McpTestBase
 
         var scanned = (data["testProjectsScanned"] as JArray)!;
         scanned.Select(s => s.Value<string>()).Should().Contain("SharpLensMcp.Tests",
-            "every project where IsTestMethod found a hit must appear in testProjectsScanned");
+            "every project where an entry point was found must appear in testProjectsScanned");
 
         var uncovered = (data["uncoveredSymbols"] as JArray)!;
         var names = uncovered.Select(s => s["fullName"]!.Value<string>()!).ToList();

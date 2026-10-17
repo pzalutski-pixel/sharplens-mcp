@@ -180,7 +180,7 @@ public class FixAllTests
         var json = JObject.FromObject(result);
         json["success"]!.Value<bool>().Should().BeFalse();
         json["error"]!["Code"]!.Value<string>().Should().Be(ErrorCodes.InvalidParameter,
-            "an unknown project name is an invalid argument, routed through ProjectNotFoundError");
+            "an unknown project name is an invalid argument, the canonical project-resolution error");
         json["error"]!["Hint"]!.Value<string>().Should().Contain("TestProject",
             "the error must list the available project names");
     }

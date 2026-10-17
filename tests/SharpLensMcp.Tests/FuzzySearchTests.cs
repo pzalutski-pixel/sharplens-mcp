@@ -60,6 +60,6 @@ public class FuzzySearchTests : RoslynServiceTestBase
 
         AssertError(result, ErrorCodes.InvalidParameter);
         var json = JObject.FromObject(result);
-        json["error"]!["Message"]!.Value<string>().Should().Contain("'glob' or 'fuzzy'");
+        json["error"]!["Message"]!.Value<string>().Should().Be("matchMode must be one of: glob, fuzzy (got 'regex')");
     }
 }

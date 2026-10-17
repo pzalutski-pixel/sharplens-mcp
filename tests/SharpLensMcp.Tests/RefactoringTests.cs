@@ -84,7 +84,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         var symbol = symbols![0];
         var loc = symbol["location"]!;
-        // The impl rejects whitespace/empty newName before the identifier check.
+        // An empty newName is not a valid identifier.
         var result = await Service.RenameSymbolAsync(
             loc["filePath"]!.Value<string>()!,
             loc["line"]!.Value<int>(),
@@ -94,7 +94,7 @@ public class RefactoringTests : RoslynServiceTestBase
 
         AssertError(result, ErrorCodes.InvalidParameter);
         var json = JObject.FromObject(result);
-        json["error"]!["Message"]!.Value<string>().Should().Contain("empty");
+        json["error"]!["Message"]!.Value<string>().Should().Be("'' is not a valid C# identifier");
     }
 
     [Fact]
@@ -238,7 +238,9 @@ public class RefactoringTests : RoslynServiceTestBase
     public async Task RenameSymbol_VerbosityFull_EmitsTextSnippets()
     {
         // Full verbosity adds oldText/newText to each
-        // inner change entry. Locks the differentiator from compact.
+        // inner change entry. Locks the differentiator from compact. Each change is the
+        // minimal edit: "_workspace" -> "_renamed" keeps the shared "_" prefix, so the
+        // edited span is "workspace" replaced by "renamed".
         var searchResult = await Service.SearchSymbolsAsync("_workspace", kind: "Field", maxResults: 10);
         var symbols = GetData(searchResult)["results"] as JArray;
         var symbol = symbols![0];
@@ -259,8 +261,8 @@ public class RefactoringTests : RoslynServiceTestBase
         var innerChanges = (firstFile["changes"] as JArray)!;
         innerChanges.Should().NotBeEmpty();
         var firstChange = innerChanges[0]!;
-        firstChange["oldText"]!.Value<string>().Should().Contain("_workspace");
-        firstChange["newText"]!.Value<string>().Should().Contain("_renamed");
+        firstChange["oldText"]!.Value<string>().Should().Be("workspace");
+        firstChange["newText"]!.Value<string>().Should().Be("renamed");
     }
 
     [Fact]
@@ -638,10 +640,10 @@ public class RefactoringTests : RoslynServiceTestBase
 
         var calls = (GetData(result)["calls"] as JArray)!;
         var magnitude = calls.FirstOrDefault(c =>
-            c["shortName"]?.Value<string>() == "OutgoingCallsTarget.Magnitude");
+            c["shortName"]!.Value<string>() == "OutgoingCallsTarget.Magnitude.get");
         magnitude.Should().NotBeNull(
-            "the bare unqualified `Magnitude` read must surface even with no member-access node");
-        magnitude!["isProperty"]!.Value<bool>().Should().BeTrue();
+            "the bare unqualified `Magnitude` read must surface its getter even with no member-access node");
+        magnitude!["kind"]!.Value<string>().Should().Be("propertyGet");
     }
 
     [Fact]

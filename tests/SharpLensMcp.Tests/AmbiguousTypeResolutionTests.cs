@@ -9,8 +9,9 @@ namespace SharpLensMcp.Tests;
 
 // Locks name-based type resolution against silent first-match selection: a
 // name matching several distinct types must return AMBIGUOUS_TYPE with the
-// fully-qualified candidates instead of picking one arbitrarily — name-based
-// tools feed refactorings, and the wrong pick mutates the wrong type.
+// fully-qualified candidates instead of picking one arbitrarily, and a partial
+// name never resolves — name-based tools feed refactorings, and the wrong pick
+// mutates the wrong type.
 // Exercised through get_type_members, which resolves via FindTypeByNameAsync.
 public class AmbiguousTypeResolutionTests
 {
@@ -66,18 +67,20 @@ namespace Legacy
     }
 
     [Fact]
-    public async Task PartialNameMatchingTwoTypes_ReturnsAmbiguousTypeWithCandidates()
+    public async Task PartialNameMatchingTwoTypes_ReturnsTypeNotFoundWithSuggestions()
     {
+        // A partial name never resolves — not even to one of several partial matches;
+        // the matches come back as suggestions to repeat the call with.
         var service = CreateService(DistinctNamesCode);
         var result = await service.GetTypeMembersAsync("Widg");
         var json = JObject.FromObject(result);
         json["success"]!.Value<bool>().Should().BeFalse(
-            "a partial name matching two types must not silently pick one");
-        json["error"]!["Code"]!.Value<string>().Should().Be(ErrorCodes.AmbiguousType);
-        var candidates = (json["error"]!["Context"]!["candidates"] as JArray)!
+            "a partial name must not resolve to any type");
+        json["error"]!["Code"]!.Value<string>().Should().Be(ErrorCodes.TypeNotFound);
+        var suggestions = (json["error"]!["Context"]!["suggestions"] as JArray)!
             .Select(c => c.Value<string>())
             .ToList();
-        candidates.Should().BeEquivalentTo(new[] { "Legacy.WidgetFactory", "Production.Widget" });
+        suggestions.Should().Equal("Legacy.WidgetFactory", "Production.Widget");
     }
 
     [Fact]

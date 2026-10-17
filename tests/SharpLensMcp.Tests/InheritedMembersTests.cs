@@ -6,8 +6,9 @@ namespace SharpLensMcp.Tests;
 
 // Inherited-member walks across get_type_members, get_method_signature, and
 // get_external_type_info: an override and the base it replaces collapse into one
-// entry (no inflated overload count), and interface members — including
-// default-interface-members — are part of the inherited surface.
+// entry (no inflated overload count), and a class does not inherit an interface's
+// members — a default interface member is callable only through the interface
+// (`new DerivedHost().Farewell()` is CS1061), so it is not part of the class's surface.
 public class InheritedMembersTests
 {
     private const string Probe = """
@@ -50,7 +51,7 @@ public class InheritedMembersTests
     }
 
     [Fact]
-    public async Task GetTypeMembers_IncludeInherited_IncludesInterfaceDefaultMembersAndDedupesOverride()
+    public async Task GetTypeMembers_IncludeInherited_DedupesOverride_AndExcludesInterfaceDefaultMembers()
     {
         var result = await LoadProbe().GetTypeMembersAsync("DerivedHost", includeInherited: true, maxResults: 200);
 
@@ -58,14 +59,12 @@ public class InheritedMembersTests
             .Select(m => m["name"]!.Value<string>()!)
             .ToList();
 
-        members.Should().Contain("Farewell",
-            "a default-interface-member is part of the inherited surface");
-        members.Count(n => n == "Compute").Should().Be(1,
-            "the override and the base method it replaces collapse into one member");
+        members.Should().Equal(new[] { "Compute", "Greet" },
+            "the override replaces the base method it overrides, and the default interface member Farewell is reachable only through IGreeter");
     }
 
     [Fact]
-    public async Task GetExternalTypeInfo_IncludeInherited_DedupesOverrideAndIncludesInterfaceMembers()
+    public async Task GetExternalTypeInfo_IncludeInherited_DedupesOverride_AndExcludesInterfaceDefaultMembers()
     {
         var result = await LoadProbe().GetExternalTypeInfoAsync(
             "Probe.DerivedHost", includeInherited: true, includeXmlDocs: false, maxMembers: 200);
@@ -74,9 +73,7 @@ public class InheritedMembersTests
             .Select(m => m["name"]!.Value<string>()!)
             .ToList();
 
-        members.Count(n => n == "Compute").Should().Be(1,
-            "the override and the base method collapse into one member");
-        members.Should().Contain("Farewell",
-            "default-interface-members are part of the inherited surface");
+        members.Should().Equal(new[] { "Compute", "Greet" },
+            "the override and the base method collapse into one member, and the default interface member is not the class's surface");
     }
 }

@@ -1,18 +1,25 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Text;
 
 namespace SharpLensMcp;
 
 // diff_api_surface: public-API breaking-change report against a git ref.
-// The baseline surface is rebuilt by parsing the project's .cs files as they
-// existed at the ref (git ls-tree / git show — pure reads) into an in-memory
-// compilation that borrows the CURRENT compilation's references (declarations
-// are all that matter). Both surfaces snapshot to signature strings keyed by
-// DocumentationCommentId, so "removed", "changed signature", and "added" fall
-// out of a dictionary diff. Compares declaration signatures only — base-list
-// and attribute changes are not reported.
+// The baseline surface is rebuilt from the files the project compiled at the ref: the
+// project file as it read at the ref, evaluated by MSBuild, decides which .cs files of
+// the ref's tree are Compile items (SDK globs, Compile Remove, linked Compile Include —
+// pure git reads: ls-tree / cat-file). They compile into an in-memory compilation that
+// borrows the CURRENT compilation's references and options (declarations are all that
+// matter), plus the current build-generated sources that are no Compile item (implicit
+// global usings, assembly info), and the project's source generators run on it as they
+// run on the current compilation — so generated API is compared like authored API. Both
+// surfaces snapshot to signature strings keyed by DocumentationCommentId, so "removed",
+// "changed signature", and "added" fall out of a dictionary diff. A multi-targeted project
+// is compared per target framework and each change reported once with the frameworks it
+// occurs in. Compares declaration signatures only — base-list and attribute changes are
+// not reported.
 public partial class RoslynService
 {
     internal sealed record ApiSurfaceEntry(
@@ -35,19 +42,11 @@ public partial class RoslynService
                 context: new { baselineRef });
         }
 
-        // An unknown project NAME is an invalid argument: route it through the shared
-        // ProjectNotFoundError (InvalidParameter), consistent with the rest of the tools.
-        if (projectName != null && !_solution!.Projects.Any(
-                p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase)))
-        {
-            return ProjectNotFoundError(projectName);
-        }
+        var (scope, scopeError) = ResolveProjectScope(projectName);
+        if (scope == null) return scopeError!;
 
-        var projects = (projectName == null
-                ? _solution!.Projects
-                : _solution!.Projects.Where(p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase)))
-            .Where(p => p.FilePath != null)
-            .ToList();
+        var model = GetLogicalProjects();
+        var projects = scope.Where(p => p.FilePath != null).ToList();
         if (projects.Count == 0)
         {
             return CreateErrorResponse(
@@ -55,7 +54,7 @@ public partial class RoslynService
                 projectName == null
                     ? "The solution has no projects with a file path to compare"
                     : $"Project '{projectName}' has no file path to compare",
-                hint: $"Available projects: {string.Join(", ", _solution!.Projects.Select(p => p.Name))}",
+                hint: $"Available projects: {string.Join(", ", model.ValidNames)}",
                 context: new { projectName });
         }
 
@@ -94,27 +93,42 @@ public partial class RoslynService
         }
         var baselineRepoFiles = lsOut.Split('\0', StringSplitOptions.RemoveEmptyEntries);
 
-        var breaking = new List<object>();
-        var added = new List<object>();
+        var breakingRaw = new List<(string ChangeKind, string Signature, string? BaselineSignature, object? Location, string Project, string? TargetFramework)>();
+        var addedRaw = new List<(string Signature, object? Location, string Project, string? TargetFramework)>();
         var projectsCompared = new List<object>();
+        var comparedProjects = new HashSet<LogicalProject>();
+        // The project file text at the ref, read once per project file.
+        var projectXmlAtRef = new Dictionary<string, string?>(LoadFidelityClassifier.PathComparer);
+        using var evaluator = new MSBuildProjectEvaluator();
 
         foreach (var project in projects)
         {
-            var currentCompilation = await project.GetCompilationAsync(cancellationToken);
+            var currentCompilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (currentCompilation == null) continue;
+            var logical = model.Of(project);
+            var targetFramework = LogicalProject.TargetFrameworkOf(project);
 
-            // The project's directory, as a forward-slash repo-relative prefix —
-            // the shape git ls-tree emits.
-            var projectDir = Path.GetDirectoryName(project.FilePath!)!;
-            var relativeDir = Path.GetRelativePath(repoRoot, projectDir).Replace('\\', '/');
-            var prefix = relativeDir == "." ? "" : relativeDir + "/";
+            if (!projectXmlAtRef.TryGetValue(project.FilePath!, out var xml))
+            {
+                var relativeProjectFile = Path.GetRelativePath(repoRoot, project.FilePath!).Replace('\\', '/');
+                var blobs = await ReadBaselineBlobsAsync(repoRoot, baselineRef, new[] { relativeProjectFile }, cancellationToken);
+                xml = blobs.GetValueOrDefault(relativeProjectFile);
+                projectXmlAtRef[project.FilePath!] = xml;
+            }
 
-            var baselineFiles = ScopeBaselineFiles(
-                baselineRepoFiles,
-                prefix,
-                project.Documents.Where(d => d.FilePath != null)
-                    .Select(d => Path.GetRelativePath(repoRoot, d.FilePath!).Replace('\\', '/')),
-                PathComparison);
+            List<string> baselineFiles;
+            try
+            {
+                baselineFiles = BaselineCompileFiles(evaluator, project.FilePath!, xml, targetFramework, repoRoot, baselineRepoFiles);
+            }
+            catch (Microsoft.Build.Exceptions.InvalidProjectFileException ex)
+            {
+                return CreateErrorResponse(
+                    ErrorCodes.AnalysisFailed,
+                    $"The project file of '{logical.Name}' at '{baselineRef}' cannot be evaluated: {ex.Message}",
+                    hint: "diff_api_surface evaluates the project file as it read at the baseline ref to know which files it compiled.",
+                    context: new { baselineRef, projectName = logical.Name });
+            }
 
             var parseOptions = project.ParseOptions as CSharpParseOptions
                 ?? new CSharpParseOptions(LanguageVersion.Latest);
@@ -125,36 +139,28 @@ public partial class RoslynService
             foreach (var file in baselineFiles)
             {
                 if (!baselineBlobs.TryGetValue(file, out var content)) continue; // symlink/submodule entry
-                baselineTrees.Add(CSharpSyntaxTree.ParseText(content, parseOptions, path: file,
-                    cancellationToken: cancellationToken));
+                baselineTrees.Add(CSharpSyntaxTree.ParseText(content, parseOptions,
+                    path: Path.GetFullPath(Path.Combine(repoRoot, file)), cancellationToken: cancellationToken));
             }
-
             var baselineGitFileCount = baselineTrees.Count;
 
-            // Build-generated documents (GlobalUsings.g.cs, AssemblyInfo.cs,
-            // AssemblyAttributes.cs) are not in git, but without the implicit
-            // global usings the baseline trees cannot resolve common types and
-            // every such symbol would render as a bogus signature change. The
-            // current build's generated documents stand in for the baseline's.
-            // They are identified by their generated-file names, not an "obj/"
-            // path substring, so a relocated intermediate directory still works.
-            var baselineFileSet = baselineFiles.ToHashSet(StringComparer.FromComparison(PathComparison));
-            foreach (var document in project.Documents)
+            // Build-generated documents (GlobalUsings.g.cs, AssemblyInfo.cs) are not in
+            // git, but without the implicit global usings the baseline trees cannot
+            // resolve common types and every such symbol would render as a bogus
+            // signature change. The current build's generated documents stand in.
+            foreach (var document in BuildGeneratedDocuments(evaluator, project, targetFramework))
             {
-                var path = document.FilePath;
-                if (path == null || !IsBuildGeneratedFileName(Path.GetFileName(path))) continue;
-                var repoRelative = Path.GetRelativePath(repoRoot, path).Replace('\\', '/');
-                if (baselineFileSet.Contains(repoRelative)) continue; // already taken from git
                 var text = await document.GetTextAsync(cancellationToken);
-                baselineTrees.Add(CSharpSyntaxTree.ParseText(text.ToString(), parseOptions, path: path,
+                baselineTrees.Add(CSharpSyntaxTree.ParseText(text.ToString(), parseOptions, path: document.FilePath!,
                     cancellationToken: cancellationToken));
             }
 
-            var baselineCompilation = CSharpCompilation.Create(
+            Compilation baselineCompilation = CSharpCompilation.Create(
                 $"{project.AssemblyName}.Baseline",
                 baselineTrees,
                 currentCompilation.References,
                 (CSharpCompilationOptions)currentCompilation.Options);
+            baselineCompilation = RunProjectGenerators(project, baselineCompilation, cancellationToken);
 
             var baselineSurface = SnapshotApiSurface(baselineCompilation);
             var currentSurface = SnapshotApiSurface(currentCompilation);
@@ -163,32 +169,60 @@ public partial class RoslynService
             // Locations are reported on the CURRENT side only: a removed entry's
             // path points into the baseline tree (a repo-relative git path at the
             // ref), which no longer corresponds to anything on disk.
-            breaking.AddRange(projectBreaking.Select(b => new
-            {
+            breakingRaw.AddRange(projectBreaking.Select(b => (
                 b.changeKind,
                 b.signature,
                 b.baselineSignature,
-                location = b.changeKind == "changed" && b.entry is { FilePath: not null, Line: not null }
-                    ? new { filePath = FormatPath(b.entry.FilePath), line = b.entry.Line }
-                    : (object?)null,
-                project = project.Name
-            }));
-            added.AddRange(projectAdded.Select(a => new
+                b.changeKind == "changed" && b.entry is { FilePath: not null, Line: not null }
+                    ? (object?)new { filePath = FormatPath(b.entry.FilePath), line = b.entry.Line }
+                    : null,
+                logical.Name,
+                targetFramework)));
+            addedRaw.AddRange(projectAdded.Select(a => (
+                a.Signature,
+                a is { FilePath: not null, Line: not null }
+                    ? (object?)new { filePath = FormatPath(a.FilePath), line = a.Line }
+                    : null,
+                logical.Name,
+                targetFramework)));
+            if (comparedProjects.Add(logical))
             {
-                signature = a.Signature,
-                location = a is { FilePath: not null, Line: not null }
-                    ? new { filePath = FormatPath(a.FilePath), line = a.Line }
-                    : (object?)null,
-                project = project.Name
-            }));
-            projectsCompared.Add(new
-            {
-                project = project.Name,
-                baselineFileCount = baselineGitFileCount,
-                currentSurfaceCount = currentSurface.Count,
-                baselineSurfaceCount = baselineSurface.Count
-            });
+                projectsCompared.Add(new
+                {
+                    project = logical.Name,
+                    targetFrameworks = logical.IsMultiTargeted ? logical.TargetFrameworks : null,
+                    baselineFileCount = baselineGitFileCount,
+                    currentSurfaceCount = currentSurface.Count,
+                    baselineSurfaceCount = baselineSurface.Count
+                });
+            }
         }
+
+        var breaking = TargetFrameworkDeduplication.By(
+                breakingRaw, b => (b.Project, b.ChangeKind, b.Signature, b.BaselineSignature ?? ""),
+                EqualityComparer<(string, string, string, string)>.Default, b => b.TargetFramework)
+            .OrderBy(b => b.Item.Signature, StringComparer.Ordinal)
+            .Select(b => new
+            {
+                changeKind = b.Item.ChangeKind,
+                signature = b.Item.Signature,
+                baselineSignature = b.Item.BaselineSignature,
+                location = b.Item.Location,
+                project = b.Item.Project,
+                targetFrameworks = FrameworksOrNull(b.TargetFrameworks)
+            })
+            .ToList();
+        var added = TargetFrameworkDeduplication.By(
+                addedRaw, a => (a.Project, a.Signature), EqualityComparer<(string, string)>.Default, a => a.TargetFramework)
+            .OrderBy(a => a.Item.Signature, StringComparer.Ordinal)
+            .Select(a => new
+            {
+                signature = a.Item.Signature,
+                location = a.Item.Location,
+                project = a.Item.Project,
+                targetFrameworks = FrameworksOrNull(a.TargetFrameworks)
+            })
+            .ToList();
 
         return CreateSuccessResponse(
             data: new
@@ -201,40 +235,61 @@ public partial class RoslynService
                 breaking,
                 added
             },
+            ResultCounts.Complete(breaking.Count + added.Count),
             suggestedNextTools: breaking.Count > 0
                 ? new[]
                 {
                     "Review each breaking entry; a major-version bump (or compatibility shims) is required to ship them",
                     "find_references on changed symbols to gauge caller impact"
                 }
-                : new[] { "No breaking changes: the release can ship as a minor/patch version for API purposes" },
-            totalCount: breaking.Count + added.Count,
-            returnedCount: breaking.Count + added.Count);
+                : new[] { "No breaking changes: the release can ship as a minor/patch version for API purposes" });
     }
 
-    // Selects the baseline .cs files belonging to a project. A non-empty prefix (the
-    // project's repo-relative directory, forward-slashed with a trailing '/') filters
-    // by path prefix. An empty prefix means the project's .csproj sits at the git root,
-    // where a prefix filter would match EVERY .cs in the repo — sibling and test
-    // projects under the root included — so it scopes to the project's own document
-    // paths instead.
-    internal static List<string> ScopeBaselineFiles(
-        IEnumerable<string> baselineRepoFiles,
-        string prefix,
-        IEnumerable<string> projectRelativeDocPaths,
-        StringComparison pathComparison)
+    // The compilation with the project's source generators run on it, exactly as the
+    // generator-aware current compilation runs them; unchanged when the project has none.
+    private static Compilation RunProjectGenerators(Project project, Compilation compilation, CancellationToken cancellationToken)
     {
-        var csFiles = baselineRepoFiles.Where(f => f.EndsWith(".cs", StringComparison.OrdinalIgnoreCase));
-        if (prefix.Length == 0)
+        var generators = project.AnalyzerReferences
+            .SelectMany(r => r.GetGenerators(LanguageNames.CSharp))
+            .ToImmutableArray();
+        if (generators.IsEmpty) return compilation;
+        CreateGeneratorDriver(project, generators).RunGeneratorsAndUpdateCompilation(compilation, out var updated, out _, cancellationToken);
+        return updated;
+    }
+
+    // The repo-relative .cs paths of the ref's tree that the project compiled at the ref:
+    // the Compile items of the project file as it read there, evaluated by MSBuild (its
+    // imports resolve against the files on disk now). Empty when the project file did not
+    // exist at the ref.
+    private static List<string> BaselineCompileFiles(
+        MSBuildProjectEvaluator evaluator, string projectFile, string? projectXmlAtRef, string? targetFramework,
+        string repoRoot, IEnumerable<string> baselineRepoFiles)
+    {
+        if (projectXmlAtRef == null) return new List<string>();
+        var project = evaluator.EvaluateText(projectFile, projectXmlAtRef, targetFramework);
+        return baselineRepoFiles
+            .Where(f => f.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+            .Where(f => MSBuildProjectEvaluator.CompileIncludes(project, Path.GetFullPath(Path.Combine(repoRoot, f))))
+            .ToList();
+    }
+
+    // The current project's documents the build generates rather than the project file
+    // listing them (implicit global usings, assembly info): documents that are not Compile
+    // items of the project file evaluated now. They stand in for the baseline's own, which
+    // git does not hold. None when the project file cannot be evaluated.
+    private static List<Document> BuildGeneratedDocuments(MSBuildProjectEvaluator evaluator, Project project, string? targetFramework)
+    {
+        try
         {
-            var ownFiles = new HashSet<string>(
-                projectRelativeDocPaths,
-                pathComparison == StringComparison.OrdinalIgnoreCase
-                    ? StringComparer.OrdinalIgnoreCase
-                    : StringComparer.Ordinal);
-            return csFiles.Where(ownFiles.Contains).ToList();
+            var evaluated = evaluator.Evaluate(project.FilePath!, targetFramework);
+            return project.Documents
+                .Where(d => d.FilePath != null && !MSBuildProjectEvaluator.CompileIncludes(evaluated, d.FilePath))
+                .ToList();
         }
-        return csFiles.Where(f => f.StartsWith(prefix, pathComparison)).ToList();
+        catch (Microsoft.Build.Exceptions.InvalidProjectFileException)
+        {
+            return new List<Document>();
+        }
     }
 
     // Snapshot of a compilation's public API: every public type (plus nested
@@ -300,14 +355,17 @@ public partial class RoslynService
 
     // Diff two snapshots. Members of a wholly removed (or added) type collapse
     // into the single type entry so one deleted class is one finding, not one
-    // per member.
+    // per member. A key declared more than once in one snapshot (a compilation with
+    // duplicate declarations) is compared once, by its first declaration.
     internal static (
         List<(string changeKind, string signature, string? baselineSignature, ApiSurfaceEntry entry)> breaking,
         List<ApiSurfaceEntry> added)
         DiffApiSurfaces(List<ApiSurfaceEntry> baseline, List<ApiSurfaceEntry> current)
     {
-        var baselineByKey = baseline.ToDictionary(e => e.Key, e => e);
-        var currentByKey = current.ToDictionary(e => e.Key, e => e);
+        baseline = baseline.DistinctBy(e => e.Key, StringComparer.Ordinal).ToList();
+        current = current.DistinctBy(e => e.Key, StringComparer.Ordinal).ToList();
+        var baselineByKey = baseline.ToDictionary(e => e.Key, e => e, StringComparer.Ordinal);
+        var currentByKey = current.ToDictionary(e => e.Key, e => e, StringComparer.Ordinal);
 
         var removedEntries = baseline.Where(e => !currentByKey.ContainsKey(e.Key)).ToList();
         var removedTypeKeys = removedEntries
@@ -420,14 +478,6 @@ public partial class RoslynService
         var location = symbol.Locations.FirstOrDefault(l => l.IsInSource);
         return location?.GetLineSpan().StartLinePosition.Line;
     }
-
-    // Generated build outputs that stand in for the baseline's implicit global
-    // usings and assembly attributes — matched by name so the detection is
-    // independent of where the intermediate (obj) directory lives.
-    private static bool IsBuildGeneratedFileName(string fileName) =>
-        fileName.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase)
-        || fileName.EndsWith(".AssemblyInfo.cs", StringComparison.OrdinalIgnoreCase)
-        || fileName.EndsWith(".AssemblyAttributes.cs", StringComparison.OrdinalIgnoreCase);
 
     // Reads every requested blob (`<ref>:<file>`) from one `git cat-file --batch`
     // subprocess. Responses come back in request order as

@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Text;
 
 namespace SharpLensMcp;
 
@@ -12,6 +13,13 @@ namespace SharpLensMcp;
 // its own Edit/Write tools (under the host's approval flow) and then calls
 // sync_documents. New tools must not gain a write path without the user's
 // explicit validation.
+//
+// The new file carries exactly the context its code needs: the namespace
+// declarations around it and the using directives it uses — never the origin's
+// other types, top-level statements, assembly or module attributes, or global
+// usings. Declarations are removed with DeclarationRemoval, so the directives and
+// file header around them stay balanced and in place in both files, and a using
+// directive the move left unused in the origin is removed too.
 public partial class RoslynService
 {
     public async Task<object> MoveTypeToFileAsync(
@@ -21,7 +29,8 @@ public partial class RoslynService
 
         var (resolution, error) = await ResolveReorganizationTargetAsync(typeName, cancellationToken);
         if (resolution == null) return error!;
-        var (document, root, typeDecl, typeSymbol) = resolution;
+        var (document, root, typeDecl, typeSymbol, typeResolution) = resolution;
+        var notice = typeResolution.ShadowNotice;
 
         var siblingTypes = TopLevelTypeDeclarations(root)
             .Where(t => t != typeDecl)
@@ -36,7 +45,8 @@ public partial class RoslynService
                     alreadyAlone = true,
                     typeName = typeSymbol.ToDisplayString(),
                     filePath = FormatPath(document.FilePath),
-                    message = "The type is already the only type in its file"
+                    message = "The type is already the only type in its file",
+                    notice
                 });
         }
 
@@ -44,13 +54,16 @@ public partial class RoslynService
         var (newFilePath, collisionError) = ResolveNewFilePath(document, newFileName, typeName);
         if (newFilePath == null) return collisionError!;
 
-        // The new file is the origin minus every OTHER type: usings, namespace
-        // shape (file-scoped or block), and the moved type's own text survive
-        // verbatim. The origin keeps everything except the moved declaration. A
-        // block-scoped namespace that loses all its types is removed rather than
-        // left behind as an empty `namespace X { }`.
-        var newFileRoot = RemoveEmptiedNamespaces(root.RemoveNodes(siblingTypes, SyntaxRemoveOptions.KeepNoTrivia)!);
-        var originRoot = RemoveEmptiedNamespaces(root.RemoveNode(typeDecl, SyntaxRemoveOptions.KeepNoTrivia)!);
+        // The new file is the origin minus everything that is not the moved type's
+        // context; the origin keeps everything except the moved declaration. A
+        // block-scoped namespace that loses all its types is removed rather than left
+        // behind as an empty `namespace X { }`.
+        var newFileRoot = TrimLeadingBlankLines(RemoveEmptiedNamespaces(
+            DeclarationRemoval.Remove(root, siblingTypes.Concat(FileContextNotCarried(root)))));
+        var originRoot = (CompilationUnitSyntax)RemoveEmptiedNamespaces(DeclarationRemoval.Remove(root, new[] { typeDecl }));
+
+        var (finalOrigin, finalNewFile) = await WithoutUnusedUsingsAsync(
+            document, originRoot, newFilePath, (CompilationUnitSyntax)newFileRoot, cancellationToken);
 
         return CreateSuccessResponse(
             data: new
@@ -60,8 +73,9 @@ public partial class RoslynService
                 typeName = typeSymbol.ToDisplayString(),
                 newFilePath = FormatPath(newFilePath),
                 originFilePath = FormatPath(document.FilePath),
-                newFileContent = newFileRoot.ToFullString(),
-                updatedOriginContent = originRoot.ToFullString()
+                newFileContent = await InDocumentLineBreaksAsync(document, finalNewFile.ToFullString(), cancellationToken),
+                updatedOriginContent = await MatchDocumentLineEndingsAsync(document, finalOrigin.ToFullString(), cancellationToken),
+                notice
             },
             suggestedNextTools: new[]
             {
@@ -88,7 +102,7 @@ public partial class RoslynService
 
         var (resolution, error) = await ResolveReorganizationTargetAsync(typeName, cancellationToken);
         if (resolution == null) return error!;
-        var (document, root, typeDecl, typeSymbol) = resolution;
+        var (document, root, typeDecl, typeSymbol, typeResolution) = resolution;
 
         if (typeDecl is RecordDeclarationSyntax)
         {
@@ -135,32 +149,23 @@ public partial class RoslynService
         var partialAlreadyPresent = typeDecl.Modifiers.Any(SyntaxKind.PartialKeyword);
         var siblingTypes = TopLevelTypeDeclarations(root).Where(t => t != typeDecl).ToList();
 
-        // New file: drop sibling types, then shrink the target declaration to
-        // ONLY the moved members. Attributes stay on the origin half — copying
-        // them would apply each attribute twice (CS0579 for non-repeatable
-        // ones). The origin loses the moved members. Both halves get `partial`.
-        var trackedNew = root.TrackNodes(siblingTypes.Append<SyntaxNode>(typeDecl).Concat(movedMembers));
-        var newFileRoot = siblingTypes.Count > 0
-            ? trackedNew.RemoveNodes(
-                siblingTypes.Select(t => trackedNew.GetCurrentNode(t)!),
-                SyntaxRemoveOptions.KeepNoTrivia)!
-            : trackedNew;
+        // New file: the type's context (as move_type_to_file builds it) holding a
+        // partial half of the type with ONLY the moved members (NewPartialHalf). The
+        // origin loses the moved members. Both halves get `partial`.
+        var notCarried = siblingTypes.Concat(FileContextNotCarried(root)).ToList();
+        var trackedNew = root.TrackNodes(movedMembers.Append<SyntaxNode>(typeDecl).Concat(notCarried));
+        var newFileRoot = DeclarationRemoval.Remove(trackedNew, notCarried.Select(n => trackedNew.GetCurrentNode(n)!));
         var currentTypeInNew = newFileRoot.GetCurrentNode(typeDecl)!;
-        var currentMovedInNew = movedMembers
-            .Select(m => newFileRoot.GetCurrentNode(m)!)
-            .ToList();
-        var newHalf = EnsurePartialModifier(
-            currentTypeInNew
-                .WithMembers(SyntaxFactory.List(currentMovedInNew))
-                .WithAttributeLists(default));
-        newFileRoot = newFileRoot.ReplaceNode(currentTypeInNew, newHalf);
+        var newHalf = NewPartialHalf(currentTypeInNew, movedMembers.Select(m => newFileRoot.GetCurrentNode(m)!).ToList());
+        var newFileUnit = (CompilationUnitSyntax)TrimLeadingBlankLines(RemoveEmptiedNamespaces(newFileRoot.ReplaceNode(currentTypeInNew, newHalf)));
 
         var trackedOrigin = root.TrackNodes(movedMembers.Append<SyntaxNode>(typeDecl));
-        var originRoot = trackedOrigin.RemoveNodes(
-            movedMembers.Select(m => trackedOrigin.GetCurrentNode(m)!),
-            SyntaxRemoveOptions.KeepNoTrivia)!;
+        var originRoot = DeclarationRemoval.Remove(trackedOrigin, movedMembers.Select(m => trackedOrigin.GetCurrentNode(m)!));
         var currentTypeInOrigin = originRoot.GetCurrentNode(typeDecl)!;
         originRoot = originRoot.ReplaceNode(currentTypeInOrigin, EnsurePartialModifier(currentTypeInOrigin));
+
+        var (finalOrigin, finalNewFile) = await WithoutUnusedUsingsAsync(
+            document, originRoot, newFilePath, newFileUnit, cancellationToken);
 
         return CreateSuccessResponse(
             data: new
@@ -172,8 +177,9 @@ public partial class RoslynService
                 originFilePath = FormatPath(document.FilePath),
                 movedMembers = movedMembers.Select(DescribeMemberDeclaration).ToList(),
                 partialModifierAdded = !partialAlreadyPresent,
-                newFileContent = newFileRoot.ToFullString(),
-                updatedOriginContent = originRoot.ToFullString()
+                newFileContent = await InDocumentLineBreaksAsync(document, finalNewFile.ToFullString(), cancellationToken),
+                updatedOriginContent = await MatchDocumentLineEndingsAsync(document, finalOrigin.ToFullString(), cancellationToken),
+                notice = typeResolution.ShadowNotice
             },
             suggestedNextTools: new[]
             {
@@ -182,11 +188,105 @@ public partial class RoslynService
             });
     }
 
+    // The new partial half of a split type: the declaration with only the moved members,
+    // no attributes (they stay on the origin half, where repeating them would apply each
+    // twice), no primary-constructor parameter list and no base list (only one partial
+    // declaration may have the parameter list, and the bases need not repeat). The
+    // trivia before the type stays (directives, blank lines, indentation) except its doc
+    // comment, which documents the type once, on the origin half.
+    private static TypeDeclarationSyntax NewPartialHalf(TypeDeclarationSyntax type, IReadOnlyList<MemberDeclarationSyntax> members)
+    {
+        var leading = type.GetLeadingTrivia();
+        var kept = new List<SyntaxTrivia>();
+        for (var i = 0; i < leading.Count; i++)
+        {
+            var isDocumentation = leading[i].IsKind(SyntaxKind.SingleLineDocumentationCommentTrivia)
+                || leading[i].IsKind(SyntaxKind.MultiLineDocumentationCommentTrivia);
+            if (isDocumentation)
+            {
+                // The indentation before the doc comment goes with it.
+                if (kept.Count > 0 && kept[^1].IsKind(SyntaxKind.WhitespaceTrivia)) kept.RemoveAt(kept.Count - 1);
+                continue;
+            }
+            kept.Add(leading[i]);
+        }
+        var newLeading = SyntaxFactory.TriviaList(kept);
+
+        // The header's line break (before `{` on the next line) is the trailing trivia of
+        // whatever token preceded the brace; it must survive the header's shortening.
+        var headerTrailing = type.OpenBraceToken.GetPreviousToken().TrailingTrivia;
+        var half = type.WithMembers(SyntaxFactory.List(members))
+            .WithAttributeLists(default)
+            .WithParameterList(null)
+            .WithBaseList(null);
+        var lastHeaderToken = half.OpenBraceToken.GetPreviousToken();
+        half = half.ReplaceToken(lastHeaderToken, lastHeaderToken.WithTrailingTrivia(headerTrailing));
+        return EnsurePartialModifier(half.WithLeadingTrivia(newLeading));
+    }
+
+    // What the origin file holds that a file moved out of it must not carry: top-level
+    // statements, assembly and module attributes, and global using directives (each
+    // already applies to the whole compilation).
+    private static IEnumerable<SyntaxNode> FileContextNotCarried(CompilationUnitSyntax root) =>
+        root.Members.OfType<GlobalStatementSyntax>().Cast<SyntaxNode>()
+            .Concat(root.AttributeLists)
+            .Concat(root.Usings.Where(u => u.GlobalKeyword.IsKind(SyntaxKind.GlobalKeyword)));
+
+    // A file with no blank lines (or indentation) before its first token.
+    private static SyntaxNode TrimLeadingBlankLines(SyntaxNode root)
+    {
+        var first = root.GetFirstToken(includeZeroWidth: true);
+        var trimmed = first.LeadingTrivia.SkipWhile(t => t.IsKind(SyntaxKind.EndOfLineTrivia) || t.IsKind(SyntaxKind.WhitespaceTrivia));
+        return root.ReplaceToken(first, first.WithLeadingTrivia(trimmed));
+    }
+
+    // The origin without the using directives the reorganization left unused there, and
+    // the new file without any using directive it does not use - judged by compiling the
+    // two together in place of the origin.
+    private async Task<(CompilationUnitSyntax origin, CompilationUnitSyntax newFile)> WithoutUnusedUsingsAsync(
+        Document document, CompilationUnitSyntax originRoot, string newFilePath, CompilationUnitSyntax newFileRoot,
+        CancellationToken cancellationToken)
+    {
+        var newDocumentId = DocumentId.CreateNewId(document.Project.Id);
+        var forked = document.Project.Solution
+            .WithDocumentSyntaxRoot(document.Id, originRoot)
+            .AddDocument(DocumentInfo.Create(newDocumentId, Path.GetFileName(newFilePath),
+                folders: document.Folders,
+                loader: TextLoader.From(TextAndVersion.Create(SourceText.From(newFileRoot.ToFullString()), VersionStamp.Create())),
+                filePath: newFilePath));
+
+        var (origin, _) = await RemoveNewlyUnusedUsingsAsync(document, forked.GetDocument(document.Id)!, cancellationToken);
+
+        var newDocument = forked.GetDocument(newDocumentId)!;
+        var newRoot = (CompilationUnitSyntax)(await newDocument.GetSyntaxRootAsync(cancellationToken))!;
+        var model = await newDocument.GetSemanticModelAsync(cancellationToken);
+        if (model == null || newRoot.Usings.Count == 0) return ((CompilationUnitSyntax)origin, newRoot);
+        var unused = model.GetDiagnostics(cancellationToken: cancellationToken)
+            .Where(d => d.Id == "CS8019")
+            .Select(d => d.Location.SourceSpan)
+            .ToList();
+        var survivors = newRoot.Usings.Where(u => !unused.Any(span => span.Contains(u.Span) || u.Span.Contains(span))).ToList();
+        var finalNew = survivors.Count == newRoot.Usings.Count
+            ? newRoot
+            : (CompilationUnitSyntax)TrimLeadingBlankLines(WithUsingsPreservingHeader(newRoot, newRoot.Usings[0], survivors));
+        return ((CompilationUnitSyntax)origin, finalNew);
+    }
+
+    // New content made from a document's text, with every line break in the document's
+    // style.
+    private static async Task<string> InDocumentLineBreaksAsync(Document document, string content, CancellationToken cancellationToken)
+    {
+        var text = await document.GetTextAsync(cancellationToken);
+        var lineBreak = LineEndings.UniformStyle(text) ?? LineEndings.DominantStyle(text);
+        return lineBreak == null ? content : LineEndings.Convert(content, lineBreak);
+    }
+
     private sealed record ReorganizationTarget(
         Document Document,
         CompilationUnitSyntax Root,
         TypeDeclarationSyntax TypeDeclaration,
-        INamedTypeSymbol TypeSymbol);
+        INamedTypeSymbol TypeSymbol,
+        TypeResolution TypeResolution);
 
     // Shared target resolution for both reorganization tools: name lookup with
     // ambiguity propagation, then the v1 shape restrictions (single-file,
@@ -194,9 +294,9 @@ public partial class RoslynService
     private async Task<(ReorganizationTarget? target, object? error)> ResolveReorganizationTargetAsync(
         string typeName, CancellationToken cancellationToken)
     {
-        var (typeSymbol, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
-        if (ambiguousType != null) return (null, ambiguousType);
-        if (typeSymbol == null)
+        var typeResolution = await ResolveTypeByNameAsync(typeName, cancellationToken);
+        if (typeResolution.Error != null) return (null, typeResolution.Error);
+        if (typeResolution.Type is not { } typeSymbol)
         {
             return (null, CreateErrorResponse(
                 ErrorCodes.TypeNotFound,
@@ -255,7 +355,7 @@ public partial class RoslynService
         }
 
         var root = (CompilationUnitSyntax)await typeDecl.SyntaxTree.GetRootAsync(cancellationToken);
-        return (new ReorganizationTarget(document, root, typeDecl, typeSymbol), null);
+        return (new ReorganizationTarget(document, root, typeDecl, typeSymbol, typeResolution), null);
     }
 
     // Every type declared at namespace or file level in the unit (classes,
@@ -295,7 +395,7 @@ public partial class RoslynService
                 .Where(ns => ns.Members.Count == 0)
                 .ToList();
             if (empty.Count == 0) return root;
-            root = root.RemoveNodes(empty, SyntaxRemoveOptions.KeepNoTrivia) ?? root;
+            root = DeclarationRemoval.Remove(root, empty);
         }
     }
 

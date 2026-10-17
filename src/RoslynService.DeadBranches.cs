@@ -8,11 +8,16 @@ namespace SharpLensMcp;
 // find_dead_branches: unreachable basic blocks per method body, from the real
 // control-flow graph (ControlFlowGraph.Create + IsReachable) rather than
 // syntax heuristics — so code after return/throw, constant-false branches,
-// and code after non-breaking infinite loops all surface uniformly. Top-level
-// bodies only: a local function's or lambda's interior flow is its own graph
-// and is not walked in v1.
+// and code after non-breaking infinite loops all surface uniformly. A block whose only
+// content is its branch value (a `return 2;` or `throw` after a return) is reported at the
+// statement that carries the value. A file is analyzed in every target framework that
+// compiles it, each unreachable block reported once with the frameworks it is dead in.
+// Top-level bodies only: a local function's or lambda's interior flow is its own graph
+// and is not walked.
 public partial class RoslynService
 {
+    private const int MaxDeadBranchResults = 500;
+
     public async Task<object> FindDeadBranchesAsync(
         string? filePath = null,
         string? projectName = null,
@@ -28,13 +33,8 @@ public partial class RoslynService
                 "Supply exactly one of filePath (scan one file) or projectName (scan a project).",
                 context: new { filePath, projectName });
         }
-        if (maxResults is < 1 or > 500)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"maxResults must be between 1 and 500 (got {maxResults})",
-                context: new { maxResults });
-        }
+        if (ParameterValidation.Limit("maxResults", maxResults, MaxDeadBranchResults) is { } invalid)
+            return CreateErrorResponse(invalid);
 
         List<Document> documents;
         if (filePath != null)
@@ -48,22 +48,17 @@ public partial class RoslynService
                     hint: "Check the file path or reload the solution",
                     context: new { filePath });
             }
-            documents = new List<Document> { document };
+            documents = DocumentsSharingPath(document);
         }
         else
         {
-            var project = _solution!.Projects.FirstOrDefault(
-                p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase));
-            if (project == null)
-            {
-                return ProjectNotFoundError(projectName!);
-            }
-            documents = project.Documents.ToList();
+            var (scope, scopeError) = ResolveProjectScope(projectName);
+            if (scope == null) return scopeError!;
+            documents = scope.SelectMany(p => p.Documents).ToList();
         }
 
-        var deadBranches = new List<object>();
-        var methodsAnalyzed = 0;
-        var totalFound = 0;
+        var found = new List<(string Method, ResultLocation Location, SourceSpanKey Span, string Snippet, string? TargetFramework)>();
+        var methods = new HashSet<SourceSpanKey>();
 
         foreach (var document in documents)
         {
@@ -71,6 +66,7 @@ public partial class RoslynService
             var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
             var root = semanticModel == null ? null : await semanticModel.SyntaxTree.GetRootAsync(cancellationToken);
             if (semanticModel == null || root == null) continue;
+            var targetFramework = LogicalProject.TargetFrameworkOf(document.Project);
 
             foreach (var declaration in root.DescendantNodes().Where(n =>
                          n is BaseMethodDeclarationSyntax or AccessorDeclarationSyntax
@@ -81,48 +77,64 @@ public partial class RoslynService
             {
                 var graph = TryCreateControlFlowGraph(semanticModel, declaration, cancellationToken);
                 if (graph == null) continue;
-                methodsAnalyzed++;
+                methods.Add(new SourceSpanKey(declaration.SyntaxTree.FilePath, declaration.Span));
 
                 foreach (var block in graph.Blocks)
                 {
-                    if (block.IsReachable || block.Operations.IsEmpty) continue;
+                    if (block.IsReachable) continue;
+                    var syntax = DeadBlockSyntax(block);
+                    if (syntax == null) continue;
 
-                    totalFound++;
-                    if (deadBranches.Count >= maxResults) continue;
-
-                    var firstOperation = block.Operations[0].Syntax;
-                    var lineSpan = firstOperation.GetLocation().GetLineSpan();
-                    var snippetText = firstOperation.ToString();
-                    deadBranches.Add(new
-                    {
-                        method = DescribeBodyOwner(declaration, semanticModel, cancellationToken),
-                        location = new
-                        {
-                            filePath = FormatPath(lineSpan.Path),
-                            line = lineSpan.StartLinePosition.Line
-                        },
-                        snippet = TruncateForSnippet(snippetText, 160)
-                    });
+                    var location = syntax.GetLocation();
+                    var at = ResultLocation.From(location)!.Value;
+                    found.Add((
+                        DescribeBodyOwner(declaration, semanticModel, cancellationToken),
+                        at with { FilePath = FormatPath(at.FilePath) },
+                        new SourceSpanKey(syntax.SyntaxTree.FilePath, syntax.Span),
+                        TruncateForSnippet(syntax.ToString(), 160),
+                        targetFramework));
                 }
             }
         }
+
+        var merged = CanonicalOrder.ByLocation(
+            TargetFrameworkDeduplication.ByLocation(found, f => f.Span, f => f.TargetFramework),
+            m => m.Item.Location);
+        var returned = merged.Take(maxResults).ToList();
 
         return CreateSuccessResponse(
             data: new
             {
                 scope = filePath != null ? "file" : "project",
-                methodsAnalyzed,
-                deadBranches
+                methodsAnalyzed = methods.Count,
+                deadBranches = returned.Select(m => new
+                {
+                    method = m.Item.Method,
+                    location = new { filePath = m.Item.Location.FilePath, line = m.Item.Location.Line, column = m.Item.Location.Column },
+                    snippet = m.Item.Snippet,
+                    targetFrameworks = FrameworksOrNull(m.TargetFrameworks)
+                }).ToList()
             },
-            suggestedNextTools: deadBranches.Count > 0
+            ResultCounts.Capped(merged.Count, returned.Count),
+            suggestedNextTools: returned.Count > 0
                 ? new[]
                 {
                     "Delete the unreachable statements (they can never execute), or fix the condition that strands them",
                     "analyze_control_flow on a flagged method for the full reachability picture"
                 }
-                : new[] { "No unreachable blocks: every statement in scope can execute" },
-            totalCount: totalFound,
-            returnedCount: deadBranches.Count);
+                : new[] { "No unreachable blocks: every statement in scope can execute" });
+    }
+
+    // The source an unreachable block stands for: its first operation, or — for a block
+    // that holds nothing but its branch value (`return 2;`, `throw new X();`) — the
+    // statement carrying that value. Null for a block with neither (an empty join point).
+    private static SyntaxNode? DeadBlockSyntax(BasicBlock block)
+    {
+        if (!block.Operations.IsEmpty) return block.Operations[0].Syntax;
+        if (block.BranchValue is not { } value) return null;
+        return value.Syntax.AncestorsAndSelf().OfType<StatementSyntax>().FirstOrDefault()
+            ?? value.Syntax.AncestorsAndSelf().OfType<ArrowExpressionClauseSyntax>().FirstOrDefault()?.Expression
+            ?? value.Syntax;
     }
 
     private static ControlFlowGraph? TryCreateControlFlowGraph(
@@ -145,26 +157,15 @@ public partial class RoslynService
         };
     }
 
+    // "Type.Member" as C# declares the member (a constructor by its type name, "operator
+    // +", an accessor "Property.get" / "this[].get" / "Event.add").
     private static string DescribeBodyOwner(
         SyntaxNode declaration, SemanticModel semanticModel, CancellationToken cancellationToken)
     {
-        if (declaration is AccessorDeclarationSyntax accessor)
-        {
-            var propertyName = accessor.Ancestors().OfType<BasePropertyDeclarationSyntax>().FirstOrDefault() switch
-            {
-                PropertyDeclarationSyntax property => property.Identifier.Text,
-                IndexerDeclarationSyntax => "this[]",
-                EventDeclarationSyntax eventDecl => eventDecl.Identifier.Text,
-                _ => "?"
-            };
-            return $"{propertyName}.{accessor.Keyword.Text}";
-        }
-
-        var symbol = semanticModel.GetDeclaredSymbol(declaration, cancellationToken);
-        return symbol != null
-            ? $"{symbol.ContainingType?.Name}.{symbol.Name}".TrimStart('.')
-            : declaration is BaseMethodDeclarationSyntax
-                ? declaration.ToString().Split('(')[0].Split(' ').Last()
-                : "?";
+        var member = ComplexityMemberName(declaration);
+        if (declaration is AccessorDeclarationSyntax) return member;
+        var containingType = declaration.Ancestors().OfType<BaseTypeDeclarationSyntax>().FirstOrDefault()?.Identifier.ValueText
+            ?? semanticModel.GetDeclaredSymbol(declaration, cancellationToken)?.ContainingType?.Name;
+        return containingType == null ? member : $"{containingType}.{member}";
     }
 }

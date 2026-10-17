@@ -1,12 +1,18 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CodeActions;
-using Microsoft.CodeAnalysis.CodeRefactorings;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Text;
 
 namespace SharpLensMcp;
 
+// The code-action tools: listing the fixes and refactorings Roslyn offers at a position,
+// applying one by title, and the wrappers that apply one named refactoring. Each call
+// computes the offered actions once and chooses among them. A wrapper applies only its
+// own refactoring — extract_variable an "Introduce local", inline_variable an "Inline
+// temporary variable" — and fails rather than fall back to a different one;
+// encapsulate_field picks the variant whose result compiles; implement_missing_members
+// also works from the type declaration, implementing every missing member the compiler
+// reports on the type's base list.
 public partial class RoslynService
 {
     // Guards a two-position code-action selection so a reversed range (end before start)
@@ -27,6 +33,26 @@ public partial class RoslynService
         return null;
     }
 
+    // The document and the (validated) selection a code-action call addresses.
+    private async Task<(ResolvedPosition? position, int? endPosition, object? error)> ResolveActionSelectionAsync(
+        string filePath, int line, int column, int? endLine, int? endColumn, CancellationToken cancellationToken)
+    {
+        var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
+        if (pos == null) return (null, null, posError);
+
+        int? endPosition = null;
+        if (endLine.HasValue && endColumn.HasValue)
+        {
+            var (endPos, endError) = await ResolvePositionAsync(filePath, endLine.Value, endColumn.Value, cancellationToken);
+            if (endPos == null) return (null, null, endError);
+            endPosition = endPos.Position;
+        }
+
+        if (ValidateSelectionOrder(pos.Position, endPosition, line, column, endLine, endColumn) is { } orderError)
+            return (null, null, orderError);
+        return (pos, endPosition, null);
+    }
+
     /// <summary>
     /// Get all available code actions (fixes + refactorings) at a position.
     /// </summary>
@@ -42,19 +68,9 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
-        var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
-        if (pos == null) return posError!;
-
-        int? endPosition = null;
-        if (endLine.HasValue && endColumn.HasValue)
-        {
-            var (endPos, endError) = await ResolvePositionAsync(filePath, endLine.Value, endColumn.Value, cancellationToken);
-            if (endPos == null) return endError!;
-            endPosition = endPos.Position;
-        }
-
-        if (ValidateSelectionOrder(pos.Position, endPosition, line, column, endLine, endColumn) is { } orderError)
-            return orderError;
+        var (pos, endPosition, selectionError) = await ResolveActionSelectionAsync(
+            filePath, line, column, endLine, endColumn, cancellationToken);
+        if (pos == null) return selectionError!;
 
         var allActions = await GetAllCodeActionsAtPositionAsync(
             pos.Document,
@@ -130,23 +146,12 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
-        var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
-        if (pos == null) return posError!;
-        var document = pos.Document;
-
-        int? endPosition = null;
-        if (endLine.HasValue && endColumn.HasValue)
-        {
-            var (endPos, endError) = await ResolvePositionAsync(filePath, endLine.Value, endColumn.Value, cancellationToken);
-            if (endPos == null) return endError!;
-            endPosition = endPos.Position;
-        }
-
-        if (ValidateSelectionOrder(pos.Position, endPosition, line, column, endLine, endColumn) is { } orderError)
-            return orderError;
+        var (pos, endPosition, selectionError) = await ResolveActionSelectionAsync(
+            filePath, line, column, endLine, endColumn, cancellationToken);
+        if (pos == null) return selectionError!;
 
         var allActions = await GetAllCodeActionsAtPositionAsync(
-            document,
+            pos.Document,
             pos.Position,
             endPosition,
             includeCodeFixes: true,
@@ -201,12 +206,10 @@ public partial class RoslynService
             );
         }
 
-        var selectedAction = matchingAction.action;
-
         // Roslyn surfaces some refactorings as CodeActionWithNestedActions — a menu
         // wrapper with no operations of its own. Calling GetOperationsAsync on one
         // throws NotSupportedException, so descend into NestedCodeActions to a leaf.
-        var (leaf, ambiguousCandidates) = ResolveLeafAction(selectedAction, title);
+        var (leaf, ambiguousCandidates) = ResolveLeafAction(matchingAction.action, title);
         if (leaf == null)
         {
             return CreateErrorResponse(
@@ -216,28 +219,31 @@ public partial class RoslynService
                 context: new { title, candidates = ambiguousCandidates!.Take(10).ToList() }
             );
         }
-        selectedAction = leaf;
 
-        // Apply the code action
-        var operations = await selectedAction.GetOperationsAsync(cancellationToken);
-        var changedSolution = _solution;
+        var changedSolution = await ChangedSolutionOfAsync(leaf, cancellationToken);
+        return await ApplyActionResultAsync(leaf.Title, matchingAction.kind, changedSolution, preview, cancellationToken);
+    }
 
-        foreach (var operation in operations)
-        {
-            if (operation is ApplyChangesOperation applyChangesOp)
-            {
-                changedSolution = applyChangesOp.ChangedSolution;
-                break;
-            }
-        }
+    // The solution a (leaf) code action produces, or null when it produces no change.
+    private async Task<Solution?> ChangedSolutionOfAsync(CodeAction action, CancellationToken cancellationToken)
+    {
+        var operations = await action.GetOperationsAsync(cancellationToken);
+        var changed = operations.OfType<ApplyChangesOperation>().FirstOrDefault()?.ChangedSolution;
+        return changed == null || changed == _solution ? null : changed;
+    }
 
-        if (changedSolution == null || changedSolution == _solution)
+    // The preview, or the apply, of a code action's result: the shape every code-action
+    // tool returns.
+    private async Task<object> ApplyActionResultAsync(
+        string actionTitle, string actionKind, Solution? changedSolution, bool preview, CancellationToken cancellationToken)
+    {
+        if (changedSolution == null)
         {
             return CreateErrorResponse(
                 ErrorCodes.AnalysisFailed,
                 "Code action did not produce any changes",
                 hint: "The selected action may not be applicable in this context.",
-                context: new { actionTitle = selectedAction.Title }
+                context: new { actionTitle }
             );
         }
 
@@ -248,8 +254,8 @@ public partial class RoslynService
                 data: new
                 {
                     applied = false,
-                    actionTitle = selectedAction.Title,
-                    actionKind = matchingAction.kind,
+                    actionTitle,
+                    actionKind,
                     changedFiles = changedDocuments,
                     preview = true
                 },
@@ -266,8 +272,8 @@ public partial class RoslynService
             data: new
             {
                 applied = true,
-                actionTitle = selectedAction.Title,
-                actionKind = matchingAction.kind,
+                actionTitle,
+                actionKind,
                 changedFiles = FormatAppliedChanges(applyReport),
                 preview = false,
                 postApplyErrors = introducedErrors.Count > 0 ? introducedErrors : null
@@ -278,29 +284,60 @@ public partial class RoslynService
         );
     }
 
-
-
-    // Tries each candidate title until one applies. A title that simply isn't
-    // offered (SYMBOL_NOT_FOUND) or matches several actions (AMBIGUOUS_MATCH) is
-    // skipped to the next candidate; any OTHER error means a title WAS selected
-    // but applying it failed — that is surfaced distinctly instead of being masked
-    // as the generic "no action found at this position".
-    private async Task<object> ApplyFirstMatchingActionAsync(
-        IEnumerable<string> titles, Func<string, Task<object>> apply, object notFound)
+    // Every leaf of the offered actions (a menu's children, recursively), with the kind
+    // of the action it came from.
+    private static List<(CodeAction leaf, string kind)> LeafActions(IEnumerable<(CodeAction action, string kind)> actions)
     {
-        object? applyFailure = null;
-        foreach (var title in titles)
+        var leaves = new List<(CodeAction, string)>();
+        void Walk(CodeAction action, string kind, int depth)
         {
-            var result = await apply(title);
-            if (IsSuccessResponse(result)) return result;
-            var code = GetResponseErrorCode(result);
-            if (code is not (ErrorCodes.SymbolNotFound or ErrorCodes.AmbiguousMatch))
+            var nested = GetNestedActionsOrEmpty(action);
+            if (nested.IsEmpty || depth > 32)
             {
-                applyFailure ??= result;
+                leaves.Add((action, kind));
+                return;
             }
+            foreach (var child in nested) Walk(child, kind, depth + 1);
         }
-        return applyFailure ?? notFound;
+        foreach (var (action, kind) in actions) Walk(action, kind, 0);
+        return leaves;
     }
+
+    // The first leaf whose title starts with one of the prefixes, tried in order.
+    private static (CodeAction leaf, string kind)? FirstLeafTitled(
+        IReadOnlyList<(CodeAction leaf, string kind)> leaves, params string[] titlePrefixes)
+    {
+        foreach (var prefix in titlePrefixes)
+        {
+            var match = leaves.FirstOrDefault(l => l.leaf.Title.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+            if (match.leaf != null) return match;
+        }
+        return null;
+    }
+
+    // The compile errors a candidate solution introduces against the loaded one.
+    private async Task<IReadOnlyList<string>> IntroducedErrorsOfAsync(Solution candidate, CancellationToken cancellationToken)
+    {
+        var (prepared, _) = await PrepareForApplyAsync(candidate, cancellationToken);
+        if (prepared == null) return new[] { "the edit changes linked documents in conflicting ways" };
+        return await IntroducedCompileErrorsAsync(prepared, await ComputeFileChangesAsync(prepared, cancellationToken), cancellationToken);
+    }
+
+    // The code fixes, by title, that implement members: interface, abstract class, or
+    // either form of explicit implementation.
+    private static readonly string[] ImplementTitles =
+    {
+        "Implement interface", "Implement abstract class", "Implement remaining members", "Implement missing members",
+        "Implement all members explicitly"
+    };
+
+    // Diagnostics the implement-members fixes resolve: an interface member not
+    // implemented (CS0535), an abstract member not overridden (CS0534), and an
+    // implementation that is not public or has the wrong return type (CS0737, CS0738).
+    private static readonly HashSet<string> MissingMemberDiagnostics = new(StringComparer.Ordinal)
+    {
+        "CS0535", "CS0534", "CS0737", "CS0738"
+    };
 
     /// <summary>
     /// Implement missing interface/abstract members.
@@ -312,38 +349,65 @@ public partial class RoslynService
         bool preview = true,
         CancellationToken cancellationToken = default)
     {
-        // This is a convenience wrapper around apply_code_action_by_title
-        // Looking for actions like "Implement interface", "Implement abstract class"
-        var actionsResult = await GetCodeActionsAtPositionAsync(
-            filePath, line, column,
-            includeCodeFixes: true,
-            includeRefactorings: true,
-            cancellationToken: cancellationToken);
+        EnsureSolutionLoaded();
 
-        // Check if we got actions
-        if (!IsSuccessResponse(actionsResult))
+        var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
+        if (pos == null) return posError!;
+
+        var notFound = CreateErrorResponse(
+            ErrorCodes.SymbolNotFound,
+            "No 'implement members' action found at this position",
+            hint: "Position cursor on a class that implements an interface or extends an abstract class",
+            context: new { filePath, line, column });
+
+        // A fix offered at the position itself (on the interface name in the base list,
+        // where the compiler reports the missing members).
+        var atPosition = LeafActions(await GetAllCodeActionsAtPositionAsync(
+            pos.Document, pos.Position, null, includeCodeFixes: true, includeRefactorings: false, cancellationToken));
+        if (FirstLeafTitled(atPosition, ImplementTitles) is { } offered)
         {
-            return actionsResult;
+            return await ApplyActionResultAsync(offered.leaf.Title, offered.kind,
+                await ChangedSolutionOfAsync(offered.leaf, cancellationToken), preview, cancellationToken);
         }
 
-        // Look for implement actions
-        var implementTitles = new[]
+        // On the type declaration's header (its identifier, keyword, modifiers or base
+        // list): implement every missing member the compiler reports on the type, one fix
+        // at a time until none is left.
+        var typeDeclaration = pos.Token.Parent?.AncestorsAndSelf().OfType<TypeDeclarationSyntax>().FirstOrDefault();
+        if (typeDeclaration == null
+            || pos.Position < typeDeclaration.SpanStart || pos.Position > typeDeclaration.OpenBraceToken.SpanStart
+            || pos.Model.GetDeclaredSymbol(typeDeclaration, cancellationToken) is not INamedTypeSymbol typeSymbol)
         {
-            "Implement interface",
-            "Implement abstract class",
-            "Implement all members explicitly",
-            "Implement remaining members",
-            "Implement missing members"
-        };
+            return notFound;
+        }
 
-        return await ApplyFirstMatchingActionAsync(
-            implementTitles,
-            t => ApplyCodeActionByTitleAsync(filePath, line, column, t, preview: preview, cancellationToken: cancellationToken),
-            CreateErrorResponse(
-                ErrorCodes.SymbolNotFound,
-                "No 'implement members' action found at this position",
-                hint: "Position cursor on a class that implements an interface or extends an abstract class",
-                context: new { filePath, line, column }));
+        var working = _solution!;
+        string? appliedTitle = null;
+        for (var round = 0; round < 64; round++)
+        {
+            var document = working.GetDocument(pos.Document.Id)!;
+            var model = await document.GetSemanticModelAsync(cancellationToken);
+            var compilation = model!.Compilation;
+            var current = Microsoft.CodeAnalysis.FindSymbols.SymbolFinder.FindSimilarSymbols(typeSymbol, compilation, cancellationToken).FirstOrDefault();
+            var node = current?.DeclaringSyntaxReferences
+                .FirstOrDefault(r => r.SyntaxTree == model.SyntaxTree)?.GetSyntax(cancellationToken) as TypeDeclarationSyntax;
+            if (node?.BaseList == null) break;
+
+            var diagnostic = model.GetDiagnostics(node.BaseList.Span, cancellationToken)
+                .FirstOrDefault(d => MissingMemberDiagnostics.Contains(d.Id));
+            if (diagnostic == null) break;
+
+            var fixes = (await GetCodeActionsForDiagnosticAsync(document, diagnostic, cancellationToken))
+                .Select(a => (a, "fix"));
+            if (FirstLeafTitled(LeafActions(fixes), ImplementTitles) is not { } fix) break;
+            var next = await ChangedSolutionOfAsync(fix.leaf, cancellationToken);
+            if (next == null || next == working) break;
+            working = next;
+            appliedTitle ??= fix.leaf.Title;
+        }
+
+        if (appliedTitle == null) return notFound;
+        return await ApplyActionResultAsync(appliedTitle, "fix", working, preview, cancellationToken);
     }
 
     /// <summary>
@@ -356,25 +420,117 @@ public partial class RoslynService
         bool preview = true,
         CancellationToken cancellationToken = default)
     {
-        // Roslyn titles the two variants "Encapsulate field: 'X' (and use property)"
-        // and "Encapsulate field: 'X' (but still use field)", so a bare
-        // "Encapsulate field" probe matches both and is ambiguous. Probe the
-        // preferred property variant by its unique suffix first; the generic probe
-        // still resolves offerings with a single variant.
-        var encapsulateTitles = new[]
-        {
-            "(and use property)",
-            "Encapsulate field"
-        };
+        EnsureSolutionLoaded();
 
-        return await ApplyFirstMatchingActionAsync(
-            encapsulateTitles,
-            t => ApplyCodeActionByTitleAsync(filePath, line, column, t, preview: preview, cancellationToken: cancellationToken),
-            CreateErrorResponse(
+        var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
+        if (pos == null) return posError!;
+
+        // Roslyn offers two variants: "Encapsulate field: 'X' (and use property)" replaces
+        // the field's uses with the property, "(but still use field)" leaves them. The
+        // property variant is preferred; a use the property cannot take (passed by ref or
+        // out, CS0206) keeps the field; when that still does not compile, the field
+        // variant is used; when neither compiles, nothing is applied.
+        var leaves = LeafActions(await GetAllCodeActionsAtPositionAsync(
+            pos.Document, pos.Position, null, includeCodeFixes: false, includeRefactorings: true, cancellationToken));
+        var useProperty = leaves.FirstOrDefault(l => l.leaf.Title.StartsWith("Encapsulate field", StringComparison.OrdinalIgnoreCase)
+            && !l.leaf.Title.Contains("(but still use field)", StringComparison.OrdinalIgnoreCase));
+        var keepField = leaves.FirstOrDefault(l => l.leaf.Title.StartsWith("Encapsulate field", StringComparison.OrdinalIgnoreCase)
+            && l.leaf.Title.Contains("(but still use field)", StringComparison.OrdinalIgnoreCase));
+        if (useProperty.leaf == null && keepField.leaf == null)
+        {
+            return CreateErrorResponse(
                 ErrorCodes.SymbolNotFound,
                 "No 'encapsulate field' action found at this position",
                 hint: "Position cursor on a field declaration",
-                context: new { filePath, line, column }));
+                context: new { filePath, line, column, offeredTitles = leaves.Select(l => l.leaf.Title).Distinct().Take(10).ToList() });
+        }
+
+        IReadOnlyList<string> firstErrors = Array.Empty<string>();
+        if (useProperty.leaf != null && await ChangedSolutionOfAsync(useProperty.leaf, cancellationToken) is { } withProperty)
+        {
+            firstErrors = await IntroducedErrorsOfAsync(withProperty, cancellationToken);
+            if (firstErrors.Count == 0)
+                return await ApplyActionResultAsync(useProperty.leaf.Title, useProperty.kind, withProperty, preview, cancellationToken);
+
+            var repaired = await WithFieldAtRefUsesAsync(withProperty, cancellationToken);
+            if (repaired != null && (await IntroducedErrorsOfAsync(repaired, cancellationToken)).Count == 0)
+                return await ApplyActionResultAsync(useProperty.leaf.Title, useProperty.kind, repaired, preview, cancellationToken);
+        }
+        if (keepField.leaf != null && await ChangedSolutionOfAsync(keepField.leaf, cancellationToken) is { } withField)
+        {
+            var errors = await IntroducedErrorsOfAsync(withField, cancellationToken);
+            if (errors.Count == 0)
+                return await ApplyActionResultAsync(keepField.leaf.Title, keepField.kind, withField, preview, cancellationToken);
+            if (firstErrors.Count == 0) firstErrors = errors;
+        }
+
+        return CreateErrorResponse(
+            ErrorCodes.AnalysisFailed,
+            $"Encapsulating the field would not compile: {firstErrors.FirstOrDefault()}",
+            hint: "Nothing was applied. Encapsulate the field by hand where its uses need the field itself.",
+            context: new { filePath, line, column, errors = firstErrors });
+    }
+
+    // The encapsulated solution with every use the property cannot take — passed by ref
+    // or out (CS0206) — pointed back at the field the property wraps, or null when there
+    // is none to repair.
+    private static async Task<Solution?> WithFieldAtRefUsesAsync(Solution encapsulated, CancellationToken cancellationToken)
+    {
+        var repaired = encapsulated;
+        var changed = false;
+        foreach (var project in encapsulated.Projects)
+        {
+            foreach (var document in project.Documents)
+            {
+                var model = await document.GetSemanticModelAsync(cancellationToken);
+                var root = await document.GetSyntaxRootAsync(cancellationToken);
+                if (model == null || root == null) continue;
+                var replacements = new Dictionary<SimpleNameSyntax, SimpleNameSyntax>();
+                foreach (var diagnostic in model.GetDiagnostics(cancellationToken: cancellationToken).Where(d => d.Id == "CS0206"))
+                {
+                    var node = root.FindNode(diagnostic.Location.SourceSpan, getInnermostNodeForTie: true);
+                    var name = node switch
+                    {
+                        SimpleNameSyntax simple => simple,
+                        MemberAccessExpressionSyntax access => access.Name,
+                        ArgumentSyntax { Expression: SimpleNameSyntax simple } => simple,
+                        ArgumentSyntax { Expression: MemberAccessExpressionSyntax access } => access.Name,
+                        _ => null
+                    };
+                    // A property in a ref or out position does not bind: it is the single
+                    // candidate (CandidateReason.NotAVariable).
+                    var info = name == null ? default : model.GetSymbolInfo(name, cancellationToken);
+                    if (name == null || (info.Symbol ?? info.CandidateSymbols.FirstOrDefault()) is not IPropertySymbol property) continue;
+                    if (await WrappedFieldAsync(encapsulated, property, cancellationToken) is not { } field) continue;
+                    replacements[name] = SyntaxFactory.IdentifierName(field.Name).WithTriviaFrom(name);
+                }
+                if (replacements.Count == 0) continue;
+                repaired = repaired.WithDocumentSyntaxRoot(document.Id, root.ReplaceNodes(replacements.Keys, (original, _) => replacements[original]));
+                changed = true;
+            }
+        }
+        return changed ? repaired : null;
+    }
+
+    // The field a property's getter returns, or null.
+    private static async Task<IFieldSymbol?> WrappedFieldAsync(Solution solution, IPropertySymbol property, CancellationToken cancellationToken)
+    {
+        foreach (var reference in property.GetMethod?.DeclaringSyntaxReferences ?? Enumerable.Empty<SyntaxReference>())
+        {
+            var syntax = await reference.GetSyntaxAsync(cancellationToken);
+            var document = solution.GetDocument(syntax.SyntaxTree);
+            var model = document == null ? null : await document.GetSemanticModelAsync(cancellationToken);
+            if (model == null) continue;
+            foreach (var identifier in syntax.DescendantNodes().OfType<IdentifierNameSyntax>())
+            {
+                if (model.GetSymbolInfo(identifier, cancellationToken).Symbol is IFieldSymbol field
+                    && SymbolEqualityComparer.Default.Equals(field.ContainingType, property.ContainingType))
+                {
+                    return field;
+                }
+            }
+        }
+        return null;
     }
 
     /// <summary>
@@ -387,22 +543,25 @@ public partial class RoslynService
         bool preview = true,
         CancellationToken cancellationToken = default)
     {
-        var inlineTitles = new[]
-        {
-            "Inline variable",
-            "Inline temporary variable",
-            "Inline 'temp'",
-            "Inline" // broadest partial probe, tried last
-        };
+        EnsureSolutionLoaded();
 
-        return await ApplyFirstMatchingActionAsync(
-            inlineTitles,
-            t => ApplyCodeActionByTitleAsync(filePath, line, column, t, preview: preview, cancellationToken: cancellationToken),
-            CreateErrorResponse(
+        var (pos, posError) = await ResolvePositionAsync(filePath, line, column, cancellationToken);
+        if (pos == null) return posError!;
+
+        // Only Roslyn's inline-temporary refactoring; never another "Inline ..." action
+        // such as inline method.
+        var leaves = LeafActions(await GetAllCodeActionsAtPositionAsync(
+            pos.Document, pos.Position, null, includeCodeFixes: false, includeRefactorings: true, cancellationToken));
+        if (FirstLeafTitled(leaves, "Inline temporary variable", "Inline variable") is not { } inline)
+        {
+            return CreateErrorResponse(
                 ErrorCodes.SymbolNotFound,
                 "No 'inline variable' action found at this position",
-                hint: "Position cursor on a variable that can be inlined",
-                context: new { filePath, line, column }));
+                hint: "Position cursor on a local variable that is assigned once",
+                context: new { filePath, line, column, offeredTitles = leaves.Select(l => l.leaf.Title).Distinct().Take(10).ToList() });
+        }
+        return await ApplyActionResultAsync(inline.leaf.Title, inline.kind,
+            await ChangedSolutionOfAsync(inline.leaf, cancellationToken), preview, cancellationToken);
     }
 
     /// <summary>
@@ -417,23 +576,31 @@ public partial class RoslynService
         bool preview = true,
         CancellationToken cancellationToken = default)
     {
-        var extractTitles = new[]
-        {
-            "Introduce local",
-            "Extract local variable",
-            "Introduce variable for",
-            "Extract variable",
-            "Introduce" // broadest partial probe, tried last
-        };
+        EnsureSolutionLoaded();
 
-        return await ApplyFirstMatchingActionAsync(
-            extractTitles,
-            t => ApplyCodeActionByTitleAsync(filePath, line, column, t, endLine, endColumn, preview: preview, cancellationToken: cancellationToken),
-            CreateErrorResponse(
+        var (pos, endPosition, selectionError) = await ResolveActionSelectionAsync(
+            filePath, line, column, endLine, endColumn, cancellationToken);
+        if (pos == null) return selectionError!;
+
+        // Only a local: "Introduce local" (this occurrence first, then every occurrence).
+        // Introducing a field, constant or parameter changes where and how often the
+        // expression is evaluated, so it is never a fallback.
+        var leaves = LeafActions(await GetAllCodeActionsAtPositionAsync(
+            pos.Document, pos.Position, endPosition, includeCodeFixes: false, includeRefactorings: true, cancellationToken));
+        var local = FirstLeafTitled(
+            leaves.Where(l => !l.leaf.Title.Contains("all occurrences", StringComparison.OrdinalIgnoreCase)).ToList(),
+            "Introduce local for", "Introduce local constant for")
+            ?? FirstLeafTitled(leaves, "Introduce local for", "Introduce local constant for");
+        if (local is not { } chosen)
+        {
+            return CreateErrorResponse(
                 ErrorCodes.SymbolNotFound,
                 "No 'extract variable' action found at this position",
-                hint: "Select an expression to extract",
-                context: new { filePath, line, column, endLine, endColumn }));
+                hint: "Select an expression inside a method body; only a local variable is introduced",
+                context: new { filePath, line, column, endLine, endColumn, offeredTitles = leaves.Select(l => l.leaf.Title).Distinct().Take(10).ToList() });
+        }
+        return await ApplyActionResultAsync(chosen.leaf.Title, chosen.kind,
+            await ChangedSolutionOfAsync(chosen.leaf, cancellationToken), preview, cancellationToken);
     }
 
     // Reach Roslyn's internal CodeAction.NestedCodeActions via reflection. The property

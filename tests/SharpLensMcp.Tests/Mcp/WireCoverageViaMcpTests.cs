@@ -35,12 +35,14 @@ public class WireCoverageViaMcpTests : McpTestBase
         projects.Should().ContainSingle();
         var src = projects[0];
         src["projectName"]!.Value<string>().Should().Be("SharpLensMcp");
-        src["packagesChecked"]!.Value<int>().Should().Be(7,
-            "the src csproj declares exactly seven PackageReference entries");
+        src["packagesChecked"]!.Value<int>().Should().Be(8,
+            "the src csproj declares exactly eight PackageReference entries");
         (src["unusedPackages"] as JArray)!.Select(u => u["name"]!.Value<string>())
             .Should().BeEquivalentTo("Microsoft.CodeAnalysis.Features", "Microsoft.CodeAnalysis.CSharp.Features");
+        // PrivateAssets=all does not keep the Microsoft.Build packages' compile assets out, so
+        // they are judged (and used); only build-only SourceLink cannot be.
         (src["skipped"] as JArray)!.Select(s => s["name"]!.Value<string>())
-            .Should().BeEquivalentTo("Microsoft.Build.Framework", "Microsoft.SourceLink.GitHub");
+            .Should().Equal("Microsoft.SourceLink.GitHub");
     }
 
     // Mirrors DependencyAuditTests.UnknownProject_ReturnsInvalidParameterListingProjects.

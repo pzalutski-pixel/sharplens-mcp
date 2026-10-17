@@ -7,10 +7,14 @@ namespace SharpLensMcp;
 // fix_all: apply one code fix to every instance of a diagnostic id across a
 // file, project, or the whole solution — "remove all unused usings", "drop
 // every unused variable". COMPUTE-ONLY per the write-surface product rule:
-// the changed file contents are returned and the agent writes them. The
-// provider's own FixAllProvider does the batch when it supports the scope;
-// otherwise an iterative fallback fixes the first instance, recomputes, and
-// repeats until the diagnostic is gone or no progress is made.
+// the changed file contents are returned and the agent writes them. The fix is
+// the fixIndex-th fix offered for the first instance (the order get_code_fixes
+// lists), run through the provider that offered it: that provider's own
+// FixAllProvider does the batch when it supports the scope; otherwise an iterative
+// fallback fixes the first instance, recomputes, and repeats until the diagnostic is
+// gone or no progress is made. A fix that is a menu of variants is refused with the
+// variants. A project scope covers every target framework of the named project, and a
+// diagnostic reported once per target framework at the same place counts once.
 public partial class RoslynService
 {
     public async Task<object> FixAllAsync(
@@ -35,7 +39,7 @@ public partial class RoslynService
         // Resolve the scope to stable ids up front (ids survive solution forks,
         // so the fallback loop can re-collect against its working solution).
         DocumentId? scopedFileId = null;
-        ProjectId? scopedProjectId = null;
+        IReadOnlyList<ProjectId>? scopedProjectIds = null;
         if (normalizedScope == "file")
         {
             if (string.IsNullOrEmpty(filePath))
@@ -58,17 +62,17 @@ public partial class RoslynService
                 return CreateErrorResponse(ErrorCodes.InvalidParameter,
                     "project scope requires projectName", context: new { scope });
             }
-            var project = _solution!.Projects.FirstOrDefault(
-                p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase));
-            if (project == null)
-            {
-                return ProjectNotFoundError(projectName);
-            }
-            scopedProjectId = project.Id;
+            var (projects, projectError) = ResolveProjectScope(projectName);
+            if (projects == null) return projectError!;
+            scopedProjectIds = projects.Select(p => p.Id).ToList();
         }
 
         var matches = await CollectDiagnosticMatchesAsync(
-            _solution!, diagnosticId, scopedFileId, scopedProjectId, cancellationToken);
+            _solution!, diagnosticId, scopedFileId, scopedProjectIds, cancellationToken);
+        var diagnosticsMatched = matches
+            .Select(m => (m.document.FilePath, m.diagnostic.Location.SourceSpan))
+            .Distinct()
+            .Count();
         if (matches.Count == 0)
         {
             // fix_all reads compiler diagnostics only. A non-compiler id matching
@@ -95,49 +99,56 @@ public partial class RoslynService
                 returnedCount: 0);
         }
 
-        var provider = GetBuiltInCodeFixProviders()
-            .FirstOrDefault(p => p.FixableDiagnosticIds.Contains(diagnosticId));
-        if (provider == null)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.AnalysisFailed,
-                $"No code fix provider handles '{diagnosticId}'",
-                hint: "This diagnostic has no automated fix. get_code_fixes shows what is available at a position.",
-                context: new { diagnosticId, diagnosticsMatched = matches.Count });
-        }
-
-        // The fix is chosen from the first instance: its title and equivalence
-        // key drive both the FixAll batch and the fallback loop's selection.
+        // The fix is chosen from the first instance: the fixIndex-th offered fix, with the
+        // provider that offered it.
         var (firstDocument, firstDiagnostic) = matches[0];
-        var firstActions = await GetCodeActionsForDiagnosticAsync(firstDocument, firstDiagnostic, cancellationToken);
-        if (firstActions.Count == 0)
+        var firstFixes = await CodeFixesWithProvidersAsync(firstDocument, firstDiagnostic, cancellationToken);
+        if (firstFixes.Count == 0)
         {
             return CreateErrorResponse(
                 ErrorCodes.AnalysisFailed,
                 $"No code fixes available for '{diagnosticId}'",
-                context: new { diagnosticId });
+                hint: "This diagnostic has no automated fix. get_code_fixes shows what is available at a position.",
+                context: new { diagnosticId, diagnosticsMatched });
         }
-        if (fixIndex < 0 || fixIndex >= firstActions.Count)
+        if (fixIndex < 0 || fixIndex >= firstFixes.Count)
         {
             return CreateErrorResponse(
                 ErrorCodes.InvalidParameter,
-                $"Invalid fixIndex {fixIndex}. Available range: 0 to {firstActions.Count - 1}",
+                $"Invalid fixIndex {fixIndex}. Available range: 0 to {firstFixes.Count - 1}",
                 hint: "Call get_code_fixes to list the fixes and their indices.",
-                context: new { fixIndex, availableFixCount = firstActions.Count });
+                context: new { fixIndex, availableFixCount = firstFixes.Count });
         }
-        var selectedAction = firstActions[fixIndex];
+        var (provider, offered) = firstFixes[fixIndex];
+
+        // A menu of variants has no operations of its own and no single meaning to apply
+        // everywhere; a one-variant menu is that variant.
+        var selectedAction = offered;
+        for (var nested = GetNestedActionsOrEmpty(selectedAction); nested.Length > 0; nested = GetNestedActionsOrEmpty(selectedAction))
+        {
+            if (nested.Length > 1)
+            {
+                return CreateErrorResponse(
+                    ErrorCodes.AmbiguousMatch,
+                    $"Fix {fixIndex} ('{offered.Title}') is a menu of variants; fix_all applies a single fix",
+                    hint: "Apply one variant at each site with apply_code_action_by_title, or choose another fixIndex.",
+                    context: new { fixIndex, fixTitle = offered.Title, variants = nested.Select(n => n.Title).ToList() });
+            }
+            selectedAction = nested[0];
+        }
+        var equivalenceKey = selectedAction.EquivalenceKey ?? offered.EquivalenceKey;
 
         Solution? changedSolution = null;
         var fallbackMode = false;
 
         var fixAllProvider = provider.GetFixAllProvider();
-        if (fixAllProvider != null && selectedAction.EquivalenceKey != null)
+        if (fixAllProvider != null && equivalenceKey != null)
         {
             try
             {
                 changedSolution = await TryBatchFixAllAsync(
-                    provider, fixAllProvider, selectedAction.EquivalenceKey, diagnosticId,
-                    normalizedScope, matches, firstDocument, cancellationToken);
+                    provider, fixAllProvider, equivalenceKey, diagnosticId,
+                    normalizedScope, scopedProjectIds?.Count > 1, matches, firstDocument, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -155,7 +166,7 @@ public partial class RoslynService
         {
             fallbackMode = true;
             changedSolution = await FixAllByLoopAsync(
-                diagnosticId, scopedFileId, scopedProjectId, fixIndex, selectedAction.EquivalenceKey,
+                provider, diagnosticId, scopedFileId, scopedProjectIds, fixIndex, equivalenceKey,
                 matches.Count, cancellationToken);
         }
 
@@ -177,7 +188,7 @@ public partial class RoslynService
                 diagnosticId,
                 scope = normalizedScope,
                 fixTitle = selectedAction.Title,
-                diagnosticsMatched = matches.Count,
+                diagnosticsMatched,
                 fallbackMode,
                 files
             },
@@ -202,20 +213,45 @@ public partial class RoslynService
         return true;
     }
 
+    // The fixes the code-fix providers offer for a diagnostic, each with its provider, in
+    // the order get_code_fixes and apply_code_fix list them.
+    private async Task<List<(CodeFixProvider provider, CodeAction action)>> CodeFixesWithProvidersAsync(
+        Document document, Diagnostic diagnostic, CancellationToken cancellationToken)
+    {
+        var fixes = new List<(CodeFixProvider, CodeAction)>();
+        foreach (var provider in GetBuiltInCodeFixProviders())
+        {
+            if (!provider.FixableDiagnosticIds.Contains(diagnostic.Id)) continue;
+            var context = new CodeFixContext(document, diagnostic, (action, _) => fixes.Add((provider, action)), cancellationToken);
+            try
+            {
+                await provider.RegisterCodeFixesAsync(context);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // A provider that cannot handle the diagnostic offers no fix.
+            }
+        }
+        return fixes;
+    }
+
     // Compiler diagnostics matching the id within scope, paired with their
     // document. Reads base compilations (where compiler diagnostics like CS0219
     // / CS8019 live); analyzer-only ids are out of v1 scope.
     private async Task<List<(Document document, Diagnostic diagnostic)>> CollectDiagnosticMatchesAsync(
-        Solution solution, string diagnosticId, DocumentId? scopedFileId, ProjectId? scopedProjectId,
+        Solution solution, string diagnosticId, DocumentId? scopedFileId, IReadOnlyList<ProjectId>? scopedProjectIds,
         CancellationToken cancellationToken)
     {
         var matches = new List<(Document, Diagnostic)>();
 
         IEnumerable<Project> projects;
-        if (scopedProjectId != null)
+        if (scopedProjectIds != null)
         {
-            var project = solution.GetProject(scopedProjectId);
-            projects = project == null ? Array.Empty<Project>() : new[] { project };
+            projects = scopedProjectIds.Select(solution.GetProject).Where(p => p != null)!;
         }
         else if (scopedFileId != null)
         {
@@ -246,13 +282,15 @@ public partial class RoslynService
 
     private async Task<Solution?> TryBatchFixAllAsync(
         CodeFixProvider provider, FixAllProvider fixAllProvider, string equivalenceKey,
-        string diagnosticId, string scope, List<(Document document, Diagnostic diagnostic)> matches,
+        string diagnosticId, string scope, bool severalProjects, List<(Document document, Diagnostic diagnostic)> matches,
         Document triggerDocument, CancellationToken cancellationToken)
     {
+        // A project scope that covers several target frameworks runs as a solution-wide
+        // fix restricted (by the diagnostics it is given) to that project's documents.
         var fixAllScope = scope switch
         {
             "file" => FixAllScope.Document,
-            "project" => FixAllScope.Project,
+            "project" when !severalProjects => FixAllScope.Project,
             _ => FixAllScope.Solution
         };
         if (!fixAllProvider.GetSupportedFixAllScopes().Contains(fixAllScope)) return null;
@@ -276,7 +314,7 @@ public partial class RoslynService
     // recompute against the forked solution, repeat. Bounded by the initial
     // match count, and stops the moment an iteration makes no progress.
     private async Task<Solution?> FixAllByLoopAsync(
-        string diagnosticId, DocumentId? scopedFileId, ProjectId? scopedProjectId,
+        CodeFixProvider provider, string diagnosticId, DocumentId? scopedFileId, IReadOnlyList<ProjectId>? scopedProjectIds,
         int fixIndex, string? equivalenceKey, int maxIterations, CancellationToken cancellationToken)
     {
         var working = _solution!;
@@ -286,19 +324,23 @@ public partial class RoslynService
         {
             cancellationToken.ThrowIfCancellationRequested();
             var matches = await CollectDiagnosticMatchesAsync(
-                working, diagnosticId, scopedFileId, scopedProjectId, cancellationToken);
+                working, diagnosticId, scopedFileId, scopedProjectIds, cancellationToken);
             if (matches.Count == 0) break;
 
             var (document, diagnostic) = matches[0];
-            var actions = await GetCodeActionsForDiagnosticAsync(document, diagnostic, cancellationToken);
-            // Select the SAME logical fix at every site by its equivalence key (the
-            // key the provider path uses), not the positional index — the fixIndex-th
-            // action at another site can be a different fix. Fall back to the index
-            // only when the chosen fix has no equivalence key.
+            var fixes = await CodeFixesWithProvidersAsync(document, diagnostic, cancellationToken);
+            // Select the SAME logical fix at every site: the chosen provider's fix with the
+            // chosen equivalence key (a menu's one variant included), not the positional
+            // index — the fixIndex-th action at another site can be a different fix. Fall
+            // back to the index only when the chosen fix has no equivalence key.
+            var leaves = fixes
+                .Where(f => f.provider == provider)
+                .SelectMany(f => GetNestedActionsOrEmpty(f.action) is { Length: 1 } single ? single.ToArray() : new[] { f.action })
+                .ToList();
             var action = equivalenceKey != null
-                ? actions.FirstOrDefault(a => a.EquivalenceKey == equivalenceKey)
-                : (fixIndex < actions.Count ? actions[fixIndex] : null);
-            if (action == null) break;
+                ? leaves.FirstOrDefault(a => a.EquivalenceKey == equivalenceKey)
+                : (fixIndex < fixes.Count ? fixes[fixIndex].action : null);
+            if (action == null || !GetNestedActionsOrEmpty(action).IsEmpty) break;
 
             var operations = await action.GetOperationsAsync(cancellationToken);
             var next = operations.OfType<ApplyChangesOperation>().FirstOrDefault()?.ChangedSolution;
@@ -311,33 +353,22 @@ public partial class RoslynService
         return madeProgress ? working : null;
     }
 
-    // Per-modified-document new content, diffed against the live solution.
+    // Per-modified-file new content, prepared exactly as an apply would write it (the
+    // file's line-break style, one entry per file however many documents share it), with
+    // the number of minimal edited spans against the live solution.
     private async Task<List<object>> BuildUpdatedFileContentsAsync(
         Solution newSolution, CancellationToken cancellationToken)
     {
-        var files = new List<object>();
-        foreach (var projectChange in newSolution.GetChanges(_solution!).GetProjectChanges())
-        {
-            foreach (var documentId in projectChange.GetChangedDocuments())
+        var (prepared, _) = await PrepareForApplyAsync(newSolution, cancellationToken);
+        return (await ComputeFileChangesAsync(prepared ?? newSolution, cancellationToken))
+            .Where(f => f.ChangeType == "Modified")
+            .Select(f => (object)new
             {
-                var oldDocument = _solution!.GetDocument(documentId);
-                var newDocument = newSolution.GetDocument(documentId);
-                if (oldDocument == null || newDocument == null) continue;
-
-                var oldText = await oldDocument.GetTextAsync(cancellationToken);
-                var newText = await newDocument.GetTextAsync(cancellationToken);
-                var changeCount = newText.GetTextChanges(oldText).Count;
-                if (changeCount == 0) continue;
-
-                files.Add(new
-                {
-                    filePath = FormatPath(newDocument.FilePath),
-                    changeCount,
-                    updatedContent = newText.ToString()
-                });
-            }
-        }
-        return files;
+                filePath = FormatPath(f.FilePath),
+                changeCount = f.Changes.Count,
+                updatedContent = f.NewText!.ToString()
+            })
+            .ToList();
     }
 
     // Feeds the FixAllContext the diagnostics we already collected, keyed by

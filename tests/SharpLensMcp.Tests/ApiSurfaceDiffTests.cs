@@ -263,43 +263,20 @@ public class ApiSurfaceDiffTests
     }
 
     [Fact]
-    public void ScopeBaselineFiles_EmptyPrefix_ScopesToProjectOwnFilesNotWholeRepo()
+    public void Diff_DuplicateDeclarations_AreComparedOnce_NotACrash()
     {
-        // A project whose .csproj sits at the git root has prefix "". A plain
-        // StartsWith(prefix) scope matches EVERY .cs in the repo, since StartsWith("")
-        // is always true — pulling sibling and test files into this project's baseline.
-        var repoFiles = new[] { "Root.cs", "src/Other.cs", "tests/T.cs", "README.md" };
-        var ownDocs = new[] { "Root.cs" };
+        // Two declarations of one type in one compilation (a duplicated source file) merge
+        // into one type with the same member declared twice — two entries with one
+        // documentation-comment id; the diff compares the key once.
+        var baseline = RoslynService.SnapshotApiSurface(CreateCompilation(
+            "namespace Lib { public class C { public void A() { } public void B() { } } } namespace Lib { public class C { public void A() { } } }"));
+        var current = RoslynService.SnapshotApiSurface(CreateCompilation(
+            "namespace Lib { public class C { public void A() { } } }"));
 
-        var scoped = RoslynService.ScopeBaselineFiles(repoFiles, "", ownDocs, StringComparison.Ordinal);
+        var (breaking, added) = RoslynService.DiffApiSurfaces(baseline, current);
 
-        scoped.Should().Equal(new[] { "Root.cs" },
-            "an empty prefix must scope to the project's own documents, not the whole repo");
-    }
-
-    [Fact]
-    public void ScopeBaselineFiles_NonEmptyPrefix_FiltersByDirectoryPrefix()
-    {
-        var repoFiles = new[] { "src/lib/A.cs", "src/lib/B.cs", "src/other/C.cs", "src/lib/notes.md" };
-
-        var scoped = RoslynService.ScopeBaselineFiles(
-            repoFiles, "src/lib/", Array.Empty<string>(), StringComparison.Ordinal);
-
-        scoped.Should().BeEquivalentTo(new[] { "src/lib/A.cs", "src/lib/B.cs" },
-            "only .cs files under the project's directory prefix belong to its baseline");
-    }
-
-    [Fact]
-    public void ScopeBaselineFiles_EmptyPrefix_OrdinalIgnoreCase_MatchesOwnFilesAcrossCase()
-    {
-        // On a case-insensitive filesystem the project's own document paths can differ in
-        // case from git's tree output; the empty-prefix scope must still match them.
-        var repoFiles = new[] { "Src/Root.cs", "src/Other.cs" };
-        var ownDocs = new[] { "src/root.cs" };
-
-        var scoped = RoslynService.ScopeBaselineFiles(repoFiles, "", ownDocs, StringComparison.OrdinalIgnoreCase);
-
-        scoped.Should().Equal(new[] { "Src/Root.cs" },
-            "OrdinalIgnoreCase matches the project's own file despite the case difference");
+        baseline.Count(e => e.Key == "M:Lib.C.A").Should().Be(2, "the fixture must carry the duplicate key it guards against");
+        breaking.Select(b => $"{b.changeKind}: {b.signature}").Should().Equal("removed: public void Lib.C.B()");
+        added.Should().BeEmpty();
     }
 }

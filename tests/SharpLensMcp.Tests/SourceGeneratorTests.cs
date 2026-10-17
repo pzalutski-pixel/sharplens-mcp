@@ -163,26 +163,24 @@ public class SourceGeneratorTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task CompilationCache_InvalidatedAfterSyncDocuments()
+    public async Task CompilationCache_KeptAfterSyncingAnUnchangedFile()
     {
         var projectId = GetTestProject().Id;
-        _ = await Service.GetProjectCompilationAsync(GetTestProject());
+        var cached = await Service.GetProjectCompilationAsync(GetTestProject());
         Service._compilationCache.ContainsKey(projectId).Should().BeTrue("compilation should have been cached");
-        // Use Write tool semantics: sync_documents with a real file triggers cache clear.
+        // The consumer file on disk equals the loaded text, so the sync changes nothing and
+        // the generator-augmented compilation stays valid. (A sync that does change a file
+        // clears the cache: SyncDocumentsDiskTests.ChangedFile_IsReportedUpdated_WithTheDiskText.)
         var consumerPath = GetConsumerFilePath();
         await Service.SyncDocumentsAsync(new List<string> { consumerPath });
-        Service._compilationCache.ContainsKey(projectId).Should().BeFalse("cache should be cleared after sync_documents when changes applied");
+        Service._compilationCache[projectId].Should().BeSameAs(cached,
+            "a sync that finds no change must not discard the cached compilation");
     }
 
     [Fact]
     public async Task GetTypeOverview_OnFixtureRecord_ClassifiesAsRecord()
     {
-        // The previous version of this test asserted match["typeKind"] == "Record" on
-        // a search_symbols result, but the search_symbols entry shape
-        // doesn't include a typeKind field — only `kind` ("NamedType" for all types).
-        // The `?.Value<string>().Should().Be(...)` chain silently passed because the
-        // null-conditional short-circuits when the field is missing. Switched to
-        // get_type_overview which DOES emit typeKind.
+        // get_type_overview emits the type's kind as typeKind.
         var result = await Service.GetTypeOverviewAsync("FixtureRecord");
         AssertSuccess(result);
         var data = GetData(result);
@@ -194,19 +192,18 @@ public class SourceGeneratorTests : RoslynServiceTestBase
     }
 
     [Fact]
-    public async Task SearchSymbols_FindsFixtureRecord_AsNamedTypeWithRecordContainingTypeShape()
+    public async Task SearchSymbols_FindsFixtureRecord_LabeledRecord()
     {
         // Companion to the GetTypeOverview test above: confirms search_symbols ITSELF
-        // can find a record by simple name. The search entry's `kind` is "NamedType"
-        // (the symbol kind, not the type kind) — distinguishing Record vs Class
-        // requires a follow-up get_type_overview call (locked above).
+        // can find a record by simple name, labeled with the type kind (Record) its kind
+        // filter accepts.
         var searchResult = await Service.SearchSymbolsAsync("FixtureRecord", kind: null, maxResults: 10);
         AssertSuccess(searchResult);
         var results = GetData(searchResult)["results"] as JArray;
         results.Should().NotBeNullOrEmpty();
-        var match = results!.FirstOrDefault(r => r["name"]?.Value<string>() == "FixtureRecord");
+        var match = results!.FirstOrDefault(r => r["fullyQualifiedName"]!.Value<string>() == "SharpLensMcp.Tests.Fixtures.FixtureRecord");
         match.Should().NotBeNull("FixtureRecord must be locatable by simple name");
         match!["kind"].Should().NotBeNull();
-        match["kind"]!.Value<string>().Should().Be("NamedType", "search_symbols reports the symbol Kind ('NamedType' for any type), not typeKind");
+        match["kind"]!.Value<string>().Should().Be("Record", "search_symbols labels a type by its kind, a positional record as Record");
     }
 }

@@ -1,20 +1,25 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Text;
+using Microsoft.CodeAnalysis.Operations;
 
 namespace SharpLensMcp;
 
-// Fine-grained usage searches over one shared scanner: where a type is
-// constructed (find_type_instantiations), pattern-matched (find_pattern_usages),
-// thrown (find_throw_sites), and caught (find_catch_blocks). Each tool supplies
-// a node matcher; the scanner walks every source tree of every project's base
-// compilation (source only — no generated trees, no metadata) and reports
-// {location, lineText, kind}. Type identity is compared across compilations via
-// CrossCompilationSymbol.TypeKey, with an includeDerived option for the
-// throw/catch pair.
+// Fine-grained usage searches over one shared scanner: where a type is constructed
+// (find_type_instantiations), pattern-matched (find_pattern_usages), thrown
+// (find_throw_sites), and caught (find_catch_blocks). Each tool supplies a node matcher;
+// the scanner walks the solution's own documents (no generated trees, no metadata) in
+// every project, a multi-targeted project's shared files once per target framework so
+// #if branches are all seen, and reports each site once as {location, lineText, kind}, in
+// canonical location order before the cap. Types are compared by the solution's
+// cross-compilation identity (CrossCompilationSymbolComparer over OriginalDefinitions),
+// so a type bound in another project's compilation matches and two same-named types of
+// different assemblies do not; includeDerived extends the throw/catch pair to derived
+// types. The target type's shadow notice is reported as data.notice.
 public partial class RoslynService
 {
+    private const int MaxTypeUsageResults = 1000;
+
     public Task<object> FindTypeInstantiationsAsync(
         string typeName, int maxResults = 100, CancellationToken cancellationToken = default) =>
         ScanTypeUsagesAsync(typeName, includeDerived: false, maxResults, MatchInstantiation, cancellationToken);
@@ -33,24 +38,20 @@ public partial class RoslynService
         CancellationToken cancellationToken = default) =>
         ScanTypeUsagesAsync(typeName, includeDerived, maxResults, MatchCatch, cancellationToken);
 
+    // A matcher's verdict on a node: the kind of usage and the node to report it at.
+    private delegate (string kind, SyntaxNode site)? UsageMatcher(
+        SyntaxNode node, SemanticModel model, INamedTypeSymbol target, bool includeDerived, CancellationToken ct);
+
     private async Task<object> ScanTypeUsagesAsync(
-        string typeName, bool includeDerived, int maxResults,
-        Func<SyntaxNode, SemanticModel, INamedTypeSymbol, bool, CancellationToken, string?> matcher,
-        CancellationToken cancellationToken)
+        string typeName, bool includeDerived, int maxResults, UsageMatcher matcher, CancellationToken cancellationToken)
     {
         EnsureSolutionLoaded();
 
-        if (maxResults is < 1 or > 1000)
-        {
-            return CreateErrorResponse(
-                ErrorCodes.InvalidParameter,
-                $"maxResults must be between 1 and 1000 (got {maxResults})",
-                context: new { maxResults });
-        }
+        if (ParameterValidation.Limit("maxResults", maxResults, MaxTypeUsageResults) is { } invalid) return CreateErrorResponse(invalid);
 
-        var (target, ambiguousType) = await FindTypeByNameAsync(typeName, cancellationToken);
-        if (ambiguousType != null) return ambiguousType;
-        if (target == null)
+        var resolution = await ResolveTypeByNameAsync(typeName, cancellationToken);
+        if (resolution.Error != null) return resolution.Error;
+        if (resolution.Type is not { } target)
         {
             return CreateErrorResponse(
                 ErrorCodes.TypeNotFound,
@@ -59,181 +60,170 @@ public partial class RoslynService
                 context: new { typeName });
         }
 
-        var matches = new List<object>();
-        var totalFound = 0;
-        // A multi-targeted project appears once per TFM, each compiling the same
-        // shared source files; dedup hits by physical path + span so they are not
-        // counted once per target framework.
-        var seen = new HashSet<(string path, int start, int length)>();
+        var found = new List<(ResultLocation location, string lineText, string kind)>();
+        // A multi-targeted project compiles each shared file once per target framework;
+        // a site is one result whichever compilation reported it.
+        var seen = new HashSet<SourceSpanKey>();
 
-        foreach (var project in _solution!.Projects)
+        foreach (var project in GetLogicalProjects().Projects.SelectMany(p => p.Projects))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            // Base compilation: its syntax trees are exactly this project's own
-            // source documents — no generated trees, no referenced assemblies.
-            var compilation = await project.GetCompilationAsync(cancellationToken);
+            var compilation = await GetProjectCompilationAsync(project, cancellationToken);
             if (compilation == null) continue;
 
             foreach (var tree in compilation.SyntaxTrees)
             {
+                if (!IsSolutionSourceTree(tree)) continue;
                 var semanticModel = compilation.GetSemanticModel(tree);
                 var root = await tree.GetRootAsync(cancellationToken);
-                SourceText? text = null;
 
                 foreach (var node in root.DescendantNodes())
                 {
-                    var kind = matcher(node, semanticModel, target, includeDerived, cancellationToken);
-                    if (kind == null) continue;
+                    if (matcher(node, semanticModel, target, includeDerived, cancellationToken) is not { } match) continue;
+                    if (!seen.Add(new SourceSpanKey(tree.FilePath, match.site.Span))) continue;
 
-                    if (!seen.Add((tree.FilePath ?? string.Empty, node.Span.Start, node.Span.Length))) continue;
-
-                    totalFound++;
-                    if (matches.Count >= maxResults) continue;
-
-                    var lineSpan = node.GetLocation().GetLineSpan();
-                    text ??= tree.GetText(cancellationToken);
-                    matches.Add(new
-                    {
-                        location = new
-                        {
-                            filePath = FormatPath(lineSpan.Path),
-                            line = lineSpan.StartLinePosition.Line,
-                            column = lineSpan.StartLinePosition.Character
-                        },
-                        lineText = text.Lines[lineSpan.StartLinePosition.Line].ToString().Trim(),
-                        kind
-                    });
+                    var lineSpan = match.site.GetLocation().GetLineSpan();
+                    found.Add((
+                        new ResultLocation(FormatPath(lineSpan.Path), lineSpan.StartLinePosition.Line, lineSpan.StartLinePosition.Character),
+                        tree.GetText(cancellationToken).Lines[lineSpan.StartLinePosition.Line].ToString().Trim(),
+                        match.kind));
                 }
             }
         }
+
+        var ordered = CanonicalOrder.ByLocation(found, f => f.location);
+        var matches = ordered.Take(maxResults).Select(f => new
+        {
+            location = new
+            {
+                filePath = f.location.FilePath,
+                line = f.location.Line,
+                column = f.location.Column
+            },
+            lineText = f.lineText,
+            kind = f.kind
+        }).ToList();
 
         return CreateSuccessResponse(
             data: new
             {
                 typeName = target.ToDisplayString(),
                 includeDerived,
-                matches
+                matches,
+                notice = resolution.ShadowNotice
             },
-            suggestedNextTools: new[] { "get_method_source on a result's containing method for full context" },
-            totalCount: totalFound,
-            returnedCount: matches.Count);
+            ResultCounts.Capped(ordered.Count, matches.Count),
+            suggestedNextTools: new[] { "get_method_source on a result's containing method for full context" });
     }
 
-    private static string? MatchInstantiation(
+    private static (string kind, SyntaxNode site)? MatchInstantiation(
         SyntaxNode node, SemanticModel model, INamedTypeSymbol target, bool includeDerived, CancellationToken ct) =>
-        node switch
-        {
-            ObjectCreationExpressionSyntax oc when TypeMatches(model.GetTypeInfo(oc, ct).Type, target, false)
-                => "objectCreation",
-            ImplicitObjectCreationExpressionSyntax ioc when TypeMatches(model.GetTypeInfo(ioc, ct).Type, target, false)
-                => "objectCreation",
-            _ => null
-        };
+        node is BaseObjectCreationExpressionSyntax creation
+        && TypeMatches(model.GetTypeInfo(creation, ct).Type, target, includeDerived: false)
+            ? ("objectCreation", creation)
+            : null;
 
-    // Matches patterns that name a TYPE (`is T`, `as T`, declaration/type/recursive
-    // patterns whose type token is the target) AND type-LESS recursive/property
-    // patterns (a bare `{ Prop: ... }` with no type token): those are attributed to
-    // the type of the expression they match — the `is`/switch input at the top level,
-    // or the member's type when nested in a property subpattern (see PatternInputType).
-    // Positional deconstruction elements are not resolved.
-    private static string? MatchPattern(
-        SyntaxNode node, SemanticModel model, INamedTypeSymbol target, bool includeDerived, CancellationToken ct) =>
-        node switch
-        {
-            BinaryExpressionSyntax be when be.IsKind(SyntaxKind.IsExpression)
-                && TypeMatches(model.GetTypeInfo(be.Right, ct).Type, target, false) => "isExpression",
-            BinaryExpressionSyntax be when be.IsKind(SyntaxKind.AsExpression)
-                && TypeMatches(model.GetTypeInfo(be.Right, ct).Type, target, false) => "asExpression",
-            DeclarationPatternSyntax dp when TypeMatches(model.GetTypeInfo(dp.Type, ct).Type, target, false)
-                => "declarationPattern",
-            TypePatternSyntax tp when TypeMatches(model.GetTypeInfo(tp.Type, ct).Type, target, false)
-                => "typePattern",
-            // A bare type in pattern position (e.g. a switch arm `T => ...`) can
-            // parse as a constant pattern whose expression binds to the type.
-            ConstantPatternSyntax cp when model.GetSymbolInfo(cp.Expression, ct).Symbol is ITypeSymbol constantType
-                && TypeMatches(constantType, target, false) => "typePattern",
-            RecursivePatternSyntax { Type: { } recursiveType } when TypeMatches(model.GetTypeInfo(recursiveType, ct).Type, target, false)
-                => "recursivePattern",
-            // A type-less recursive/positional/property pattern (`order is { Total: … }`,
-            // `p is (var x, var y)`) carries no type of its own; it matches against the
-            // type of the expression being matched, so resolve that input's type.
-            RecursivePatternSyntax { Type: null } rp when PatternInputType(rp, model, ct) is { } inputType
-                && TypeMatches(inputType, target, false) => "recursivePattern",
-            _ => null
-        };
-
-    // The type a pattern is matched against: the `is` operand, the switch-expression
-    // governing expression, or the switch-statement expression. Used to attribute a
-    // type-less pattern to the type whose shape it inspects.
-    private static ITypeSymbol? PatternInputType(
-        PatternSyntax pattern, SemanticModel model, CancellationToken ct) => pattern.Parent switch
-    {
-        IsPatternExpressionSyntax ip when ip.Pattern == pattern
-            => model.GetTypeInfo(ip.Expression, ct).Type,
-        SwitchExpressionArmSyntax arm when arm.Pattern == pattern && arm.Parent is SwitchExpressionSyntax se
-            => model.GetTypeInfo(se.GoverningExpression, ct).Type,
-        CasePatternSwitchLabelSyntax label when label.Pattern == pattern
-            => label.FirstAncestorOrSelf<SwitchStatementSyntax>() is { } sw
-                ? model.GetTypeInfo(sw.Expression, ct).Type
-                : null,
-        // A pattern nested in a property subpattern (`{ Member: <pattern> }`) matches
-        // against the member's type; the subpattern's name binds to that member.
-        SubpatternSyntax { NameColon.Name: { } memberName }
-            => model.GetSymbolInfo(memberName, ct).Symbol switch
-            {
-                IPropertySymbol prop => prop.Type,
-                IFieldSymbol field => field.Type,
-                _ => null
-            },
-        _ => null
-    };
-
-    private static string? MatchThrow(
-        SyntaxNode node, SemanticModel model, INamedTypeSymbol target, bool includeDerived, CancellationToken ct) =>
-        node switch
-        {
-            ThrowStatementSyntax { Expression: { } thrown } when TypeMatches(model.GetTypeInfo(thrown, ct).Type, target, includeDerived)
-                => "throw",
-            ThrowExpressionSyntax te when TypeMatches(model.GetTypeInfo(te.Expression, ct).Type, target, includeDerived)
-                => "throw",
-            _ => null
-        };
-
-    // Catch semantics are the inverse of throw: a `catch (C)` catches the
-    // target T when C IS T or C is a BASE of T. So with includeDerived we test
-    // whether the TARGET derives from the caught type, not the other way round.
-    private static string? MatchCatch(
+    // Matches the type tests and patterns the bound tree resolves to the target type:
+    // `is T` (isExpression), `as T` (asExpression), and every declaration, type and
+    // recursive pattern whose matched type is the target — at the top of an is/switch, in
+    // a `case T:` label, under not/and/or/parentheses, as a list-pattern element, or nested
+    // in a property subpattern. A type-less recursive pattern (`{ Total: > 5 }`) matches
+    // against its input's type, which the bound pattern carries. A pattern the compiler
+    // implies (the nested pattern of an extended property pattern `{ A.B: 3 }`) is not one
+    // the code spells, and is not reported.
+    private static (string kind, SyntaxNode site)? MatchPattern(
         SyntaxNode node, SemanticModel model, INamedTypeSymbol target, bool includeDerived, CancellationToken ct)
     {
-        if (node is not CatchClauseSyntax { Declaration.Type: { } caughtTypeSyntax }) return null;
+        switch (node)
+        {
+            case BinaryExpressionSyntax binary when binary.IsKind(SyntaxKind.IsExpression):
+                return model.GetOperation(binary, ct) is IIsTypeOperation isType && TypeMatches(isType.TypeOperand, target, false)
+                    ? ("isExpression", binary)
+                    : null;
+            case BinaryExpressionSyntax binary when binary.IsKind(SyntaxKind.AsExpression):
+                return model.GetOperation(binary, ct) is IConversionOperation { IsTryCast: true } tryCast
+                       && TypeMatches(tryCast.Type, target, false)
+                    ? ("asExpression", binary)
+                    : null;
+            // `case T:` spells a type pattern with an expression; the bound pattern is
+            // marked implicit, but the code names it.
+            case CaseSwitchLabelSyntax label:
+                return model.GetOperation(label, ct) is IPatternCaseClauseOperation { Pattern: { } labelPattern }
+                    ? MatchPatternOperation(labelPattern, target)
+                    : null;
+            case PatternSyntax pattern:
+                return model.GetOperation(pattern, ct) is IPatternOperation { IsImplicit: false } operation && operation.Syntax == pattern
+                    ? MatchPatternOperation(operation, target)
+                    : null;
+            default:
+                return null;
+        }
+    }
+
+    private static (string kind, SyntaxNode site)? MatchPatternOperation(IPatternOperation pattern, INamedTypeSymbol target)
+    {
+        var (kind, matched) = pattern switch
+        {
+            IDeclarationPatternOperation declaration => ("declarationPattern", declaration.MatchedType),
+            ITypePatternOperation type => ("typePattern", type.MatchedType),
+            IRecursivePatternOperation recursive => ("recursivePattern", recursive.MatchedType),
+            _ => (null, null)
+        };
+        return kind != null && TypeMatches(matched, target, false) ? (kind, pattern.Syntax) : null;
+    }
+
+    private static (string kind, SyntaxNode site)? MatchThrow(
+        SyntaxNode node, SemanticModel model, INamedTypeSymbol target, bool includeDerived, CancellationToken ct)
+    {
+        var thrown = node switch
+        {
+            ThrowStatementSyntax { Expression: { } expression } => expression,
+            ThrowExpressionSyntax throwExpression => throwExpression.Expression,
+            _ => null
+        };
+        return thrown != null && TypeMatches(model.GetTypeInfo(thrown, ct).Type, target, includeDerived)
+            ? ("throw", node)
+            : null;
+    }
+
+    // Catch semantics are the inverse of throw: a `catch (C)` catches the target T when C
+    // IS T or C is a BASE of T, so with includeDerived the TARGET is tested for deriving
+    // from the caught type. A catch with no exception type (`catch { }`) catches every
+    // exception — a base of every T — and is reported as catchAll with includeDerived.
+    private static (string kind, SyntaxNode site)? MatchCatch(
+        SyntaxNode node, SemanticModel model, INamedTypeSymbol target, bool includeDerived, CancellationToken ct)
+    {
+        if (node is not CatchClauseSyntax catchClause) return null;
+        if (catchClause.Declaration is not { Type: { } caughtTypeSyntax })
+        {
+            return includeDerived ? ("catchAll", catchClause) : null;
+        }
         var caught = model.GetTypeInfo(caughtTypeSyntax, ct).Type;
         if (caught == null) return null;
-
-        var caughtName = CrossCompilationSymbol.TypeKey(caught);
-        if (CrossCompilationSymbol.TypeKey(target) == caughtName) return "catch";
+        if (SameDefinition(target, caught)) return ("catch", catchClause);
         if (!includeDerived) return null;
-
         for (var baseType = target.BaseType; baseType != null; baseType = baseType.BaseType)
         {
-            if (CrossCompilationSymbol.TypeKey(baseType) == caughtName) return "catch";
+            if (SameDefinition(baseType, caught)) return ("catch", catchClause);
         }
         return null;
     }
 
-    // Cross-compilation type identity via CrossCompilationSymbol.TypeKey; with
-    // includeDerived, also matches when the candidate derives from (or implements)
-    // the target.
+    // Whether a candidate type is the target (with includeDerived, also a type that derives
+    // from or implements it), by cross-compilation identity of their definitions.
     private static bool TypeMatches(ITypeSymbol? candidate, INamedTypeSymbol target, bool includeDerived)
     {
         if (candidate == null) return false;
-        var targetName = CrossCompilationSymbol.TypeKey(target);
-        if (CrossCompilationSymbol.TypeKey(candidate) == targetName) return true;
+        if (SameDefinition(candidate, target)) return true;
         if (!includeDerived) return false;
 
         for (var baseType = candidate.BaseType; baseType != null; baseType = baseType.BaseType)
         {
-            if (CrossCompilationSymbol.TypeKey(baseType) == targetName) return true;
+            if (SameDefinition(baseType, target)) return true;
         }
-        return candidate.AllInterfaces.Any(i => CrossCompilationSymbol.TypeKey(i) == targetName);
+        return candidate.AllInterfaces.Any(i => SameDefinition(i, target));
     }
+
+    private static bool SameDefinition(ITypeSymbol x, ITypeSymbol y) =>
+        CrossCompilationSymbolComparer.Instance.Equals(x.OriginalDefinition, y.OriginalDefinition);
 }

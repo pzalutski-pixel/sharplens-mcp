@@ -66,7 +66,7 @@ public class Widget
         var data = JObject.FromObject(result)["data"]!;
         var names = (data["methods"] as JArray)!.Select(m => m["name"]!.Value<string>()).ToList();
 
-        names.Should().Contain(".ctor", "the constructor must appear in file-scope metrics");
+        names.Should().Contain("Widget", "the constructor, named by its type, must appear in file-scope metrics");
         names.Should().Contain("Value.get", "the property getter must appear in file-scope metrics");
 
         // Cursor scope on the same getter must name it identically to file scope.

@@ -108,37 +108,34 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     }
 
     [Fact]
-    public async Task SyncDocuments_AllDocuments_ReportsTotalAsSumOfBuckets()
+    public async Task SyncDocuments_AllDocuments_OverAnInSyncSolution_ChangesNothing()
     {
         var data = await CallAndGetDataAsync("sync_documents", new
         {
             filePaths = (string[]?)null
         });
-        var updated = data["updated"]!.Value<int>();
-        var added = data["added"]!.Value<int>();
-        var removed = data["removed"]!.Value<int>();
-        var total = data["totalSynced"]!.Value<int>();
-        total.Should().Be(updated + added + removed,
-            "totalSynced is defined as the sum of the three buckets");
-        total.Should().BeGreaterThan(0,
-            "the solution has many .cs files; syncing all must surface at least one");
+        // Every document matches disk and every compile item is already loaded.
+        data["updated"]!.Value<int>().Should().Be(0);
+        data["added"]!.Value<int>().Should().Be(0);
+        data["removed"]!.Value<int>().Should().Be(0);
+        data["totalSynced"]!.Value<int>().Should().Be(0);
+        data["unchanged"]!.Value<int>().Should().BeGreaterThan(50,
+            "every one of the solution's document paths is checked and found unchanged");
     }
 
     [Fact]
-    public async Task SyncDocuments_SpecificFile_UpdatesExactlyThatFile()
+    public async Task SyncDocuments_SpecificUnchangedFile_ReportsItUnchanged()
     {
         var data = await CallAndGetDataAsync("sync_documents", new
         {
             filePaths = new[] { Fixture.RoslynServicePath }
         });
-        data["totalSynced"]!.Value<int>().Should().Be(1, "exactly one file was requested");
-        data["updated"]!.Value<int>().Should().Be(1, "the file already exists on disk and in the solution");
+        data["unchanged"]!.Value<int>().Should().Be(1, "the file on disk equals the loaded text");
+        data["totalSynced"]!.Value<int>().Should().Be(0);
+        data["updated"]!.Value<int>().Should().Be(0);
         data["added"]!.Value<int>().Should().Be(0);
         data["removed"]!.Value<int>().Should().Be(0);
-
-        var updatedFiles = (data["updatedFiles"] as JArray)!;
-        updatedFiles.Count.Should().Be(1);
-        updatedFiles[0]!.Value<string>()!.Should().EndWith("RoslynService.cs");
+        ((JArray)data["updatedFiles"]!).Should().BeEmpty();
     }
 
     [Fact]
@@ -170,18 +167,16 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
     public async Task DependencyGraph_Json_ReportsKnownDependencies()
     {
         var data = await CallAndGetDataAsync("dependency_graph", new { });
-        // JSON form: dependencies (per-project map),
-        // hasCycles, cycles.
+        // JSON form: nodes, edges (by node id), hasCycles, cycles.
         data["hasCycles"]!.Value<bool>().Should().BeFalse(
             "the SharpLens solution has no project cycles");
         var cycles = (data["cycles"] as JArray)!;
         cycles.Count.Should().Be(0);
 
-        var deps = (data["dependencies"] as JObject)!;
-        var testDeps = (deps["SharpLensMcp.Tests"] as JArray)!;
-        testDeps.Should().NotBeNull("SharpLensMcp.Tests must appear in the dependency map");
-        testDeps.Select(t => t.Value<string>()).Should().Contain("SharpLensMcp",
-            "the test project references the main project");
+        var nameById = ((JArray)data["nodes"]!).ToDictionary(n => n["id"]!.Value<string>()!, n => n["name"]!.Value<string>()!);
+        ((JArray)data["edges"]!)
+            .Select(e => $"{nameById[e["from"]!.Value<string>()!]}>{nameById[e["to"]!.Value<string>()!]}")
+            .Should().Contain("SharpLensMcp.Tests>SharpLensMcp", "the test project references the main project");
     }
 
     [Fact]
@@ -196,10 +191,12 @@ public class InfrastructureToolsViaMcpTests : McpTestBase
 
         var graph = data["graph"]!.Value<string>()!;
         graph.Should().StartWith("graph TD");
-        graph.Should().Contain("SharpLensMcp",
+        graph.Should().Contain("  SharpLensMcp[\"SharpLensMcp\"]",
             "the main project must appear in the rendered graph");
-        graph.Should().Contain("SharpLensMcp.Tests",
-            "the test project must appear in the rendered graph");
+        graph.Should().Contain("  SharpLensMcp_Tests[\"SharpLensMcp.Tests\"]",
+            "the test project must appear in the rendered graph with a Mermaid-valid id");
+        graph.Should().Contain("  SharpLensMcp_Tests --> SharpLensMcp",
+            "the test project references the main project");
     }
 
     [Fact]

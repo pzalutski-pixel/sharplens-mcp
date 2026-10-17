@@ -3,12 +3,15 @@ using Microsoft.CodeAnalysis;
 namespace SharpLensMcp;
 
 // get_documentation: a symbol's full XML documentation with <inheritdoc>
-// resolved recursively — today every other tool returns the tag verbatim.
+// resolved recursively — every other tool returns the tag verbatim.
 // A member-level <inheritdoc> (bare or cref) is expanded element-by-element:
 // inherited content fills sections the local doc omits. A cref points at the
 // referenced symbol; a bare tag points at the overridden member, the
 // explicitly implemented interface member, or the implicitly satisfied
-// interface member (and, for a type, its base type or first interface).
+// interface member; for a constructor, the base class constructor with the same
+// parameter types; for a type, its base type or first interface. Inherited
+// <param>/<typeparam> entries document the parameters at the same positions, so
+// they are reported under the inheriting symbol's own parameter names.
 public partial class RoslynService
 {
     public async Task<object> GetDocumentationAsync(
@@ -17,9 +20,8 @@ public partial class RoslynService
     {
         EnsureSolutionLoaded();
 
-        var (symbol, symbolError) = await ResolveSymbolByNameAsync(
-            typeName, memberName, overloadIndex, cancellationToken);
-        if (symbol == null) return symbolError!;
+        var resolution = await ResolveMemberByNameAsync(typeName, memberName, overloadIndex, cancellationToken);
+        if (resolution.Symbol is not { } symbol) return resolution.Error!;
 
         var compilation = await FindCompilationForSymbolAsync(symbol, cancellationToken);
         if (compilation == null)
@@ -40,7 +42,8 @@ public partial class RoslynService
                 symbol = symbol.ToDisplayString(),
                 documentation = StructuredDocsToWire(docs),
                 inheritedFrom,
-                unresolved
+                unresolved,
+                notice = resolution.Type?.ShadowNotice
             },
             suggestedNextTools: new[]
             {
@@ -80,14 +83,55 @@ public partial class RoslynService
         // itself inherited, follow through to that origin rather than stopping at the
         // first hop.
         var origin = deeperInheritedFrom ?? target.ToDisplayString();
-        return (local.MergeInherited(inherited), origin, deeperUnresolved);
+        return (local.MergeInherited(RenameInheritedEntries(inherited, target, symbol)), origin, deeperUnresolved);
     }
 
+    // The inherited entries named for the inheriting symbol: a <param>/<typeparam> of the
+    // source's parameter at position i documents the inheriting symbol's parameter at
+    // position i. An entry naming none of the source's parameters keeps its name; one
+    // whose position the inheriting symbol does not have documents nothing of it.
+    private static StructuredDocs RenameInheritedEntries(StructuredDocs inherited, ISymbol source, ISymbol inheriting) =>
+        inherited with
+        {
+            Params = RenameByPosition(inherited.Params, ParameterNames(source), ParameterNames(inheriting)),
+            TypeParams = RenameByPosition(inherited.TypeParams, TypeParameterNames(source), TypeParameterNames(inheriting))
+        };
+
+    private static IReadOnlyList<DocEntry> RenameByPosition(
+        IReadOnlyList<DocEntry> entries, IReadOnlyList<string> sourceNames, IReadOnlyList<string> inheritingNames)
+    {
+        var renamed = new List<DocEntry>();
+        foreach (var entry in entries)
+        {
+            var position = sourceNames.ToList().IndexOf(entry.Name);
+            if (position < 0) renamed.Add(entry);
+            else if (position < inheritingNames.Count) renamed.Add(entry with { Name = inheritingNames[position] });
+        }
+        return renamed;
+    }
+
+    private static IReadOnlyList<string> ParameterNames(ISymbol symbol) => symbol switch
+    {
+        IMethodSymbol method => method.Parameters.Select(p => p.Name).ToList(),
+        IPropertySymbol property => property.Parameters.Select(p => p.Name).ToList(),
+        INamedTypeSymbol { DelegateInvokeMethod: { } invoke } => invoke.Parameters.Select(p => p.Name).ToList(),
+        _ => Array.Empty<string>()
+    };
+
+    private static IReadOnlyList<string> TypeParameterNames(ISymbol symbol) => symbol switch
+    {
+        IMethodSymbol method => method.TypeParameters.Select(t => t.Name).ToList(),
+        INamedTypeSymbol type => type.TypeParameters.Select(t => t.Name).ToList(),
+        _ => Array.Empty<string>()
+    };
+
     // The symbol a bare <inheritdoc/> inherits from: the overridden member, the
-    // explicitly implemented interface member, or the implicitly satisfied one;
-    // for a type, its non-Object base or first interface.
+    // explicitly implemented interface member, or the implicitly satisfied one; for a
+    // constructor, the base class constructor with the same parameter types; for a type,
+    // its non-Object base or first interface.
     private static ISymbol? FindInheritedDocSource(ISymbol symbol) => symbol switch
     {
+        IMethodSymbol { MethodKind: MethodKind.Constructor } constructor => MatchingBaseConstructor(constructor),
         IMethodSymbol method => method.OverriddenMethod
             ?? method.ExplicitInterfaceImplementations.FirstOrDefault()
             ?? FindImplicitInterfaceMember(method),
@@ -102,6 +146,14 @@ public partial class RoslynService
             : type.Interfaces.FirstOrDefault(),
         _ => null
     };
+
+    // The base class's constructor with the same parameter types and ref kinds.
+    private static IMethodSymbol? MatchingBaseConstructor(IMethodSymbol constructor) =>
+        constructor.ContainingType.BaseType?.InstanceConstructors.FirstOrDefault(candidate =>
+            candidate.Parameters.Length == constructor.Parameters.Length
+            && candidate.Parameters.Zip(constructor.Parameters).All(pair =>
+                pair.First.RefKind == pair.Second.RefKind
+                && SymbolEqualityComparer.Default.Equals(pair.First.Type, pair.Second.Type)));
 
     // The interface member this symbol implicitly implements, if any: walk the
     // containing type's interfaces and match each member's implementation.
@@ -125,9 +177,10 @@ public partial class RoslynService
         return null;
     }
 
-    // The compilation in which to resolve crefs: the one owning the symbol's
-    // source (exact for source symbols); for metadata symbols any compilation
-    // referencing the assembly suffices, so fall back to the first project's.
+    // The compilation in which to resolve crefs: the one owning the symbol's source
+    // (exact for source symbols); for a metadata symbol, the first project in
+    // logical-project order whose compilation references its assembly — a project that
+    // does not reference it cannot resolve the assembly's crefs.
     private async Task<Compilation?> FindCompilationForSymbolAsync(
         ISymbol symbol, CancellationToken cancellationToken)
     {
@@ -141,8 +194,22 @@ public partial class RoslynService
             }
         }
 
-        var firstProject = _solution!.Projects.FirstOrDefault();
-        return firstProject == null ? null : await firstProject.GetCompilationAsync(cancellationToken);
+        var assembly = symbol.ContainingAssembly;
+        if (assembly == null) return null;
+        foreach (var project in GetLogicalProjects().Projects.SelectMany(p => p.Projects))
+        {
+            var compilation = await project.GetCompilationAsync(cancellationToken);
+            if (compilation == null) continue;
+            if (SymbolEqualityComparer.Default.Equals(compilation.Assembly, assembly)) return compilation;
+            if (compilation.References
+                .Select(compilation.GetAssemblyOrModuleSymbol)
+                .OfType<IAssemblySymbol>()
+                .Any(referenced => referenced.Identity.Equals(assembly.Identity)))
+            {
+                return compilation;
+            }
+        }
+        return null;
     }
 
     internal static object? StructuredDocsToWireOrNull(StructuredDocs docs) =>

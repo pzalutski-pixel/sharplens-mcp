@@ -199,8 +199,8 @@ public class ChangeSignatureTests : IAsyncLifetime
         json["success"].Should().NotBeNull();
         json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
         json["data"]!["callSitesUpdated"].Should().NotBeNull();
-        json["data"]!["callSitesUpdated"]!.Value<int>().Should().Be(5,
-            "every call site must be visited so named-arg labels can be re-written");
+        json["data"]!["callSitesUpdated"]!.Value<int>().Should().Be(2,
+            "exactly the two calls that name `first:` change; the positional calls are untouched");
         json["data"]!["newSignature"].Should().NotBeNull();
         json["data"]!["newSignature"]!.Value<string>().Should().Contain("int primary",
             "renamed parameter must appear in the new signature");
@@ -237,8 +237,9 @@ public class ChangeSignatureTests : IAsyncLifetime
         json["success"].Should().NotBeNull();
         json["success"]!.Value<bool>().Should().BeTrue(json.ToString());
         json["data"]!["callSitesUpdated"].Should().NotBeNull();
-        json["data"]!["callSitesUpdated"]!.Value<int>().Should().Be(5);
-        var newSig = json["data"]!["newSignature"]?.Value<string>();
+        json["data"]!["callSitesUpdated"]!.Value<int>().Should().Be(3,
+            "the three positional calls are reordered; the two all-named calls bind by name and stay as written");
+        var newSig = json["data"]!["newSignature"]!.Value<string>();
         // Parameter order in the signature must reflect the requested permutation.
         var thirdIdx = newSig!.IndexOf("int third");
         var firstIdx = newSig.IndexOf("int first");
@@ -478,6 +479,7 @@ public class ChangeSignatureTests : IAsyncLifetime
         json["success"]!.Value<bool>().Should().BeFalse(
             "an out-of-range add Position must be rejected, not silently appended");
         json["error"]!["Code"]!.Value<string>().Should().Be(ErrorCodes.InvalidParameter);
-        json["error"]!["Message"]!.Value<string>().Should().Contain("out of range");
+        json["error"]!["Message"]!.Value<string>().Should().Be(
+            "changes[0].position must be -1 (the end) or between 0 and 3 (got 99)");
     }
 }

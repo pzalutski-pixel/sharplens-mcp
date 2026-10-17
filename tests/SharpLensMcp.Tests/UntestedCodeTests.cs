@@ -28,12 +28,12 @@ public class UntestedCodeTests : RoslynServiceTestBase
         data["productionProject"]!.Value<string>().Should().Be("SharpLensMcp.Tests",
             "the impl must pick the project requested by projectName");
         data["testMethodCount"]!.Value<int>().Should().BeGreaterThan(0,
-            "the test project has many [Fact] methods — IsTestMethod must match at least one");
+            "the test project has many [Fact] methods — test detection must match at least one");
         data["reachableSymbolCount"]!.Value<int>().Should().BeGreaterThan(
             data["testMethodCount"]!.Value<int>(),
             "BFS-from-tests must reach AT LEAST one production symbol beyond the test methods themselves (CoveredByTest etc.)");
 
-        // testProjectsScanned tracks every project where IsTestMethod found a hit
+        // testProjectsScanned tracks every project where an entry point was found.
         // The fixture's [Fact] methods live in SharpLensMcp.Tests,
         // so the set must include that name.
         var scanned = (data["testProjectsScanned"] as JArray)!;
@@ -61,7 +61,7 @@ public class UntestedCodeTests : RoslynServiceTestBase
         names.Should().NotContain(n => n.Contains("CoverageTarget.ChainedFromTest"),
             "ChainedFromTest is the entry called by ChainedFromTest_Test");
 
-        // Test methods themselves must NOT appear (the impl filters IsTestMethod).
+        // Test methods themselves must NOT appear (they are walk roots, so always reached).
         names.Should().NotContain(n => n.Contains("CoverageTargetTests.CoveredByTest_Test"),
             "test methods are excluded from the production-surface uncovered list");
         names.Should().NotContain(n => n.Contains("CoverageTargetTests.ChainedFromTest_Test"),
