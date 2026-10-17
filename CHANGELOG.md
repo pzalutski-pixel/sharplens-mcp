@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.6.4] - 2026-10-17
+
+### Added
+- Multi-targeted projects are one project. A project built for several target frameworks is reported once by every tool, with a `targetFrameworks` list where a result exists only under some of them; `projectName` accepts the plain name (`Multi`) for all frameworks or a framework-qualified name (`Multi(net8.0)`) for one. Diagnostics and post-apply error checks cover every framework.
+- `find_tests` entries carry `kind` (`test`, `stepBinding`, `hook`) and a `dispatchOnlyTests` list; `find_untested_code` reports `entryPointCounts` and labels members reached only through interface or virtual dispatch instead of counting them as tested.
+- By-name tools return `notice` when a simple type name resolved to a solution type that shadows a framework type of the same name.
+- Call tools mark each edge with `kind` and `viaDispatch`.
+- `load_solution` and `health_check` report `loadWarnings`; `health_check` adds `lastLoadFailure` and the effective configuration. `.slnf` solution filters load.
+- Apply tools refuse to overwrite a file that changed on disk since it was read (`STALE_DOCUMENT`), and the MCP `ping` request is answered.
+
+### Changed
+- One call model behind `get_outgoing_calls`, `get_call_graph`, `find_callers`, `find_path_between`, `get_exception_flow`, `analyze_method` and the coverage tools: extension calls, constructors and initializers, accessors, indexers, operators, conversions, partial implementations, lambdas and local functions are all followed, and interface/virtual calls reach the implementations the receiver's static type can run.
+- Test entry points are detected the way each framework discovers them — xUnit v2/v3, NUnit, MSTest, TUnit, Reqnroll and SpecFlow, including derived attributes such as `[SkippableFact]`, setup/teardown, test-class constructors, fixtures and step bindings.
+- Type names resolve in every documented spelling: dotted nested types, generic display names, keyword aliases and framework simple names (`HttpClient`, `IOException`). A partial name returns suggestions instead of picking a type, and `overloadIndex` means the same overload in every tool.
+- Results come back in a deterministic order, so capped and paged results are reproducible. Limits and enumerated parameters are validated (`INVALID_PARAMETER`), and malformed array arguments are rejected as invalid params instead of being treated as empty.
+- Member listings exclude accessors and compiler-generated members and use one member-kind vocabulary.
+- Package, target-framework and compile-item facts come from MSBuild evaluation (`get_nuget_dependencies`, `find_unused_dependencies`, `get_project_structure`, the `diff_api_surface` baseline).
+- `find_naming_violations` reproduces the compiler's IDE1006 verdicts. `find_path_between` counts hops in edges, `get_call_graph` direction `both` is the callers tree plus the callees tree, and `dependency_graph` returns `nodes`/`edges`.
+
+### Fixed
+- `find_tests` and `find_untested_code` no longer miss tests in another project when that project's package versions or target framework differ from the code under test; `get_call_graph`, `get_outgoing_calls`, `find_god_objects` and `check_architecture` had the same cross-project identity defect.
+- `find_tests` binds each method body once per call and stops a test's walk once it reaches the target, instead of re-analyzing shared code for every test.
+- Apply and sync: an apply no longer rewrites other files with stale content after `sync_documents`, keeps each file's encoding, BOM and line endings, never adds a duplicate `<Compile>` item to a project file, writes only the documents an edit changed, and reports minimal change spans. `sync_documents` detects real changes, adds new files the project includes, and rejects files no project compiles.
+- Edit tools produce code that compiles and keeps its meaning: `change_signature` (parameter renames, attributes, defaults, optional and `params` arguments, method groups, overrides and implementations, recursion), `rename_symbol` conflicts in the preview, `extract_method` (static context, async loops, written parameters, control flow), `add_null_checks`, `generate_equality_members`, `generate_constructor`, `extract_interface`, `generate_test_stub`, `move_type_to_file`, `split_type`, `remove_unused_code`, `organize_usings`, `add_missing_imports`, `encapsulate_field`, `extract_variable`, `fix_all`.
+- `load_solution`: MSBuild warnings no longer mark a complete load as partial; restore failures and projects that loaded without references do; shared projects are not counted as dropped; a failed load leaves the previous solution usable; startup auto-load no longer blocks `initialize`; non-ASCII input is read as UTF-8.
+- Analysis tools: `get_diagnostics` project paths and DiagnosticSuppressors, code fixes for analyzer diagnostics and at the requested position, complexity metrics, async-issue coverage, dead branches after `return`, similar-code fingerprints, `validate_code` contexts, `diff_api_surface` baselines, stack-trace frames (lambdas, iterators, nested types, overloads, Mono), pattern and catch searches, reference kinds, type hierarchies with interfaces, missing members, containing members, documentation inheritance, attribute targets, DI registrations, reflection usage, namespace and project cycles, and `find_unused_code` entry points.
+
 ## [1.6.3] - 2026-08-16
 
 ### Fixed

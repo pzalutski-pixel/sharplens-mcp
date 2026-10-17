@@ -7,12 +7,12 @@
     "url": "https://github.com/pzalutski-pixel/sharplens-mcp",
     "source": "github"
   },
-  "version": "1.6.3",
+  "version": "1.6.4",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "sharplens-mcp",
-      "version": "1.6.3",
+      "version": "1.6.4",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
@@ -20,7 +20,7 @@
       "environmentVariables": [
         {
           "name": "DOTNET_SOLUTION_PATH",
-          "description": "Path to .sln or .slnx file to auto-load on startup",
+          "description": "Path to a .sln, .slnx or .slnf file (or a directory holding exactly one) to auto-load on startup",
           "format": "string"
         },
         {
@@ -40,7 +40,7 @@
     {
       "registryType": "nuget",
       "identifier": "SharpLensMcp",
-      "version": "1.6.3",
+      "version": "1.6.4",
       "runtimeHint": "dotnet tool run",
       "transport": {
         "type": "stdio"
@@ -48,7 +48,7 @@
       "environmentVariables": [
         {
           "name": "DOTNET_SOLUTION_PATH",
-          "description": "Path to .sln or .slnx file to auto-load on startup",
+          "description": "Path to a .sln, .slnx or .slnf file (or a directory holding exactly one) to auto-load on startup",
           "format": "string"
         },
         {

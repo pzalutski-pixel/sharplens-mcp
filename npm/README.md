@@ -66,26 +66,28 @@ Null check generation, equality member generation, **test-stub generation** (tes
 Type overview, method analysis, file overview, method source, batch method source, instantiation options, **project health audit** (composite dashboard: diagnostics + unused + coupling + coverage in one call) — combining multiple queries to reduce round-trips.
 
 ### Audit & Quality (10 tools)
-**Detect god-objects** via efferent + afferent coupling + member-count thresholds (audit-time scoring). **Find untested code** — public/internal surface not transitively reachable from any `[Fact]`/`[Theory]`/`[Test]`/`[TestMethod]`, sorted by cyclomatic complexity so the riskiest gaps surface first. **Find tests** that cover a symbol. Fine-grained type-usage searches — **type instantiations**, **pattern usages** (`is`/`as`/patterns), **throw sites**, and **catch blocks** for a type. **Find async issues** (`async void`, blocking-on-async, unforwarded `CancellationToken`). **Check architecture** — enforce dependency rules over the real type-dependency graph. **Find naming violations** honoring the solution's `.editorconfig`, with conventional defaults.
+**Detect god-objects** via efferent + afferent coupling + member-count thresholds (audit-time scoring). **Find untested code** — public/internal surface no test transitively reaches, with tests detected the way xUnit, NUnit, MSTest, TUnit, Reqnroll and SpecFlow discover them (setup, fixtures and step bindings included), sorted by cyclomatic complexity so the riskiest gaps surface first. **Find tests** that cover a symbol. Fine-grained type-usage searches — **type instantiations**, **pattern usages** (`is`/`as`/patterns), **throw sites**, and **catch blocks** for a type. **Find async issues** (`async void`, blocking-on-async, unforwarded `CancellationToken`). **Check architecture** — enforce dependency rules over the real type-dependency graph. **Find naming violations** honoring the solution's `.editorconfig`, with conventional defaults.
 
 ### Discovery (3 tools)
 DI registration scanning, reflection usage detection, and **interceptor discovery** (`[InterceptsLocation]` call rerouting, generated code included).
 
 ### Infrastructure (12 tools)
-Health check (with **load-fidelity reporting** — a `partial` flag and `loadFailures` so dropped projects / unresolvable references aren't silent), **unused dependency detection** (PackageReference/ProjectReference the compiler never needs), **fix-all** for a diagnostic across a file, project, or solution, solution loading, document synchronization, project structure, dependency graph, code fixes, apply code fix, NuGet dependency listing, source generator inspection, and generated code viewer.
+Health check (with **load-fidelity reporting** — a `partial` flag and `loadFailures` for dropped projects, failed restores and projects loaded without references, with MSBuild warnings in `loadWarnings`), **unused dependency detection** (PackageReference/ProjectReference the compiler never needs), **fix-all** for a diagnostic across a file, project, or solution, solution loading, document synchronization, project structure, dependency graph, code fixes, apply code fix, NuGet dependency listing, source generator inspection, and generated code viewer.
 
 ## Configuration
 
 | Environment Variable | Description | Default |
 |---------------------|-------------|---------|
-| `DOTNET_SOLUTION_PATH` | Auto-load .sln or .slnx on startup | (none) |
+| `DOTNET_SOLUTION_PATH` | Auto-load a .sln, .slnx or .slnf (or a directory holding exactly one) on startup | (none) |
 | `SHARPLENS_LOG_LEVEL` | Trace/Debug/Information/Warning/Error | Information |
 | `SHARPLENS_TIMEOUT_SECONDS` | Operation timeout | 30 |
 | `SHARPLENS_MAX_DIAGNOSTICS` | Maximum diagnostics to return | 100 |
-| `SHARPLENS_ENABLE_SEMANTIC_CACHE` | Enable semantic model caching | true |
+| `SHARPLENS_ENABLE_SEMANTIC_CACHE` | Cache the file-path to document lookup | true |
 | `SHARPLENS_ABSOLUTE_PATHS` | Use absolute paths instead of relative | false |
 
-The legacy `ROSLYN_*` spellings (e.g. `ROSLYN_LOG_LEVEL`) remain accepted as a one-release migration fallback.
+The legacy `ROSLYN_*` spellings (e.g. `ROSLYN_LOG_LEVEL`) remain accepted as a fallback; boolean values are case-insensitive.
+
+A multi-targeted project is one project to every tool: results are reported once, with `targetFrameworks` where they exist only under some frameworks, and `projectName` accepts the plain or the framework-qualified name (`MyLib` or `MyLib(net8.0)`).
 
 ## Uninstall
 

@@ -79,14 +79,18 @@ Claude Code has native LSP support for basic navigation (go-to-definition, find 
 
 | Environment Variable | Description | Default |
 |---------------------|-------------|---------|
-| `DOTNET_SOLUTION_PATH` | Path to `.sln` or `.slnx` file to auto-load on startup | None (must call `load_solution`) |
+| `DOTNET_SOLUTION_PATH` | Path to a `.sln`, `.slnx` or `.slnf` file (or a directory holding exactly one) to auto-load on startup; the load runs beside the request loop, so `initialize` answers immediately | None (must call `load_solution`) |
 | `SHARPLENS_ABSOLUTE_PATHS` | Use absolute paths instead of relative | `false` (relative paths save tokens) |
 | `SHARPLENS_LOG_LEVEL` | Logging verbosity: `Trace`, `Debug`, `Information`, `Warning`, `Error` | `Information` |
 | `SHARPLENS_TIMEOUT_SECONDS` | Timeout for long-running operations | `30` |
 | `SHARPLENS_MAX_DIAGNOSTICS` | Maximum diagnostics to return | `100` |
-| `SHARPLENS_ENABLE_SEMANTIC_CACHE` | Enable semantic model caching | `true` (set to `false` to disable) |
+| `SHARPLENS_ENABLE_SEMANTIC_CACHE` | Cache the file-path to document lookup | `true` (set to `false` to disable) |
 
-The pre-1.6.0 `ROSLYN_*` spellings of the last four variables are still read as a fallback for one release; the `SHARPLENS_*` spelling wins when both are set.
+The pre-1.6.0 `ROSLYN_*` spellings of these variables are still read as a fallback; the `SHARPLENS_*` spelling wins when both are set. Boolean values are case-insensitive. A number that does not parse or is below its minimum falls back to the default, and one above its maximum is capped; each case logs a warning to stderr.
+
+### Multi-targeted projects
+
+A project built for several target frameworks is one project to every tool: each result is reported once, with a `targetFrameworks` list where it exists only under some frameworks. `projectName` accepts the plain name (`MyLib`) for all frameworks, or a framework-qualified name (`MyLib(net8.0)`) for one.
 
 If `DOTNET_SOLUTION_PATH` is not set, you must call the `load_solution` tool before using other tools.
 
@@ -144,6 +148,8 @@ sync_documents(filePaths: ["src/MyClass.cs", "src/MyService.cs"])
 # After bulk changes - sync all documents
 sync_documents()
 ```
+
+A full sync also picks up new `.cs` files the project's compile items include. SharpLensMcp's apply tools write only the files an edit changes, keep each file's encoding and line endings, and refuse with `STALE_DOCUMENT` when a target file changed on disk since it was read — run `sync_documents`, then retry.
 
 ### Why this design?
 
@@ -257,7 +263,7 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 | Tool | Description |
 |------|-------------|
 | `find_god_objects` | Detect over-coupled types via efferent + afferent coupling + member-count thresholds |
-| `find_untested_code` | Find public surface not reached by any [Fact]/[Theory]/[Test]/[TestMethod] |
+| `find_untested_code` | Find public surface no test reaches — tests detected as xUnit, NUnit, MSTest, TUnit, Reqnroll and SpecFlow discover them, with setup, fixtures and step bindings |
 | `find_tests` | Which tests cover a symbol — the inverse of find_untested_code |
 | `find_type_instantiations` | Where a type is constructed (`new T`) |
 | `find_pattern_usages` | Where a type appears in is/as/pattern matches |
@@ -277,10 +283,10 @@ This mirrors how LSP (Language Server Protocol) works - the client (editor) noti
 ### Infrastructure (12 tools)
 | Tool | Description |
 |------|-------------|
-| `health_check` | Server status + load fidelity (`partial` flag, declared-vs-loaded projects, `loadFailures`) — check without reloading |
+| `health_check` | Server status + load fidelity (`partial` flag, declared-vs-loaded projects, `loadFailures`, `loadWarnings`, `lastLoadFailure`) — check without reloading |
 | `find_unused_dependencies` | PackageReferences/ProjectReferences the compiler never needs |
 | `fix_all` | Compute the fix for every instance of a diagnostic id (generation-only) |
-| `load_solution` | Load .sln/.slnx; reports partial loads (`partial` + `loadFailures`) so dropped projects / unresolvable references aren't silent |
+| `load_solution` | Load .sln/.slnx/.slnf; reports partial loads (`partial` + `loadFailures`: dropped projects, failed restores, projects loaded without references) and MSBuild warnings (`loadWarnings`) separately |
 | `sync_documents` | Sync file changes into loaded solution |
 | `get_project_structure` | Solution structure |
 | `dependency_graph` | Project dependencies |

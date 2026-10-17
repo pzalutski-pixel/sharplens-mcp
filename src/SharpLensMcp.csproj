@@ -8,7 +8,7 @@
     <LangVersion>latest</LangVersion>
 
     <!-- Package metadata -->
-    <Version>1.6.3</Version>
+    <Version>1.6.4</Version>
     <Authors>Peter Zalutski</Authors>
     <Copyright>Copyright (c) 2025 Peter Zalutski</Copyright>
     <Description>MCP server providing 92 AI-optimized tools for .NET/C# semantic code analysis using Roslyn.</Description>
@@ -18,9 +18,20 @@
     <PackageTags>mcp;roslyn;csharp;dotnet;code-analysis;ai;semantic-analysis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
-v1.6.3
+v1.6.4
+Added:
+- Multi-targeted projects are one project: results reported once with targetFrameworks; projectName accepts the plain or the framework-qualified name.
+- find_tests kind and dispatchOnlyTests; find_untested_code entryPointCounts and dispatch-only labelling; notice on by-name tools when a type name shadows a framework type; kind and viaDispatch on call edges; loadWarnings and lastLoadFailure; .slnf solutions; MCP ping; STALE_DOCUMENT instead of overwriting a file changed on disk.
+Changed:
+- One call model behind every call tool and the coverage tools, following extension calls, constructors, accessors, operators, partial implementations and receiver-aware dispatch.
+- Test entry points detected per framework (xUnit v2/v3, NUnit, MSTest, TUnit, Reqnroll, SpecFlow) including setup, constructors, fixtures and step bindings.
+- Type names resolve in every documented spelling; partial names return suggestions; overloadIndex means the same overload everywhere.
+- Deterministic result order; validated limits and enumerated parameters; package and project facts from MSBuild evaluation; naming checks match IDE1006.
 Fixed:
-- load_solution no longer silently drops projects it can't load. A partial load now reports partial:true, declaredProjectCount (from the solution file) alongside the loaded count, and loadFailures naming what failed - so it isn't mistaken for a clean load. health_check exposes the same without a reload; get_diagnostics gains analysisMode:"live-compilation" to signal its counts can differ from a dotnet build.
+- Cross-project tests missed when package versions or target frameworks differ; find_tests re-analyzing shared code per test.
+- Apply and sync overwriting other files, changing encodings or line endings, and editing project files.
+- Edit tools producing code that does not compile or changes meaning (change_signature, rename conflicts, extract_method, code generation, move/split/remove, usings, code actions, fix_all).
+- load_solution false partial loads, unrestored projects reported as clean, failed loads, blocked initialize, non-ASCII input; analysis-tool defects across diagnostics, code fixes, metrics, stack traces, searches, hierarchies and documentation.
 Full history: CHANGELOG.md in the repository.
     </PackageReleaseNotes>
 
