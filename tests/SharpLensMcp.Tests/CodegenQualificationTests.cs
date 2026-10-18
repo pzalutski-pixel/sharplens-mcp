@@ -14,13 +14,17 @@ namespace SharpLensMcp.Tests;
 public class CodegenQualificationTests
 {
     // CS0246 (type/namespace not found) and CS0103 (name not found) in a compilation that
-    // references the runtime assemblies but declares NO usings.
+    // references the runtime assemblies but declares NO usings. The references are the
+    // runtime's own trusted platform assemblies (those in the runtime directory), which are
+    // always on disk, not whatever other tests have loaded into this process from
+    // temporary folders they delete.
     private static IReadOnlyList<string> UnresolvedNameErrors(string source)
     {
-        var refs = AppDomain.CurrentDomain.GetAssemblies()
-            .Where(a => !a.IsDynamic && !string.IsNullOrEmpty(a.Location))
-            .GroupBy(a => a.GetName().Name)
-            .Select(g => (MetadataReference)MetadataReference.CreateFromFile(g.First().Location))
+        var runtimeDirectory = Path.GetDirectoryName(typeof(object).Assembly.Location)!;
+        var refs = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
+            .Split(Path.PathSeparator)
+            .Where(path => string.Equals(Path.GetDirectoryName(path), runtimeDirectory, StringComparison.OrdinalIgnoreCase))
+            .Select(path => (MetadataReference)MetadataReference.CreateFromFile(path))
             .ToList();
         var compilation = CSharpCompilation.Create("QualTest",
             new[] { CSharpSyntaxTree.ParseText(source) }, refs,
