@@ -125,14 +125,32 @@ public class LoadFidelityClassifierTests
     [Fact]
     public void ProjectWithoutReferences_IsAFailureNamingRestore()
     {
-        // An unrestored SDK project loads with zero metadata references and no
-        // diagnostic at all.
-        var unrestored = new LoadedProjectState(Lib, "Lib", IsPlaceholder: false, MetadataReferenceCount: 0, ResolvesCoreLibrary: false);
+        // A project whose restore output exists but whose compilation sees no metadata
+        // references, with no diagnostic at all.
+        var noReferences = new LoadedProjectState(Lib, "Lib", IsPlaceholder: false, MetadataReferenceCount: 0, ResolvesCoreLibrary: false);
 
-        var fidelity = LoadFidelityClassifier.Classify(Declared(Lib), new[] { unrestored }, Array.Empty<WorkspaceDiagnostic>(), NoRestoreLog);
+        var fidelity = LoadFidelityClassifier.Classify(Declared(Lib), new[] { noReferences }, Array.Empty<WorkspaceDiagnostic>(), NoRestoreLog);
 
         fidelity.Failures.Should().Equal(
             $"Project 'Lib' ({Lib}) loaded without any metadata references, so none of its code binds (not even System.Object); run 'dotnet restore' and reload.");
+    }
+
+    // An SDK-style project without project.assets.json has not been restored. Whether the SDK
+    // still supplied framework references (150 here) or none at all, the failure is the one
+    // not-restored message, once for the project.
+    [Theory]
+    [InlineData(150, true)]
+    [InlineData(0, false)]
+    public void UnrestoredSdkProject_IsOneNotRestoredFailure_WhateverReferencesResolved(int references, bool resolvesCoreLibrary)
+    {
+        var net8 = new LoadedProjectState(Lib, "Lib(net8.0)", IsPlaceholder: false, references, resolvesCoreLibrary, IsUnrestored: true);
+        var net10 = new LoadedProjectState(Lib, "Lib(net10.0)", IsPlaceholder: false, references, resolvesCoreLibrary, IsUnrestored: true);
+
+        var fidelity = LoadFidelityClassifier.Classify(Declared(Lib), new[] { net8, net10 }, Array.Empty<WorkspaceDiagnostic>(), NoRestoreLog);
+
+        fidelity.IsPartial.Should().BeTrue();
+        fidelity.Failures.Should().Equal(
+            $"Project '{Lib}' has not been restored: it has no project.assets.json, so its package references are missing; run 'dotnet restore' and reload.");
     }
 
     [Fact]

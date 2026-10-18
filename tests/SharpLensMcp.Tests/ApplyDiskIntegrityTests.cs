@@ -151,7 +151,8 @@ public class ApplyDiskIntegrityTests
     public async Task SyncThenApplyInAWindows1252File_WritesWindows1252Back()
     {
         using var solution = ApplySyncFixture.Create();
-        solution.WriteBytes("App/Latin.cs", ApplySyncFixture.Windows1252.GetBytes(ApplySyncFixture.Latin));
+        var bytes = ApplySyncFixture.Windows1252.GetBytes(ApplySyncFixture.Latin);
+        solution.WriteBytes("App/Latin.cs", bytes);
         solution.Restore();
         var service = await LoadAsync(solution);
         JObject.FromObject(await service.SyncDocumentsAsync(null))["success"]!.Value<bool>().Should().BeTrue();
@@ -160,10 +161,22 @@ public class ApplyDiskIntegrityTests
             filePath: null, line: null, column: null, newName: "Hello", preview: false,
             typeName: "Latin", memberName: "Greet"));
 
-        rename["success"]!.Value<bool>().Should().BeTrue(rename.ToString());
-        solution.ReadBytes("App/Latin.cs").Should().Equal(
-            ApplySyncFixture.Windows1252.GetBytes(ApplySyncFixture.Latin.Replace("Greet", "Hello")),
-            "the file is windows-1252 without a BOM and must stay that way, with 'é' intact");
+        if (ApplySyncFixture.FallbackDecodesWindows1252)
+        {
+            rename["success"]!.Value<bool>().Should().BeTrue(rename.ToString());
+            solution.ReadBytes("App/Latin.cs").Should().Equal(
+                ApplySyncFixture.Windows1252.GetBytes(ApplySyncFixture.Latin.Replace("Greet", "Hello")),
+                "the file is windows-1252 without a BOM and must stay that way, with 'é' intact");
+        }
+        else
+        {
+            // The fallback is UTF-8: 'é' decoded to U+FFFD, so writing any edit would replace
+            // its byte. The apply is refused and the file is untouched.
+            rename["success"]!.Value<bool>().Should().BeFalse(rename.ToString());
+            rename["error"]!["Code"]!.Value<string>().Should().Be(ErrorCodes.UnsupportedEncoding);
+            rename["error"]!["Context"]!["files"]!.Values<string>().Should().Equal("App/Latin.cs");
+            solution.ReadBytes("App/Latin.cs").Should().Equal(bytes);
+        }
     }
 
     [Fact]

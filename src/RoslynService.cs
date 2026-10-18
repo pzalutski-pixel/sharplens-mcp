@@ -668,25 +668,30 @@ public partial class RoslynService
     {
         var declared = await SolutionProjectReader.ReadAsync(solutionPath, cancellationToken);
 
-        var loaded = new List<LoadedProjectState>();
-        foreach (var project in solution.Projects)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (project.FilePath != null) loaded.Add(DescribeLoadedProject(project));
-        }
-
         var diagnostics = workspaceDiagnostics.ToList();
         var restoreLog = new List<RestoreLogEntry>();
+        var unrestored = new HashSet<string>(LoadFidelityClassifier.PathComparer);
         var completeProjects = solution.Projects
             .Where(p => p.FilePath != null && !IsPlaceholderProject(p))
             .GroupBy(p => Path.GetFullPath(p.FilePath!), LoadFidelityClassifier.PathComparer);
         foreach (var projectInstances in completeProjects)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var (entries, warning) = ProjectAssetsReader.Read(
+            var (entries, warning, found) = ProjectAssetsReader.Read(
                 projectInstances.Key, projectInstances.First().CompilationOutputInfo.AssemblyPath);
             restoreLog.AddRange(entries);
             if (warning != null) diagnostics.Add(new WorkspaceDiagnostic(WorkspaceDiagnosticKind.Warning, warning));
+            if (!found && ProjectFileStyle.IsSdkStyle(projectInstances.Key)) unrestored.Add(projectInstances.Key);
+        }
+
+        var loaded = new List<LoadedProjectState>();
+        foreach (var project in solution.Projects)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (project.FilePath != null)
+            {
+                loaded.Add(DescribeLoadedProject(project, unrestored.Contains(Path.GetFullPath(project.FilePath))));
+            }
         }
 
         return LoadFidelityClassifier.Classify(declared, loaded, diagnostics, restoreLog);
@@ -701,14 +706,15 @@ public partial class RoslynService
     // with no metadata references at all, and without a reference defining System.Object
     // nothing binds. The probe compilation holds only the references, so resolving the core
     // library reads reference metadata the workspace already caches, not the project's source.
-    private static LoadedProjectState DescribeLoadedProject(Project project)
+    // isUnrestored: the project is SDK-style and has no project.assets.json.
+    private static LoadedProjectState DescribeLoadedProject(Project project, bool isUnrestored)
     {
         var isPlaceholder = IsPlaceholderProject(project);
         var referenceCount = project.MetadataReferences.Count;
         var resolvesCoreLibrary = !isPlaceholder && referenceCount > 0
             && CSharpCompilation.Create("SharpLensReferenceProbe", references: project.MetadataReferences)
                 .GetSpecialType(SpecialType.System_Object).TypeKind != TypeKind.Error;
-        return new LoadedProjectState(project.FilePath!, project.Name, isPlaceholder, referenceCount, resolvesCoreLibrary);
+        return new LoadedProjectState(project.FilePath!, project.Name, isPlaceholder, referenceCount, resolvesCoreLibrary, isUnrestored);
     }
 
     public async Task<object> GetHealthCheckAsync(
@@ -1106,6 +1112,13 @@ public partial class RoslynService
     // absolutization. Returns null if no match — call sites decide how to report failure.
     // A path that cannot name a file (empty, whitespace, or containing a character no
     // path may hold, such as NUL) matches nothing.
+    // A caller-supplied path with its separators made native. Windows accepts both '\' and
+    // '/'; elsewhere '\' is an ordinary file-name character, but in a path a client passes
+    // (often copied from a solution file or a Windows tool) it is a Windows separator, so it
+    // becomes '/'. Every resolution of a caller-supplied path goes through this.
+    internal static string WithNativeSeparators(string path) =>
+        Path.DirectorySeparatorChar == '\\' ? path : path.Replace('\\', Path.DirectorySeparatorChar);
+
     internal Document? TryFindDocument(string filePath)
     {
         if (!IsNameablePath(filePath)) return null;
@@ -1113,13 +1126,13 @@ public partial class RoslynService
         if (_documentCache.TryGetValue(filePath, out var cached))
             return cached;
 
-        var resolved = filePath;
-        if (!Path.IsPathRooted(filePath) && _solution?.FilePath != null)
+        var resolved = WithNativeSeparators(filePath);
+        if (!Path.IsPathRooted(resolved) && _solution?.FilePath != null)
         {
             var solutionDir = Path.GetDirectoryName(_solution.FilePath);
             if (!string.IsNullOrEmpty(solutionDir))
             {
-                resolved = Path.GetFullPath(Path.Combine(solutionDir, filePath));
+                resolved = Path.GetFullPath(Path.Combine(solutionDir, resolved));
             }
         }
 

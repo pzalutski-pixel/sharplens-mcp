@@ -67,6 +67,7 @@ public sealed class TempSolutionDirectory : IDisposable
             WorkingDirectory = workingDirectory,
         };
         foreach (var argument in arguments) psi.ArgumentList.Add(argument);
+        DotnetChildProcess.Isolated(psi);
         using var process = Process.Start(psi)!;
         var stdout = process.StandardOutput.ReadToEndAsync();
         var stderr = process.StandardError.ReadToEndAsync();

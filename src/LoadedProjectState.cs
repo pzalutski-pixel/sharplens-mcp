@@ -12,9 +12,14 @@ namespace SharpLensMcp;
 /// </param>
 /// <param name="MetadataReferenceCount">References the compilation sees; 0 for an unrestored SDK project.</param>
 /// <param name="ResolvesCoreLibrary">Whether those references define System.Object, so code in the project can bind.</param>
+/// <param name="IsUnrestored">
+/// An SDK-style project without a project.assets.json: it has not been restored, so its package
+/// references are missing whatever framework references happened to resolve.
+/// </param>
 public sealed record LoadedProjectState(
     string FilePath,
     string Name,
     bool IsPlaceholder,
     int MetadataReferenceCount,
-    bool ResolvesCoreLibrary);
+    bool ResolvesCoreLibrary,
+    bool IsUnrestored = false);

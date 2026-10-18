@@ -72,6 +72,7 @@ public partial class RoslynService
         if (filePaths != null)
         {
             paths = filePaths
+                .Select(WithNativeSeparators)
                 .Select(p => Path.GetFullPath(Path.IsPathRooted(p) ? p : Path.Combine(solutionDir, p)))
                 .Distinct(PathComparer)
                 .ToList();

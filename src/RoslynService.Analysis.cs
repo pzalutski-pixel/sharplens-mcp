@@ -134,6 +134,7 @@ public partial class RoslynService
     {
         try
         {
+            path = WithNativeSeparators(path);
             if (Path.IsPathRooted(path)) return Path.GetFullPath(path);
             var solutionDirectory = _solution?.FilePath == null ? null : Path.GetDirectoryName(_solution.FilePath);
             return solutionDirectory == null ? null : Path.GetFullPath(Path.Combine(solutionDirectory, path));

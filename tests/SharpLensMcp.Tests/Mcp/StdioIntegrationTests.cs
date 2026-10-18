@@ -41,6 +41,7 @@ public class StdioIntegrationTests
         // (analyzer-running get_diagnostics, full-solution coverage BFS) can exceed the
         // 30s default and flake with TIMEOUT under CI contention. Child-process env only.
         psi.Environment["SHARPLENS_TIMEOUT_SECONDS"] = "300";
+        DotnetChildProcess.Isolated(psi);
 
         using var process = Process.Start(psi)!;
         // Drain stderr concurrently — the server logs there, and an undrained

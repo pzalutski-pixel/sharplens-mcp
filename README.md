@@ -149,7 +149,7 @@ sync_documents(filePaths: ["src/MyClass.cs", "src/MyService.cs"])
 sync_documents()
 ```
 
-A full sync also picks up new `.cs` files the project's compile items include. SharpLensMcp's apply tools write only the files an edit changes, keep each file's encoding and line endings, and refuse with `STALE_DOCUMENT` when a target file changed on disk since it was read — run `sync_documents`, then retry.
+A full sync also picks up new `.cs` files the project's compile items include. SharpLensMcp's apply tools write only the files an edit changes, keep each file's encoding and line endings, and refuse with `STALE_DOCUMENT` when a target file changed on disk since it was read — run `sync_documents`, then retry. They also refuse with `UNSUPPORTED_ENCODING` to write a file whose bytes its encoding cannot reproduce (a BOM-less file that is not valid UTF-8 on a system whose fallback code page is UTF-8, such as Linux); save it as UTF-8 first.
 
 ### Why this design?
 

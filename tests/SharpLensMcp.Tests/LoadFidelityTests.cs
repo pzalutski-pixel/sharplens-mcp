@@ -158,8 +158,9 @@ public class LoadFidelityTests : IDisposable
     [Fact]
     public async Task UnrestoredProject_IsPartial_WithARestoreFailure()
     {
-        // Without restore the project loads with zero metadata references and the
-        // workspace reports nothing; every tool would then see unbound code.
+        // Without restore the project has no project.assets.json. Whether its framework
+        // references still resolve depends on the SDK installation, so the missing restore
+        // output itself is the failure, the same on every machine.
         _dir.Write("Lib/Lib.csproj", MinimalCsproj);
         _dir.Write("Lib/Widget.cs", "namespace Lib;\npublic class Widget { }\n");
         var sln = _dir.WriteSolution("Lib.sln", ("Lib", "Lib\\Lib.csproj"));
@@ -168,7 +169,7 @@ public class LoadFidelityTests : IDisposable
 
         result.Partial.Should().BeTrue();
         result.Failures.Should().Equal(
-            $"Project 'Lib' ({_dir.PathOf("Lib/Lib.csproj")}) loaded without any metadata references, so none of its code binds (not even System.Object); run 'dotnet restore' and reload.");
+            $"Project '{_dir.PathOf("Lib/Lib.csproj")}' has not been restored: it has no project.assets.json, so its package references are missing; run 'dotnet restore' and reload.");
     }
 
     [Fact]

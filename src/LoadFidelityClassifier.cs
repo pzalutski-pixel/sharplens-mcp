@@ -13,8 +13,9 @@ namespace SharpLensMcp;
 /// <item>a workspace-originated Failure (project file not found, exceptions) is a failure,
 /// except "cannot open" for a declared non-compiling project type, which is a warning;</item>
 /// <item>a workspace Warning is a warning;</item>
-/// <item>each declared compiling project that did not load, each placeholder, and each loaded
-/// project whose references do not define System.Object is a failure;</item>
+/// <item>each declared compiling project that did not load, each placeholder, each SDK-style
+/// project that has not been restored (no project.assets.json), and each loaded project whose
+/// references do not define System.Object is a failure;</item>
 /// <item>a restore log Error is a failure and a restore Warning a warning — and supersedes
 /// the relayed copy of the same message, which lost its severity and code.</item>
 /// </list>
@@ -90,6 +91,13 @@ internal static class LoadFidelityClassifier
             if (instances.Any(p => p.IsPlaceholder))
             {
                 failures.Add($"Project '{path}' did not load: MSBuild could not evaluate it, so it is an empty placeholder with no documents.");
+                continue;
+            }
+            // Not restored is the cause whatever references resolved (an SDK may still supply
+            // framework references): one failure for the project, not one per framework.
+            if (instances.Any(p => p.IsUnrestored))
+            {
+                failures.Add($"Project '{path}' has not been restored: it has no project.assets.json, so its package references are missing; run 'dotnet restore' and reload.");
                 continue;
             }
             foreach (var project in instances)

@@ -18,9 +18,10 @@ internal static class ProjectAssetsReader
 
     /// <summary>
     /// The project's restore log entries, empty when it has no assets file (an unrestored or
-    /// non-PackageReference project). Warning is set when an assets file exists but cannot be read.
+    /// non-PackageReference project). Found is whether the project's assets file exists (even
+    /// when it cannot be read); Warning is set when it exists but cannot be read.
     /// </summary>
-    public static (IReadOnlyList<RestoreLogEntry> Entries, string? Warning) Read(
+    public static (IReadOnlyList<RestoreLogEntry> Entries, string? Warning, bool Found) Read(
         string projectPath, string? intermediateAssemblyPath)
     {
         foreach (var assetsPath in CandidateAssetsPaths(projectPath, intermediateAssemblyPath))
@@ -31,15 +32,15 @@ internal static class ProjectAssetsReader
                 using var document = JsonDocument.Parse(File.ReadAllText(assetsPath));
                 var root = document.RootElement;
                 if (!IsAssetsFileOf(root, projectPath)) continue;
-                return (ReadLogs(root, projectPath), null);
+                return (ReadLogs(root, projectPath), null, true);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
             {
                 return (Array.Empty<RestoreLogEntry>(),
-                    $"Could not read the restore log '{assetsPath}' of '{projectPath}': {ex.Message}");
+                    $"Could not read the restore log '{assetsPath}' of '{projectPath}': {ex.Message}", true);
             }
         }
-        return (Array.Empty<RestoreLogEntry>(), null);
+        return (Array.Empty<RestoreLogEntry>(), null, false);
     }
 
     private static IEnumerable<string> CandidateAssetsPaths(string projectPath, string? intermediateAssemblyPath)

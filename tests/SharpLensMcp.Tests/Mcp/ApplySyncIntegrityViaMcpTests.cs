@@ -134,17 +134,30 @@ public class ApplySyncIntegrityViaMcpTests
     public async Task SyncThenRename_InAWindows1252File_KeepsItsEncoding()
     {
         using var solution = ApplySyncFixture.Create();
-        solution.WriteBytes("App/Latin.cs", ApplySyncFixture.Windows1252.GetBytes(ApplySyncFixture.Latin));
+        var bytes = ApplySyncFixture.Windows1252.GetBytes(ApplySyncFixture.Latin);
+        solution.WriteBytes("App/Latin.cs", bytes);
         solution.Restore();
         var ops = await LoadAsync(solution);
 
         var sync = await DataAsync(ops, "sync_documents", new { });
         sync["updated"]!.Value<int>().Should().Be(0, "no file changed on disk since the load");
 
-        await DataAsync(ops, "rename_symbol", new { typeName = "Latin", memberName = "Greet", newName = "Hello", preview = false });
+        var rename = await ops.CallToolAsync("rename_symbol",
+            new { typeName = "Latin", memberName = "Greet", newName = "Hello", preview = false });
 
-        solution.ReadBytes("App/Latin.cs").Should().Equal(
-            ApplySyncFixture.Windows1252.GetBytes(ApplySyncFixture.Latin.Replace("Greet", "Hello")));
+        if (ApplySyncFixture.FallbackDecodesWindows1252)
+        {
+            rename["success"]!.Value<bool>().Should().BeTrue(rename.ToString());
+            solution.ReadBytes("App/Latin.cs").Should().Equal(
+                ApplySyncFixture.Windows1252.GetBytes(ApplySyncFixture.Latin.Replace("Greet", "Hello")));
+        }
+        else
+        {
+            // UTF-8 fallback: the file does not round-trip, so the apply is refused untouched.
+            rename["success"]!.Value<bool>().Should().BeFalse(rename.ToString());
+            rename["error"]!["code"]!.Value<string>().Should().Be(ErrorCodes.UnsupportedEncoding);
+            solution.ReadBytes("App/Latin.cs").Should().Equal(bytes);
+        }
     }
 
     [Fact]

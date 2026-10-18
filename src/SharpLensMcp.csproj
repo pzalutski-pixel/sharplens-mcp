@@ -21,7 +21,7 @@
 v1.6.4
 Added:
 - Multi-targeted projects are one project: results reported once with targetFrameworks; projectName accepts the plain or the framework-qualified name.
-- find_tests kind and dispatchOnlyTests; find_untested_code entryPointCounts and dispatch-only labelling; notice on by-name tools when a type name shadows a framework type; kind and viaDispatch on call edges; loadWarnings and lastLoadFailure; .slnf solutions; MCP ping; STALE_DOCUMENT instead of overwriting a file changed on disk.
+- find_tests kind and dispatchOnlyTests; find_untested_code entryPointCounts and dispatch-only labelling; notice on by-name tools when a type name shadows a framework type; kind and viaDispatch on call edges; loadWarnings and lastLoadFailure; .slnf solutions; MCP ping; STALE_DOCUMENT instead of overwriting a file changed on disk, UNSUPPORTED_ENCODING instead of writing a file its encoding cannot reproduce.
 Changed:
 - One call model behind every call tool and the coverage tools, following extension calls, constructors, accessors, operators, partial implementations and receiver-aware dispatch.
 - Test entry points detected per framework (xUnit v2/v3, NUnit, MSTest, TUnit, Reqnroll, SpecFlow) including setup, constructors, fixtures and step bindings.
@@ -31,7 +31,7 @@ Fixed:
 - Cross-project tests missed when package versions or target frameworks differ; find_tests re-analyzing shared code per test.
 - Apply and sync overwriting other files, changing encodings or line endings, and editing project files.
 - Edit tools producing code that does not compile or changes meaning (change_signature, rename conflicts, extract_method, code generation, move/split/remove, usings, code actions, fix_all).
-- load_solution false partial loads, unrestored projects reported as clean, failed loads, blocked initialize, non-ASCII input; analysis-tool defects across diagnostics, code fixes, metrics, stack traces, searches, hierarchies and documentation.
+- load_solution false partial loads, unrestored projects reported as clean, failed loads, blocked initialize, non-ASCII input; backslash paths on Linux and macOS; analysis-tool defects across diagnostics, code fixes, metrics, stack traces, searches, hierarchies and documentation.
 Full history: CHANGELOG.md in the repository.
     </PackageReleaseNotes>
 

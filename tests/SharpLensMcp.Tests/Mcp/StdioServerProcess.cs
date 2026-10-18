@@ -53,6 +53,7 @@ internal sealed class StdioServerProcess : IAsyncDisposable
         {
             psi.Environment.Remove(name);
         }
+        DotnetChildProcess.Isolated(psi);
         foreach (var (name, value) in environment)
         {
             psi.Environment[name] = value;

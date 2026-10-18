@@ -19,6 +19,10 @@ public static class ErrorCodes
     // An apply's target file changed on disk since the edit was computed from it; the
     // whole apply is refused so the disk edit is never overwritten.
     public const string StaleDocument = "STALE_DOCUMENT";
+    // An apply's target file does not decode losslessly in the encoding it was read with (no
+    // byte-order mark, not valid UTF-8, and a fallback code page that cannot represent its
+    // bytes), so writing any edit would alter text outside the edit; the apply is refused.
+    public const string UnsupportedEncoding = "UNSUPPORTED_ENCODING";
     public const string InternalError = "INTERNAL_ERROR";
     public const string Timeout = "TIMEOUT";
 }

@@ -36,9 +36,10 @@ public class ProjectAssetsReaderTests : IDisposable
             ]
             """));
 
-        var (entries, warning) = ProjectAssetsReader.Read(project, intermediateAssemblyPath: null);
+        var (entries, warning, found) = ProjectAssetsReader.Read(project, intermediateAssemblyPath: null);
 
         warning.Should().BeNull();
+        found.Should().BeTrue();
         entries.Should().Equal(
             new RestoreLogEntry(project, "NU1903", "Warning", "Package 'Newtonsoft.Json' 12.0.3 has a known high severity vulnerability"),
             new RestoreLogEntry(project, "NU1101", "Error", "Unable to find package Missing.Pkg."));
@@ -53,8 +54,9 @@ public class ProjectAssetsReaderTests : IDisposable
         _dir.Write("artifacts/obj/Lib/project.assets.json", AssetsJson(project,
             """[ { "code": "NU1603", "level": "Warning", "message": "resolved a higher version" } ]"""));
 
-        var (entries, _) = ProjectAssetsReader.Read(project, _dir.PathOf("artifacts/obj/Lib/debug/Lib.dll"));
+        var (entries, _, found) = ProjectAssetsReader.Read(project, _dir.PathOf("artifacts/obj/Lib/debug/Lib.dll"));
 
+        found.Should().BeTrue();
         entries.Should().Equal(new RestoreLogEntry(project, "NU1603", "Warning", "resolved a higher version"));
     }
 
@@ -65,18 +67,21 @@ public class ProjectAssetsReaderTests : IDisposable
         _dir.Write("Lib/obj/project.assets.json", AssetsJson(_dir.PathOf("Other/Other.csproj"),
             """[ { "code": "NU1101", "level": "Error", "message": "not mine" } ]"""));
 
-        ProjectAssetsReader.Read(project, null).Entries.Should().BeEmpty();
+        var result = ProjectAssetsReader.Read(project, null);
+        result.Entries.Should().BeEmpty();
+        result.Found.Should().BeFalse("an assets file restored for another project is not this project's");
     }
 
     [Fact]
-    public void NoAssetsFile_YieldsNoEntriesAndNoWarning()
+    public void NoAssetsFile_YieldsNoEntriesAndNoWarning_AndIsNotFound()
     {
         var project = _dir.Write("Lib/Lib.csproj", "");
 
-        var (entries, warning) = ProjectAssetsReader.Read(project, null);
+        var (entries, warning, found) = ProjectAssetsReader.Read(project, null);
 
         entries.Should().BeEmpty();
         warning.Should().BeNull();
+        found.Should().BeFalse();
     }
 
     [Fact]
@@ -85,9 +90,10 @@ public class ProjectAssetsReaderTests : IDisposable
         var project = _dir.Write("Lib/Lib.csproj", "");
         var assets = _dir.Write("Lib/obj/project.assets.json", "{ not json");
 
-        var (entries, warning) = ProjectAssetsReader.Read(project, null);
+        var (entries, warning, found) = ProjectAssetsReader.Read(project, null);
 
         entries.Should().BeEmpty();
+        found.Should().BeTrue("the file exists; it cannot be read, which the warning reports");
         warning.Should().StartWith($"Could not read the restore log '{assets}' of '{project}': ");
     }
 }

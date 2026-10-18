@@ -161,7 +161,7 @@ public partial class RoslynService
 
         if (_workspace is SourceFileWorkspace)
         {
-            var (stamped, staleFiles) = await CheckDiskBaselineAsync(prepared, cancellationToken);
+            var (stamped, staleFiles, lossyFiles) = await CheckDiskBaselineAsync(prepared, cancellationToken);
             if (staleFiles.Count > 0)
             {
                 return (false, CreateErrorResponse(
@@ -169,6 +169,14 @@ public partial class RoslynService
                     $"The edit's target files changed on disk since they were read: {string.Join(", ", staleFiles)}",
                     hint: "run sync_documents, then retry",
                     context: new { staleFiles }), new List<AppliedChange>(), Array.Empty<string>());
+            }
+            if (lossyFiles.Count > 0)
+            {
+                return (false, CreateErrorResponse(
+                    ErrorCodes.UnsupportedEncoding,
+                    $"The edit's target files do not decode losslessly in the encoding they were read with, so writing them would change text outside the edit: {string.Join(", ", lossyFiles)}",
+                    hint: "Save the files as UTF-8 (with or without a byte-order mark), run sync_documents, then retry.",
+                    context: new { files = lossyFiles }), new List<AppliedChange>(), Array.Empty<string>());
             }
             prepared = stamped;
         }
@@ -420,13 +428,17 @@ public partial class RoslynService
     // On the disk workspace: compares every target file with the text the edit was
     // computed from and stamps each changed document with its file's encoding as it is on
     // disk. A modified or removed file whose disk content differs from that text is stale,
-    // as is an added file whose path already exists on disk. Returns the stamped solution
-    // and the stale files (solution-relative paths).
-    private async Task<(Solution stamped, List<string> staleFiles)> CheckDiskBaselineAsync(
+    // as is an added file whose path already exists on disk. A modified file whose bytes
+    // are not what its decoded text re-encodes to (a BOM-less file that is not valid UTF-8
+    // where the fallback code page is UTF-8, so its bytes decoded to U+FFFD) is lossy:
+    // writing it would change text outside the edit. Returns the stamped solution, the
+    // stale files and the lossy files (solution-relative paths).
+    private async Task<(Solution stamped, List<string> staleFiles, List<string> lossyFiles)> CheckDiskBaselineAsync(
         Solution prepared, CancellationToken cancellationToken)
     {
         var baseline = _solution!;
         var stale = new List<string>();
+        var lossy = new List<string>();
         var stamped = prepared;
         var checkedPaths = new HashSet<string>(PathComparer);
 
@@ -446,6 +458,11 @@ public partial class RoslynService
                 if (!disk.ContentEquals(await oldDocument!.GetTextAsync(cancellationToken)))
                 {
                     stale.Add(FormatPath(path));
+                    continue;
+                }
+                if (!SourceFileIO.RoundTrips(path, disk))
+                {
+                    lossy.Add(FormatPath(path));
                     continue;
                 }
                 foreach (var id in stamped.GetDocumentIdsWithFilePath(path))
@@ -473,7 +490,7 @@ public partial class RoslynService
             }
         }
 
-        return (stamped, stale);
+        return (stamped, stale, lossy);
     }
 
     // Compile errors the prepared solution introduces that were not already present. Every

@@ -29,13 +29,25 @@ internal static class SourceFileIO
     // encoded characters. Creates the directory for a new file.
     public static void Write(string path, string text, Encoding encoding)
     {
+        var bytes = Encode(text, encoding);
+        var directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+        File.WriteAllBytes(path, bytes);
+    }
+
+    // Whether writing the file's decoded text back with its encoding reproduces the file's
+    // bytes exactly. False for a BOM-less file that is not valid UTF-8 where the fallback
+    // code page is UTF-8: its undecodable bytes became U+FFFD, which writes back as other bytes.
+    public static bool RoundTrips(string path, SourceText decoded) =>
+        Encode(decoded.ToString(), decoded.Encoding ?? Utf8NoBom).AsSpan().SequenceEqual(File.ReadAllBytes(path));
+
+    private static byte[] Encode(string text, Encoding encoding)
+    {
         var preamble = encoding.GetPreamble();
         var body = encoding.GetBytes(text);
         var bytes = new byte[preamble.Length + body.Length];
         preamble.CopyTo(bytes, 0);
         body.CopyTo(bytes, preamble.Length);
-        var directory = Path.GetDirectoryName(path);
-        if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
-        File.WriteAllBytes(path, bytes);
+        return bytes;
     }
 }

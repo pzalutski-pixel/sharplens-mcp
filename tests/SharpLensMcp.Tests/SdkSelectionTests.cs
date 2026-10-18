@@ -7,9 +7,10 @@ namespace SharpLensMcp.Tests;
 // A solution is evaluated with the SDK its own global.json selects, not the one the server
 // process registered from its working directory: MSBuildWorkspace evaluates projects in a
 // build host process that locates MSBuild from the project's directory. The pinned SDK is
-// the lowest installed one, so on a machine with several SDKs it differs from the default
-// the server (and this test process) registered; the project records the SDK version that
-// evaluated it as a preprocessor symbol.
+// the lowest installed one that can build the net8.0 project (major version 8 or later), so
+// on a machine with several SDKs it differs from the default the server (and this test
+// process) registered; the project records the SDK version that evaluated it as a
+// preprocessor symbol.
 public class SdkSelectionTests : IDisposable
 {
     private readonly TempSolutionDirectory _dir = new("sdkselect");
@@ -22,7 +23,7 @@ public class SdkSelectionTests : IDisposable
         exitCode.Should().Be(0, output);
         var pinnedSdk = output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
             .Select(line => line.Trim().Split(' ')[0])
-            .Where(version => Version.TryParse(version.Split('-')[0], out _))
+            .Where(version => Version.TryParse(version.Split('-')[0], out var parsed) && parsed.Major >= 8)
             .OrderBy(version => Version.Parse(version.Split('-')[0]))
             .First();
 

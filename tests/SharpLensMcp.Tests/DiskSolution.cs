@@ -84,6 +84,7 @@ public sealed class DiskSolution : IDisposable
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        DotnetChildProcess.Isolated(psi);
         var output = new StringBuilder();
         using var process = new Process { StartInfo = psi };
         process.OutputDataReceived += (_, e) => { lock (output) output.AppendLine(e.Data); };

@@ -45,6 +45,14 @@ public static class ApplySyncFixture
 
     public static readonly Encoding Windows1252 = CodePagesEncoding(1252);
 
+    // A BOM-less file that is not valid UTF-8 decodes with the system's fallback code page,
+    // as the compiler reads it: windows-1252 on a Western Windows system, UTF-8 on Linux and
+    // macOS (where the windows-1252 'é' becomes U+FFFD). True when the fallback is windows-1252.
+    public static bool FallbackDecodesWindows1252 => CodePagesEncoding(0).CodePage == 1252;
+
+    // Latin as this system decodes its windows-1252 bytes.
+    public static string LatinAsDecoded => FallbackDecodesWindows1252 ? Latin : Latin.Replace('é', '�');
+
     // Creates Lib + App with the standard files. extraAppXml goes inside App.csproj's
     // <Project>. The caller writes any additional files, then calls Restore.
     public static DiskSolution Create(string extraAppXml = "")

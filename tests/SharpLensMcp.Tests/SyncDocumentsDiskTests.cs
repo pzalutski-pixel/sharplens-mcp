@@ -114,7 +114,8 @@ public class SyncDocumentsDiskTests
     public async Task Windows1252File_IsDecodedWithItsEncoding_AndIsUnchanged()
     {
         using var solution = ApplySyncFixture.Create();
-        solution.WriteBytes("App/Latin.cs", ApplySyncFixture.Windows1252.GetBytes(ApplySyncFixture.Latin));
+        var bytes = ApplySyncFixture.Windows1252.GetBytes(ApplySyncFixture.Latin);
+        solution.WriteBytes("App/Latin.cs", bytes);
         solution.Restore();
         var service = await LoadAsync(solution);
 
@@ -124,8 +125,9 @@ public class SyncDocumentsDiskTests
         Strings(data["updatedFiles"]!).Should().BeEmpty();
         var document = service.GetSolutionForTesting()!.Projects
             .SelectMany(p => p.Documents).Single(d => d.FilePath == solution.PathOf("App/Latin.cs"));
-        (await document.GetTextAsync()).ToString().Should().Be(ApplySyncFixture.Latin,
-            "the windows-1252 'é' must decode as 'é', not U+FFFD");
+        (await document.GetTextAsync()).ToString().Should().Be(ApplySyncFixture.LatinAsDecoded,
+            "sync decodes the file as the load (and the compiler) did with this system's fallback code page");
+        solution.ReadBytes("App/Latin.cs").Should().Equal(bytes, "a sync never writes the file");
     }
 
     [Fact]

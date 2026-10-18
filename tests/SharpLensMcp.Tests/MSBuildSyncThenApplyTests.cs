@@ -77,6 +77,7 @@ public class MSBuildSyncThenApplyTests : IDisposable
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        DotnetChildProcess.Isolated(psi);
         using var process = Process.Start(psi)!;
         var stdout = process.StandardOutput.ReadToEnd();
         var stderr = process.StandardError.ReadToEnd();
